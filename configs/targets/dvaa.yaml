@@ -1,0 +1,37 @@
+id: dvaa-legacybot
+
+name: DVAA LegacyBot
+
+target_type: ai_agent
+
+interface:
+  type: http
+  adapter: generic_http
+
+  config:
+    url: http://127.0.0.1:7003/v1/chat/completions
+    method: POST
+
+    headers:
+      Content-Type: application/json
+
+    body:
+      messages:
+        - role: user
+          content: "{{input}}"
+
+    response:
+      text_path: choices.0.message.content
+
+capabilities:
+  - chat
+
+observability:
+  - response
+
+credential_refs: []
+
+metadata:
+  environment: local
+  platform: dvaa
+  agent: legacybot
