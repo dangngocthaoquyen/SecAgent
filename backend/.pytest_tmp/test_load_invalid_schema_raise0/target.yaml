@@ -1,7 +1,0 @@
-
-name: Missing identifier
-target_type: ai_agent
-interface:
-  type: http
-  adapter: generic_http
-  config: {}
