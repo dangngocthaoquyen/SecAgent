@@ -1,5 +1,6 @@
 from typing import Any
 from pydantic import BaseModel, Field
+from core.models.evaluation import EvaluationConfig
 
 class TaxonomyReference(BaseModel):
     id: str
@@ -13,11 +14,6 @@ class TestCaseTaxonomy(BaseModel):
 class ExternalReference(BaseModel):
     title: str
     url: str
-
-class EvaluationConfig(BaseModel):
-    type: str
-    marker: str | None = None
-
 
 class TestCase(BaseModel):
     id: str
