@@ -44,7 +44,11 @@ def make_response(
     )
 
 
-def make_target(config: dict[str, Any]) -> TargetProfile:
+def make_target(
+    config: dict[str, Any],
+    *,
+    credential_refs: list[str] | None = None,
+) -> TargetProfile:
     return TargetProfile(
         id="target-001",
         name="Example HTTP target",
@@ -54,6 +58,7 @@ def make_target(config: dict[str, Any]) -> TargetProfile:
             adapter="generic_http",
             config=config,
         ),
+        credential_refs=credential_refs or [],
     )
 
 
@@ -262,3 +267,65 @@ def test_headers_and_timeout_are_forwarded_from_target_config() -> None:
 
     assert client.requests[0]["headers"] == {"X-Test": "abc"}
     assert client.requests[0]["timeout"] == 5.0
+
+
+def test_environment_credential_is_resolved_into_generic_http_header(
+    monkeypatch,
+) -> None:
+    client = StubHttpClient(response=make_response(text="Accepted"))
+    target = make_target(
+        {
+            "url": "https://example.invalid/execute",
+            "method": "POST",
+            "headers": {
+                "Content-Type": "application/json",
+                "X-Generic-Key": "{{credential:GENERIC_API_KEY}}",
+            },
+        },
+        credential_refs=["GENERIC_API_KEY"],
+    )
+    monkeypatch.setenv("GENERIC_API_KEY", "resolved-test-value")
+
+    HttpTargetAdapter(client).execute(
+        target,
+        CoreTestInput(id="input-1", prompt="Hello"),
+    )
+
+    assert client.requests[0]["headers"] == {
+        "Content-Type": "application/json",
+        "X-Generic-Key": "resolved-test-value",
+    }
+
+
+@pytest.mark.parametrize("environment_value", [None, "", "   "])
+def test_missing_or_empty_environment_credential_fails_before_request(
+    monkeypatch,
+    environment_value: str | None,
+) -> None:
+    client = StubHttpClient(response=make_response(text="unused"))
+    target = make_target(
+        {
+            "url": "https://example.invalid/execute",
+            "method": "POST",
+            "headers": {"X-Generic-Key": "{{credential:GENERIC_API_KEY}}"},
+        },
+        credential_refs=["GENERIC_API_KEY"],
+    )
+    if environment_value is None:
+        monkeypatch.delenv("GENERIC_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("GENERIC_API_KEY", environment_value)
+
+    with pytest.raises(
+        TargetAdapterError,
+        match=(
+            "Required credential environment variable "
+            "'GENERIC_API_KEY' is missing or empty"
+        ),
+    ):
+        HttpTargetAdapter(client).execute(
+            target,
+            CoreTestInput(id="input-1", prompt="Hello"),
+        )
+
+    assert client.requests == []

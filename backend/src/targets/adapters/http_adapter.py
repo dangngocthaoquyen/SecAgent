@@ -1,5 +1,7 @@
 """Generic adapter for configuration-driven HTTP targets."""
 
+import os
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -9,6 +11,9 @@ from tools.http import HttpClient, HttpClientError, HttpResponse
 
 
 INPUT_PLACEHOLDER = "{{input}}"
+ENV_CREDENTIAL_PATTERN = re.compile(
+    r"\{\{credential:([A-Za-z_][A-Za-z0-9_]*)\}\}"
+)
 
 
 class TargetAdapterError(Exception):
@@ -35,7 +40,7 @@ class HttpTargetAdapter(BaseTargetAdapter):
         config = target.interface.config
         method = self._required_string(config, "method")
         url = self._required_string(config, "url")
-        headers = self._headers(config.get("headers"))
+        headers = self._headers(config.get("headers"), target.credential_refs)
         request_body = self._render_template(config.get("body"), test_input.prompt)
         timeout = self._timeout(config.get("timeout"))
 
@@ -67,14 +72,39 @@ class HttpTargetAdapter(BaseTargetAdapter):
         return value
 
     @staticmethod
-    def _headers(value: Any) -> dict[str, str] | None:
+    def _headers(
+        value: Any,
+        credential_refs: list[str],
+    ) -> dict[str, str] | None:
         if value is None:
             return None
         if not isinstance(value, Mapping):
             raise TargetAdapterError("HTTP target 'headers' must be a mapping.")
         if not all(isinstance(key, str) and isinstance(item, str) for key, item in value.items()):
             raise TargetAdapterError("HTTP target headers must contain string keys and values.")
-        return dict(value)
+
+        headers: dict[str, str] = {}
+        for key, item in value.items():
+            match = ENV_CREDENTIAL_PATTERN.fullmatch(item)
+            if match is None:
+                headers[key] = item
+                continue
+
+            credential_ref = match.group(1)
+            if credential_ref not in credential_refs:
+                raise TargetAdapterError(
+                    f"HTTP header references undeclared credential {credential_ref!r}."
+                )
+
+            resolved_value = os.environ.get(credential_ref)
+            if resolved_value is None or not resolved_value.strip():
+                raise TargetAdapterError(
+                    f"Required credential environment variable {credential_ref!r} "
+                    "is missing or empty."
+                )
+            headers[key] = resolved_value
+
+        return headers
 
     @staticmethod
     def _timeout(value: Any) -> float | None:

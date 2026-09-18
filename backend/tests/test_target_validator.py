@@ -101,3 +101,29 @@ def test_non_mapping_headers_raise_target_validation_error() -> None:
 
     with pytest.raises(TargetValidationError, match="headers.*mapping"):
         validate_target(target)
+
+
+def test_declared_header_credential_reference_is_valid() -> None:
+    target = make_target(
+        config={
+            "url": "https://example.invalid/execute",
+            "method": "POST",
+            "headers": {"Authorization": "{{credential:GENERIC_API_KEY}}"},
+        }
+    )
+    target.credential_refs = ["GENERIC_API_KEY"]
+
+    validate_target(target)
+
+
+def test_undeclared_header_credential_reference_is_rejected() -> None:
+    target = make_target(
+        config={
+            "url": "https://example.invalid/execute",
+            "method": "POST",
+            "headers": {"Authorization": "{{credential:GENERIC_API_KEY}}"},
+        }
+    )
+
+    with pytest.raises(TargetValidationError, match="undeclared credential"):
+        validate_target(target)

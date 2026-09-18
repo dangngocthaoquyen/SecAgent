@@ -1,5 +1,6 @@
 """Business-rule validation for target profiles."""
 
+import re
 from collections.abc import Mapping
 
 from core.models import TargetProfile
@@ -8,6 +9,9 @@ from core.models import TargetProfile
 SUPPORTED_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 SUPPORTED_INTERFACE_TYPE = "http"
 SUPPORTED_ADAPTER = "generic_http"
+ENV_CREDENTIAL_PATTERN = re.compile(
+    r"\{\{credential:([A-Za-z_][A-Za-z0-9_]*)\}\}"
+)
 
 
 class TargetValidationError(Exception):
@@ -50,7 +54,24 @@ def validate_target(target: TargetProfile) -> None:
             f"Unsupported HTTP method: {method!r}. Supported methods: {supported_methods}."
         )
 
-    if "headers" in interface.config and not isinstance(
-        interface.config["headers"], Mapping
-    ):
-        raise TargetValidationError("HTTP target 'headers' must be a mapping.")
+    if "headers" in interface.config:
+        headers = interface.config["headers"]
+        if not isinstance(headers, Mapping):
+            raise TargetValidationError("HTTP target 'headers' must be a mapping.")
+        if not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in headers.items()
+        ):
+            raise TargetValidationError(
+                "HTTP target headers must contain string keys and values."
+            )
+
+        for value in headers.values():
+            match = ENV_CREDENTIAL_PATTERN.fullmatch(value)
+            if match is None:
+                continue
+            credential_ref = match.group(1)
+            if credential_ref not in target.credential_refs:
+                raise TargetValidationError(
+                    f"HTTP header references undeclared credential {credential_ref!r}."
+                )
