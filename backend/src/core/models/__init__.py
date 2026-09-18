@@ -1,13 +1,17 @@
 """Public exports for the core Pydantic models."""
 
-from core.models.evaluation import EvaluationResult, EvaluationStatus
+from core.models.evaluation import (
+    EvaluationConfig,
+    EvaluationResult,
+    EvaluationRule,
+    EvaluationStatus,
+)
 from core.models.execution import ExecutionResult
 from core.models.observation import Observation
 from core.models.payload import PayloadTemplate
 from core.models.target import TargetInterface, TargetProfile
 from core.models.test_input import TestInput
 from core.models.testcase import (
-    EvaluationConfig,
     ExternalReference,
     TaxonomyReference,
     TestCase,
@@ -28,4 +32,5 @@ __all__ = [
     "TestInput",
     "TestCase",
     "TestCaseTaxonomy",
+    "EvaluationRule"
 ]
