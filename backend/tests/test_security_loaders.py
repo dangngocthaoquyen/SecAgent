@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from payloads import PayloadLoader
 from testing import TestCaseLoader
 
@@ -9,13 +11,27 @@ from testing import TestCaseLoader
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_pi_001_testcase_loads() -> None:
+@pytest.mark.parametrize(
+    ("testcase_id", "payload_ref"),
+    [
+        ("PI-001", "PI-P001"),
+        ("PI-002", "PI-P002"),
+        ("PI-003", "PI-P003"),
+    ],
+)
+def test_prompt_injection_testcase_loads(
+    testcase_id: str,
+    payload_ref: str,
+) -> None:
     testcase = TestCaseLoader().load(
-        REPOSITORY_ROOT / "testcases" / "prompt_injection" / "PI-001.yaml"
+        REPOSITORY_ROOT
+        / "testcases"
+        / "prompt_injection"
+        / f"{testcase_id}.yaml"
     )
 
-    assert testcase.id == "PI-001"
-    assert testcase.payload_refs == ["PI-P001"]
+    assert testcase.id == testcase_id
+    assert testcase.payload_refs == [payload_ref]
 
 
 def test_prompt_injection_payload_repository_loads() -> None:

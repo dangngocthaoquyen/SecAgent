@@ -2,7 +2,6 @@
 
 from attack_modules import (
     AttackModuleRegistry,
-    AttackModuleRegistryError,
     build_default_attack_module_registry,
 )
 from core.models import (
@@ -16,7 +15,8 @@ from evaluators import BaseEvaluator, ResponseEvaluator
 from observers import BaseObserver, ResponseObserver
 from testing.executor import Executor
 
-class  Runner:
+
+class Runner:
     def __init__(
         self,
         executor: Executor | None = None,
@@ -40,22 +40,43 @@ class  Runner:
         test_input: TestInput,
     ) -> EvaluationResult:
         try:
-           attack_module = self._attack_module_registry.resolve(testcase.attack_module)
-        except AttackModuleRegistryError as exc:
+            attack_module = self._attack_module_registry.resolve(
+                testcase.attack_module
+            )
+        except Exception:
             return EvaluationResult(
                 status=EvaluationStatus.ERROR,
-                reason=f"Attack module resolution failed: {exc}",
+                reason="Attack module resolution failed.",
             )
 
         try:
             prepared_input = attack_module.prepare(testcase, test_input)
-        except ValueError as exc:
+        except Exception:
             return EvaluationResult(
                 status=EvaluationStatus.ERROR,
-                reason=f"Attack module preparation failed: {exc}",
+                reason="Attack module preparation failed.",
             )
 
-        execution_result = self._executor.execute(target, prepared_input)
-        observation = self._observer.observe(execution_result)
+        try:
+            execution_result = self._executor.execute(target, prepared_input)
+        except Exception:
+            return EvaluationResult(
+                status=EvaluationStatus.ERROR,
+                reason="Execution stage failed.",
+            )
 
-        return self._evaluator.evaluate(testcase, observation)
+        try:
+            observation = self._observer.observe(execution_result)
+        except Exception:
+            return EvaluationResult(
+                status=EvaluationStatus.ERROR,
+                reason="Observation stage failed.",
+            )
+
+        try:
+            return self._evaluator.evaluate(testcase, observation)
+        except Exception:
+            return EvaluationResult(
+                status=EvaluationStatus.ERROR,
+                reason="Evaluation stage failed.",
+            )

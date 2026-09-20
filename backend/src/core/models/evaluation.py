@@ -37,20 +37,37 @@ class EvaluationRule(BaseModel):
             raise ValueError("Evaluation rule type must not be blank")
         return normalized_value
 
+    @field_validator("verdict")
+    @classmethod
+    def validate_security_verdict(
+        cls,
+        value: EvaluationStatus,
+    ) -> EvaluationStatus:
+        if value not in {EvaluationStatus.PASS, EvaluationStatus.FAIL}:
+            raise ValueError(
+                "Evaluation rule verdict must be PASS or FAIL."
+            )
+        return value
+
+
 class EvaluationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    rules: list[EvaluationRule] = Field(min_length=1)  
+    rules: list[EvaluationRule] = Field(min_length=1)
 
     @field_validator("rules")
     @classmethod
-    def rule_ids_must_be_unique(cls, rules: list[EvaluationRule]) -> list[EvaluationRule]:
-        seen_ids:set[str] = set()
+    def rule_ids_must_be_unique(
+        cls,
+        rules: list[EvaluationRule],
+    ) -> list[EvaluationRule]:
+        seen_ids: set[str] = set()
         for rule in rules:
             if rule.id in seen_ids:
                 raise ValueError(f"Duplicate evaluation rule id: {rule.id!r}.")
             seen_ids.add(rule.id)
         return rules
+
 
 class EvaluationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")

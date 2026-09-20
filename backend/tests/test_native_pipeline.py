@@ -5,11 +5,11 @@ from pathlib import Path
 from core.models import (
     EvaluationStatus,
     ExecutionResult,
-    TargetInterface,
     TargetProfile,
     TestInput as CoreTestInput,
 )
 from payloads import PayloadLoader, PayloadRenderer
+from targets import load_target
 from targets.adapters import BaseTargetAdapter
 from testing import Executor, Runner, TestCaseLoader
 
@@ -56,18 +56,8 @@ def test_runner_executes_native_prompt_injection_pipeline() -> None:
         payload_ref=payload.id,
     )
 
-    target = TargetProfile(
-        id="stub-target",
-        name="Stub target",
-        target_type="service",
-        interface=TargetInterface(
-            type="http",
-            adapter="generic_http",
-            config={
-                "url": "https://example.invalid/execute",
-                "method": "POST",
-            },
-        ),
+    target = load_target(
+        REPOSITORY_ROOT / "configs" / "targets" / "dvaa.yaml"
     )
 
     evaluation = Runner(

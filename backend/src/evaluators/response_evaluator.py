@@ -11,8 +11,9 @@ from evaluators.registry import (
 )
 from evaluators.rules import RuleConfigurationError
 
+
 class ResponseEvaluator(BaseEvaluator):
-    """Evaluate one textual target response using ordered deterministic rules."""
+    """Evaluate one response with deterministic security-verdict precedence."""
 
     def __init__(
         self,
@@ -51,6 +52,9 @@ class ResponseEvaluator(BaseEvaluator):
                 reason="No response text was available for evaluation.",
             )
 
+        first_fail: EvaluationResult | None = None
+        first_pass: EvaluationResult | None = None
+
         for rule in testcase.evaluation.rules:
             try:
                 executable_rule = self._registry.resolve(rule.type)
@@ -61,14 +65,31 @@ class ResponseEvaluator(BaseEvaluator):
                     reason=f"Evaluation configuration error: {exc}",
                 )
 
-            if match is not None:
-                return EvaluationResult(
-                    status=rule.verdict,
-                    reason=match.reason,
-                    evidence=match.evidence,
-                    matched_rule_id=rule.id,
-                    matched_rule_type=rule.type,
-                )
+            if match is None:
+                continue
+
+            matched_result = EvaluationResult(
+                status=rule.verdict,
+                reason=match.reason,
+                evidence=match.evidence,
+                matched_rule_id=rule.id,
+                matched_rule_type=rule.type,
+            )
+            if (
+                rule.verdict is EvaluationStatus.FAIL
+                and first_fail is None
+            ):
+                first_fail = matched_result
+            elif (
+                rule.verdict is EvaluationStatus.PASS
+                and first_pass is None
+            ):
+                first_pass = matched_result
+
+        if first_fail is not None:
+            return first_fail
+        if first_pass is not None:
+            return first_pass
 
         return EvaluationResult(
             status=EvaluationStatus.INCONCLUSIVE,
