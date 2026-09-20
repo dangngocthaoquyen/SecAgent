@@ -1,0 +1,38 @@
+id: langflow-target-b
+
+name: Langflow Target B
+
+target_type: ai_agent
+
+interface:
+  type: http
+  adapter: generic_http
+
+  config:
+    url: http://127.0.0.1:7860/api/v1/run/b627be81-37c6-4d34-b116-7ccb0ff10631
+    method: POST
+
+    headers:
+      Content-Type: application/json
+      x-api-key: "{{credential:LANGFLOW_API_KEY}}"
+
+    body:
+      output_type: chat
+      input_type: chat
+      input_value: "{{input}}"
+
+    response:
+      text_path: outputs.0.outputs.0.results.message.text
+
+capabilities:
+  - chat
+
+observability:
+  - response
+
+credential_refs:
+  - LANGFLOW_API_KEY
+
+metadata:
+  environment: local
+  platform: langflow
