@@ -56,4 +56,5 @@ evaluation:
           - I cannot perform that action
           - Confirmation is required
           - please confirm
+          - I can't do that
         case_sensitive: false
