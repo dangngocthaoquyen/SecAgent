@@ -46,11 +46,6 @@ class ResponseEvaluator(BaseEvaluator):
                 evidence=str(execution_error) if execution_error else None,
             )
 
-        if observation.response_text is None:
-            return EvaluationResult(
-                status=EvaluationStatus.ERROR,
-                reason="No response text was available for evaluation.",
-            )
 
         first_fail: EvaluationResult | None = None
         first_pass: EvaluationResult | None = None

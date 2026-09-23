@@ -8,6 +8,7 @@ from attack_modules.registry import (
     UnknownAttackModuleError,
     build_default_attack_module_registry,
 )
+from attack_modules.tool_misuse import ToolMisuseAttackModule
 
 __all__ = [
     "AttackModuleRegistry",
@@ -16,4 +17,5 @@ __all__ = [
     "PromptInjectionAttackModule",
     "UnknownAttackModuleError",
     "build_default_attack_module_registry",
+    "ToolMisuseAttackModule",
 ]

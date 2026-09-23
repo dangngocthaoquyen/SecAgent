@@ -3,6 +3,7 @@
 from typing import Any
 
 from pydantic import BaseModel, Field
+from core.models.evidence import Evidence
 
 
 class Observation(BaseModel):
@@ -14,3 +15,4 @@ class Observation(BaseModel):
     command_executions: list[dict[str, Any]] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    evidence: list[Evidence] = Field(default_factory=list)

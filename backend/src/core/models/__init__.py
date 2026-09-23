@@ -17,6 +17,7 @@ from core.models.testcase import (
     TestCase,
     TestCaseTaxonomy,
 )
+from core.models.evidence import Evidence
 
 __all__ = [
     "EvaluationConfig",
@@ -32,5 +33,6 @@ __all__ = [
     "TestInput",
     "TestCase",
     "TestCaseTaxonomy",
-    "EvaluationRule"
+    "EvaluationRule",
+    "Evidence"
 ]

@@ -9,6 +9,7 @@ from core.models import (
     TargetInterface,
     TargetProfile,
     TestInput as CoreTestInput,
+    Evidence,
 )
 
 
@@ -133,3 +134,23 @@ def test_mutable_defaults_are_not_shared_between_instances() -> None:
 
     assert second.file_refs == []
     assert second.metadata == {}
+
+def test_observation_accepts_action_evidence() -> None:
+    evidence = Evidence(
+        kind="tool_call",
+        source="runtime_trace",
+        name="PerformSensitiveAction",
+        success=True,
+        data={"arguments": {"project": "internal"}},
+        reference="trace.tools[2]",
+    )
+
+    observation = Observation(
+        evidence=[evidence],
+        metadata={"tool_trace": "complete"},
+    )
+
+    assert observation.evidence[0].kind == "tool_call"
+    assert observation.evidence[0].name == "PerformSensitiveAction"
+    assert observation.evidence[0].success is True
+    assert observation.metadata["tool_trace"] == "complete"

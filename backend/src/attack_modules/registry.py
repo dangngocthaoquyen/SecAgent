@@ -70,12 +70,18 @@ class AttackModuleRegistry:
     
 def build_default_attack_module_registry() -> AttackModuleRegistry:
     from attack_modules.prompt_injection import PromptInjectionAttackModule
+    from attack_modules.tool_misuse import ToolMisuseAttackModule
 
     registry = AttackModuleRegistry()
 
     registry.register(
         "prompt_injection",
         PromptInjectionAttackModule(),
+    )
+
+    registry.register(
+        "tool_misuse",
+        ToolMisuseAttackModule(),
     )
 
     return registry
