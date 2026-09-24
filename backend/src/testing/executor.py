@@ -3,7 +3,12 @@
 from collections.abc import Mapping
 
 from core.models import ExecutionResult, TargetProfile, TestInput
-from targets.adapters import BaseTargetAdapter, HttpTargetAdapter, TargetAdapterError
+from targets.adapters import (
+    BaseTargetAdapter,
+    HttpTargetAdapter,
+    McpJsonRpcTargetAdapter,
+    TargetAdapterError,
+)
 from targets.validator import TargetValidationError, validate_target
 
 
@@ -15,7 +20,10 @@ class Executor:
         adapters: Mapping[str, BaseTargetAdapter] | None = None,
     ) -> None:
         if adapters is None:
-            adapters = {"generic_http": HttpTargetAdapter()}
+            adapters = {
+                "generic_http": HttpTargetAdapter(),
+                "generic_mcp_jsonrpc": McpJsonRpcTargetAdapter(),
+            }
         self._adapters = dict(adapters)
 
     def execute(

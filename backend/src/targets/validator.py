@@ -7,8 +7,10 @@ from core.models import TargetProfile
 
 
 SUPPORTED_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
-SUPPORTED_INTERFACE_TYPE = "http"
-SUPPORTED_ADAPTER = "generic_http"
+SUPPORTED_INTERFACE_ADAPTERS = {
+    "http": "generic_http",
+    "mcp": "generic_mcp_jsonrpc",
+}
 ENV_CREDENTIAL_PATTERN = re.compile(
     r"\{\{credential:([A-Za-z_][A-Za-z0-9_]*)\}\}"
 )
@@ -23,16 +25,18 @@ def validate_target(target: TargetProfile) -> None:
 
     interface = target.interface
 
-    if interface.type != SUPPORTED_INTERFACE_TYPE:
+    expected_adapter = SUPPORTED_INTERFACE_ADAPTERS.get(interface.type)
+    if expected_adapter is None:
+        supported_types = ", ".join(sorted(SUPPORTED_INTERFACE_ADAPTERS))
         raise TargetValidationError(
             f"Unsupported interface type: {interface.type!r}. "
-            f"Supported interface type: {SUPPORTED_INTERFACE_TYPE!r}."
+            f"Supported interface types: {supported_types}."
         )
 
-    if interface.adapter != SUPPORTED_ADAPTER:
+    if interface.adapter != expected_adapter:
         raise TargetValidationError(
             f"Unsupported target adapter: {interface.adapter!r}. "
-            f"Supported adapter: {SUPPORTED_ADAPTER!r}."
+            f"Supported adapter for {interface.type!r}: {expected_adapter!r}."
         )
 
     url = interface.config.get("url")
@@ -41,18 +45,20 @@ def validate_target(target: TargetProfile) -> None:
             "HTTP target configuration requires a non-empty string 'url'."
         )
 
-    method = interface.config.get("method")
-    if not isinstance(method, str) or not method.strip():
-        raise TargetValidationError(
-            "HTTP target configuration requires a non-empty string 'method'."
-        )
+    if interface.type == "http":
+        method = interface.config.get("method")
+        if not isinstance(method, str) or not method.strip():
+            raise TargetValidationError(
+                "HTTP target configuration requires a non-empty string 'method'."
+            )
 
-    normalized_method = method.strip().upper()
-    if normalized_method not in SUPPORTED_HTTP_METHODS:
-        supported_methods = ", ".join(sorted(SUPPORTED_HTTP_METHODS))
-        raise TargetValidationError(
-            f"Unsupported HTTP method: {method!r}. Supported methods: {supported_methods}."
-        )
+        normalized_method = method.strip().upper()
+        if normalized_method not in SUPPORTED_HTTP_METHODS:
+            supported_methods = ", ".join(sorted(SUPPORTED_HTTP_METHODS))
+            raise TargetValidationError(
+                f"Unsupported HTTP method: {method!r}. "
+                f"Supported methods: {supported_methods}."
+            )
 
     if "headers" in interface.config:
         headers = interface.config["headers"]

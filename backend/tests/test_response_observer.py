@@ -106,3 +106,54 @@ def test_observe_does_not_mutate_execution_result() -> None:
     ResponseObserver().observe(result)
 
     assert result.model_dump() == original_state
+
+
+def test_normalized_events_become_existing_evidence_models() -> None:
+    result = ExecutionResult(
+        success=True,
+        events=[
+            {
+                "kind": "tool_call",
+                "source": "generic_protocol",
+                "name": "sensitive_action",
+                "success": True,
+                "data": {
+                    "arguments": {"value": "harmless"},
+                    "result": {"success": True},
+                },
+                "reference": "protocol.result",
+            }
+        ],
+    )
+
+    observation = ResponseObserver().observe(result)
+
+    assert len(observation.evidence) == 1
+    assert observation.evidence[0].kind == "tool_call"
+    assert observation.evidence[0].name == "sensitive_action"
+    assert observation.evidence[0].success is True
+    assert observation.evidence[0].data["arguments"] == {"value": "harmless"}
+
+
+def test_complete_tool_trace_event_propagates_to_observation_metadata() -> None:
+    result = ExecutionResult(
+        success=True,
+        events=[
+            {
+                "kind": "tool_trace",
+                "source": "generic_protocol",
+                "data": {"completeness": "complete"},
+            }
+        ],
+    )
+
+    observation = ResponseObserver().observe(result)
+
+    assert observation.metadata["tool_trace"] == "complete"
+    assert observation.evidence[0].kind == "tool_trace"
+
+
+def test_absent_trace_event_does_not_claim_trace_completeness() -> None:
+    observation = ResponseObserver().observe(ExecutionResult(success=True))
+
+    assert "tool_trace" not in observation.metadata

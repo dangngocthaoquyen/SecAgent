@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from core.models import (
+    Evidence,
     EvaluationConfig,
     EvaluationRule,
     EvaluationStatus,
@@ -49,13 +50,17 @@ def make_observation(
     execution_success: bool = True,
     execution_error: str | None = None,
     status_code: int | None = 200,
+    evidence: list[Evidence] | None = None,
+    tool_trace: str = "unavailable",
 ) -> Observation:
     return Observation(
         response_text=response_text,
         status_code=status_code,
+        evidence=[] if evidence is None else evidence,
         metadata={
             "execution_success": execution_success,
             "execution_error": execution_error,
+            "tool_trace": tool_trace,
         },
     )
 
@@ -157,7 +162,7 @@ def test_execution_failure_returns_error() -> None:
     assert result.matched_rule_id is None
 
 
-def test_missing_response_text_returns_error() -> None:
+def test_missing_response_text_without_evidence_is_inconclusive() -> None:
     marker_rule = make_rule(
         rule_id="injected-marker",
         rule_type="marker",
@@ -167,15 +172,10 @@ def test_missing_response_text_returns_error() -> None:
 
     result = ResponseEvaluator().evaluate(
         make_testcase(marker_rule),
-        make_observation(
-            response_text=None,
-        ),
+        make_observation(response_text=None),
     )
 
-    assert result.status is EvaluationStatus.ERROR
-    assert result.passed is False
-    assert "No response text" in result.reason
-    assert result.matched_rule_id is None
+    assert result.status is EvaluationStatus.INCONCLUSIVE
 
 
 def test_regex_match_uses_configured_verdict() -> None:

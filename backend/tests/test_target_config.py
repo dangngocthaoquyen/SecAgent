@@ -6,7 +6,7 @@ from typing import Any
 
 from core.models import TestInput as CoreTestInput
 from targets import load_target, validate_target
-from targets.adapters import HttpTargetAdapter
+from targets.adapters import HttpTargetAdapter, McpJsonRpcTargetAdapter
 from testing import Executor
 from tools.http import HttpResponse
 
@@ -55,6 +55,46 @@ def test_dvaa_target_config_execution_remains_credential_free() -> None:
     }
     assert result.success is True
     assert result.output_text == "DVAA response"
+
+
+def test_dvaa_toolbot_target_is_a_separate_generic_mcp_profile() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    target = load_target(
+        repository_root / "configs" / "targets" / "dvaa-toolbot.yaml"
+    )
+    client = StubHttpClient(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": '{"success":true,"output":"safe smoke"}',
+                    }
+                ]
+            },
+        }
+    )
+
+    validate_target(target)
+    result = McpJsonRpcTargetAdapter(client).execute(
+        target,
+        CoreTestInput(
+            id="input-1",
+            parameters={
+                "tool_call": {
+                    "name": "sample_tool",
+                    "arguments": {"value": "safe"},
+                }
+            },
+        ),
+    )
+
+    assert target.interface.type == "mcp"
+    assert target.interface.adapter == "generic_mcp_jsonrpc"
+    assert result.success is True
+    assert result.events[0]["name"] == "sample_tool"
 
 
 def test_langflow_target_config_loads_validates_and_executes_without_network(

@@ -30,14 +30,18 @@ class StubAdapter(BaseTargetAdapter):
         return self.result
 
 
-def make_target(*, interface_type: str = "http") -> TargetProfile:
+def make_target(
+    *,
+    interface_type: str = "http",
+    adapter: str = "generic_http",
+) -> TargetProfile:
     return TargetProfile(
         id="target-001",
         name="Example target",
         target_type="service",
         interface=TargetInterface(
             type=interface_type,
-            adapter="generic_http",
+            adapter=adapter,
             config={
                 "url": "https://example.invalid/execute",
                 "method": "POST",
@@ -179,3 +183,37 @@ def test_adapter_mapping_selects_only_requested_adapter() -> None:
     assert result.status_code == 200
     assert len(selected.calls) == 1
     assert unused.calls == []
+
+
+def test_mcp_adapter_mapping_resolves_generic_mcp_jsonrpc() -> None:
+    expected = ExecutionResult(success=True, status_code=200)
+    adapter = StubAdapter(result=expected)
+
+    result = Executor(
+        adapters={"generic_mcp_jsonrpc": adapter}
+    ).execute(
+        target=make_target(
+            interface_type="mcp",
+            adapter="generic_mcp_jsonrpc",
+        ),
+        test_input=CoreTestInput(id="input-001"),
+    )
+
+    assert result is expected
+    assert len(adapter.calls) == 1
+
+
+def test_default_executor_registers_generic_mcp_jsonrpc_adapter() -> None:
+    result = Executor().execute(
+        target=make_target(
+            interface_type="mcp",
+            adapter="generic_mcp_jsonrpc",
+        ),
+        test_input=CoreTestInput(id="input-001"),
+    )
+
+    assert result.success is False
+    assert result.error == (
+        "Target adapter failed: MCP execution requires a "
+        "'parameters.tool_call' mapping."
+    )

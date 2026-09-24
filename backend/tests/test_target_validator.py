@@ -46,6 +46,27 @@ def test_valid_http_target_does_not_raise() -> None:
     assert target.interface.config["method"] == "Post"
 
 
+def test_valid_mcp_jsonrpc_target_does_not_require_configured_method() -> None:
+    target = make_target(
+        interface_type="mcp",
+        adapter="generic_mcp_jsonrpc",
+        config={"url": "https://example.invalid/mcp"},
+    )
+
+    validate_target(target)
+
+
+def test_mcp_interface_rejects_http_adapter() -> None:
+    target = make_target(
+        interface_type="mcp",
+        adapter="generic_http",
+        config={"url": "https://example.invalid/mcp"},
+    )
+
+    with pytest.raises(TargetValidationError, match="Unsupported target adapter"):
+        validate_target(target)
+
+
 def test_missing_url_raises_target_validation_error() -> None:
     target = make_target(config={"method": "POST"})
 

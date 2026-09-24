@@ -7,6 +7,7 @@ from evaluators.rules import (
     RegexRule,
     RuleConfigurationError,
     StatusCodeRule,
+    ToolCallRule,
 )
 
 class EvaluationRuleRegistry:
@@ -52,5 +53,6 @@ def build_default_registry() -> EvaluationRuleRegistry:
             KeywordRule(),
             RegexRule(),
             StatusCodeRule(),
+            ToolCallRule(),
         ]
     )
