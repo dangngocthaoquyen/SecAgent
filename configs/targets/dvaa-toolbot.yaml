@@ -1,0 +1,27 @@
+id: dvaa-toolbot
+
+name: DVAA ToolBot
+
+target_type: tool_service
+
+interface:
+  type: mcp
+  adapter: generic_mcp_jsonrpc
+
+  config:
+    url: http://127.0.0.1:7010/
+    headers:
+      Content-Type: application/json
+
+capabilities:
+  - tool_call
+
+observability:
+  - tool_trace
+
+credential_refs: []
+
+metadata:
+  environment: local
+  platform: dvaa
+  agent: toolbot

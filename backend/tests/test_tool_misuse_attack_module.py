@@ -88,3 +88,16 @@ def test_prepare_does_not_mutate_original_test_input() -> None:
     assert original.model_dump() == original_state
     assert prepared is not original
     assert prepared.metadata["source"] == "native"
+
+
+def test_tm001_prompt_and_structured_parameters_remain_unchanged() -> None:
+    original = CoreTestInput(
+        id="input-001",
+        prompt="rendered TM-001 payload",
+        parameters={"existing": {"value": True}},
+    )
+
+    prepared = ToolMisuseAttackModule().prepare(make_testcase(), original)
+
+    assert prepared.prompt == "rendered TM-001 payload"
+    assert prepared.parameters == {"existing": {"value": True}}
