@@ -9,6 +9,9 @@ from attack_modules.registry import (
     build_default_attack_module_registry,
 )
 from attack_modules.tool_misuse import ToolMisuseAttackModule
+from attack_modules.sensitive_data_disclosure import (
+    SensitiveDataDisclosureAttackModule,
+)
 
 __all__ = [
     "AttackModuleRegistry",
@@ -18,4 +21,5 @@ __all__ = [
     "UnknownAttackModuleError",
     "build_default_attack_module_registry",
     "ToolMisuseAttackModule",
+    "SensitiveDataDisclosureAttackModule",
 ]
