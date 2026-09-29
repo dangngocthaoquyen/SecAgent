@@ -127,7 +127,10 @@ def test_successful_tool_result_is_normalized_into_events() -> None:
         {
             "kind": "tool_trace",
             "source": "mcp_jsonrpc",
-            "data": {"completeness": "complete"},
+            "data": {
+                "completeness": "complete",
+                "scope": "direct_request",
+            },
             "reference": "result.content",
         },
     ]
@@ -145,6 +148,22 @@ def test_unsuccessful_tool_result_remains_observable() -> None:
     assert result.events[0]["success"] is False
     assert result.events[0]["data"]["result"]["error"] == "denied"
     assert result.events[1]["data"]["completeness"] == "complete"
+    assert result.events[1]["data"]["scope"] == "direct_request"
+
+
+def test_mismatched_jsonrpc_response_id_is_rejected() -> None:
+    response = make_response({"success": True, "output": "completed"})
+    response.json_body["id"] = 999
+
+    result = McpJsonRpcTargetAdapter(StubHttpClient(response)).execute(
+        make_target(), make_input()
+    )
+
+    assert result.success is False
+    assert result.events == []
+    assert result.error == (
+        "MCP JSON-RPC response id 999 does not match request id 1."
+    )
 
 
 def test_jsonrpc_error_response_is_an_execution_failure() -> None:
