@@ -1,0 +1,24 @@
+{
+  "tool_name": "garak",
+  "success": true,
+  "exit_code": 0,
+  "error": null,
+  "artifacts": [
+    "results/smoke/week4/garak-built-in-20260929T145345Z.report.html",
+    "results/smoke/week4/garak-built-in-20260929T145345Z.report.jsonl"
+  ],
+  "metadata": {
+    "target_type": "test.Blank",
+    "spec": "probes.test.Test",
+    "generations": 1,
+    "report_prefix": "results/smoke/week4/garak-built-in-20260929T145345Z"
+  },
+  "success_semantics": {
+    "means": "The external Garak process execution succeeded.",
+    "does_not_mean": [
+      "The target is secure.",
+      "A vulnerability test passed.",
+      "The SecAgent security verdict is PASS."
+    ]
+  }
+}
