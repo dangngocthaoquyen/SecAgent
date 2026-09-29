@@ -5,8 +5,8 @@ from collections.abc import Mapping
 from typing import Any
 
 from core.models import ExecutionResult, TargetProfile, TestInput
-from targets.adapters.base import BaseTargetAdapter
-from targets.adapters.http_adapter import HttpTargetAdapter, TargetAdapterError
+from targets.adapters.base import BaseTargetAdapter, TargetAdapterError
+from targets.adapters.http_adapter import HttpTargetAdapter
 from tools.http import HttpClient, HttpClientError, HttpResponse
 
 
