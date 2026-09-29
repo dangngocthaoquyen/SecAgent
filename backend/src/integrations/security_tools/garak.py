@@ -56,6 +56,8 @@ class GarakProvider(SecurityToolProvider):
                 command,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self._config.timeout_seconds,
                 check=False,
                 shell=False,

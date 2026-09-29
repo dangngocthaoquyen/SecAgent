@@ -59,6 +59,8 @@ def test_successful_process_is_normalized_and_uses_argument_list(
     assert captured["kwargs"] == {
         "capture_output": True,
         "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
         "timeout": 15.0,
         "check": False,
         "shell": False,
