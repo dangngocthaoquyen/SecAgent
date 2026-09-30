@@ -3,12 +3,14 @@
 import json
 from pathlib import Path
 
-from backend.scripts.run_garak_smoke import (
-    REPOSITORY_ROOT,
+from integrations.security_tools import ExternalToolResult
+from integrations.security_tools.smoke_summary import (
     build_smoke_summary,
     write_smoke_summary,
 )
-from integrations.security_tools import ExternalToolResult
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 def make_result() -> ExternalToolResult:
@@ -35,7 +37,7 @@ def make_result() -> ExternalToolResult:
 
 
 def test_smoke_summary_is_small_allowlisted_process_evidence() -> None:
-    summary = build_smoke_summary(make_result())
+    summary = build_smoke_summary(make_result(), REPOSITORY_ROOT)
 
     assert summary == {
         "tool_name": "garak",
@@ -71,10 +73,14 @@ def test_smoke_summary_is_small_allowlisted_process_evidence() -> None:
 def test_smoke_summary_is_written_next_to_report_prefix(tmp_path: Path) -> None:
     report_prefix = tmp_path / "garak-built-in-test"
 
-    summary_path = write_smoke_summary(make_result(), report_prefix)
+    summary_path = write_smoke_summary(
+        make_result(),
+        report_prefix,
+        REPOSITORY_ROOT,
+    )
 
     assert summary_path == tmp_path / "garak-built-in-test.secagent.json"
     assert json.loads(summary_path.read_text(encoding="utf-8")) == (
-        build_smoke_summary(make_result())
+        build_smoke_summary(make_result(), REPOSITORY_ROOT)
     )
     assert summary_path.stat().st_size < 4096
