@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from core.models import ExecutionResult, TargetProfile, TestInput
-from targets.adapters.base import BaseTargetAdapter
+from targets.adapters.base import BaseTargetAdapter, TargetAdapterError
 from tools.http import HttpClient, HttpClientError, HttpResponse
 
 
@@ -14,10 +14,6 @@ INPUT_PLACEHOLDER = "{{input}}"
 ENV_CREDENTIAL_PATTERN = re.compile(
     r"\{\{credential:([A-Za-z_][A-Za-z0-9_]*)\}\}"
 )
-
-
-class TargetAdapterError(Exception):
-    """Raised when target configuration cannot produce a valid request."""
 
 
 class _ResponsePathError(Exception):

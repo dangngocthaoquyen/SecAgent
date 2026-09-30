@@ -5,8 +5,8 @@ from collections.abc import Mapping
 from typing import Any
 
 from core.models import ExecutionResult, TargetProfile, TestInput
-from targets.adapters.base import BaseTargetAdapter
-from targets.adapters.http_adapter import HttpTargetAdapter, TargetAdapterError
+from targets.adapters.base import BaseTargetAdapter, TargetAdapterError
+from targets.adapters.http_adapter import HttpTargetAdapter
 from tools.http import HttpClient, HttpClientError, HttpResponse
 
 
@@ -56,7 +56,7 @@ class McpJsonRpcTargetAdapter(BaseTargetAdapter):
                 error=str(exc),
             )
 
-        return self._to_execution_result(response, name, arguments)
+        return self._to_execution_result(response, name, arguments, request_id)
 
     @staticmethod
     def _tool_call(parameters: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -98,6 +98,7 @@ class McpJsonRpcTargetAdapter(BaseTargetAdapter):
         response: HttpResponse,
         name: str,
         arguments: dict[str, Any],
+        request_id: int | str,
     ) -> ExecutionResult:
         raw_output = (
             response.json_body if response.json_body is not None else response.text
@@ -125,6 +126,13 @@ class McpJsonRpcTargetAdapter(BaseTargetAdapter):
         if body.get("jsonrpc") != "2.0":
             return cls._protocol_failure(
                 "MCP JSON-RPC response requires jsonrpc='2.0'.", common
+            )
+        response_id = body.get("id")
+        if isinstance(response_id, bool) or response_id != request_id:
+            return cls._protocol_failure(
+                f"MCP JSON-RPC response id {response_id!r} does not match "
+                f"request id {request_id!r}.",
+                common,
             )
 
         if "error" in body:
@@ -193,7 +201,10 @@ class McpJsonRpcTargetAdapter(BaseTargetAdapter):
             {
                 "kind": "tool_trace",
                 "source": "mcp_jsonrpc",
-                "data": {"completeness": "complete"},
+                "data": {
+                    "completeness": "complete",
+                    "scope": "direct_request",
+                },
                 "reference": "result.content",
             },
         ]

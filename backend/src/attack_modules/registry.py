@@ -71,6 +71,9 @@ class AttackModuleRegistry:
 def build_default_attack_module_registry() -> AttackModuleRegistry:
     from attack_modules.prompt_injection import PromptInjectionAttackModule
     from attack_modules.tool_misuse import ToolMisuseAttackModule
+    from attack_modules.sensitive_data_disclosure import (
+        SensitiveDataDisclosureAttackModule,
+    )
 
     registry = AttackModuleRegistry()
 
@@ -84,4 +87,8 @@ def build_default_attack_module_registry() -> AttackModuleRegistry:
         ToolMisuseAttackModule(),
     )
 
+    registry.register(
+        "sensitive_data_disclosure",
+        SensitiveDataDisclosureAttackModule(),
+    )
     return registry

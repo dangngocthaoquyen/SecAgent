@@ -29,3 +29,7 @@ Thumbs.db
 # Pytest
 .pytest_cache/
 .pytest_tmp/
+
+# Garak generated smoke reports
+results/smoke/week4/*.report.html
+results/smoke/week4/*.report.jsonl

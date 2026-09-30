@@ -119,32 +119,36 @@ Không tạo circular dependency.
 
 ---
 
-## 5. Scope tuần hiện tại
+## 5. Phạm vi hiện tại
 
-Tôi chỉ xây dựng minimum pipeline:
+SecAgent hiện chỉ thực hiện kiểm thử **black-box**.
 
-DVAA target config
-→ load target
-→ validate target
-→ HTTP adapter
-→ HTTP client
-→ execute TestInput
-→ ExecutionResult
-→ ResponseObserver
-→ Observation
+Các nhóm lỗ hổng đã được triển khai:
 
-KHÔNG triển khai trong giai đoạn này:
+* Prompt Injection
+* Tool Misuse
+* Sensitive Data Disclosure
+
+Framework hiện hỗ trợ:
+
+* target HTTP thông qua `HttpTargetAdapter`;
+* MCP JSON-RPC trực tiếp, với evidence scope `direct_request` để không ngụ ý quan sát
+  toàn bộ tool trace nội bộ của AI Agent;
+* Garak external-tool PoC thông qua `SecurityToolProvider` và `GarakProvider`, tách biệt
+  khỏi `TargetAdapter`.
+
+Goal Hijacking là công việc dự kiến cho Week 5 và chưa được triển khai.
+
+Grey-box và white-box nằm ngoài phạm vi của project 10 tuần này.
+
+Các thành phần chưa thuộc phạm vi hiện tại gồm:
 
 * frontend
 * database
 * FastAPI
 * SSE
-* SecAgent
 * LLM Judge
-* Garak
 * PyRIT
-* MCP
-* reporting
 * attack orchestration phức tạp
 * ExecutionPlan
 * CLI adapter

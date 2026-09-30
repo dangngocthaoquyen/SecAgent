@@ -5,6 +5,10 @@ from abc import ABC, abstractmethod
 from core.models import ExecutionResult, TargetProfile, TestInput
 
 
+class TargetAdapterError(Exception):
+    """Raised when target configuration cannot produce a valid request."""
+
+
 class BaseTargetAdapter(ABC):
     """Translate target-agnostic test input into one target execution."""
 
