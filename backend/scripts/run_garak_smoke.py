@@ -94,11 +94,11 @@ def parse_args() -> argparse.Namespace:
         "--executable",
         default=os.environ.get(
             "GARAK_EXECUTABLE",
-            r"D:\secagent-envs\garak\Scripts\garak.exe",
+            "garak",
         ),
         help=(
             "Path to the Garak executable. Defaults to GARAK_EXECUTABLE, then "
-            "the Week 4 development environment path."
+            "garak on PATH."
         ),
     )
     parser.add_argument(
