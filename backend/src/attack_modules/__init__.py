@@ -1,6 +1,7 @@
 """Native security attack modules and their registry."""
 
 from attack_modules.base import BaseAttackModule
+from attack_modules.goal_hijacking import GoalHijackingAttackModule
 from attack_modules.prompt_injection import PromptInjectionAttackModule
 from attack_modules.registry import (
     AttackModuleRegistry,
@@ -22,4 +23,5 @@ __all__ = [
     "build_default_attack_module_registry",
     "ToolMisuseAttackModule",
     "SensitiveDataDisclosureAttackModule",
+    "GoalHijackingAttackModule",
 ]

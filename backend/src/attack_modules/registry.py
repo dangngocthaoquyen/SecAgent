@@ -69,6 +69,7 @@ class AttackModuleRegistry:
         return module
     
 def build_default_attack_module_registry() -> AttackModuleRegistry:
+    from attack_modules.goal_hijacking import GoalHijackingAttackModule
     from attack_modules.prompt_injection import PromptInjectionAttackModule
     from attack_modules.tool_misuse import ToolMisuseAttackModule
     from attack_modules.sensitive_data_disclosure import (
@@ -90,5 +91,10 @@ def build_default_attack_module_registry() -> AttackModuleRegistry:
     registry.register(
         "sensitive_data_disclosure",
         SensitiveDataDisclosureAttackModule(),
+    )
+
+    registry.register(
+        "goal_hijacking",
+        GoalHijackingAttackModule(),
     )
     return registry
