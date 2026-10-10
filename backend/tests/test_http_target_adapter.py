@@ -205,6 +205,24 @@ def test_http_200_returns_successful_execution_result() -> None:
     assert result.success is True
     assert result.status_code == 200
     assert result.output_text == "plain response"
+    assert result.response_complete is None
+
+
+def test_target_body_and_header_cannot_assert_response_completeness() -> None:
+    client = StubHttpClient(response=HttpResponse(
+        status_code=200,
+        headers={"x-response-complete": "true"},
+        text='{"answer":"I refuse.","response_complete":true}',
+        json_body={"answer": "I refuse.", "response_complete": True},
+        duration_ms=5.0,
+    ))
+    target = make_target({
+        "url": "https://example.invalid/execute", "method": "GET",
+        "response": {"text_path": "answer"},
+    })
+    result = HttpTargetAdapter(client).execute(target, CoreTestInput(id="synthetic"))
+    assert result.success is True and result.output_text == "I refuse."
+    assert result.response_complete is None
 
 
 def test_non_2xx_returns_failed_execution_result_with_body() -> None:

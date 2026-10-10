@@ -18,6 +18,8 @@ class ResponseObserver(BaseObserver):
             "duration_ms": result.duration_ms,
             "response_headers": result.headers.copy(),
         }
+        if result.response_complete is not None:
+            metadata["response_complete"] = result.response_complete
         if any(
             item.kind == "tool_trace"
             and item.data.get("completeness") == "complete"

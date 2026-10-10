@@ -20,6 +20,7 @@ def test_successful_textual_response_is_normalized() -> None:
     assert observation.metadata["execution_error"] is None
     assert observation.metadata["duration_ms"] == 10.5
     assert "raw_output" not in observation.metadata
+    assert "response_complete" not in observation.metadata
 
 
 def test_network_failure_is_normalized_without_raising() -> None:
@@ -151,6 +152,18 @@ def test_complete_tool_trace_event_propagates_to_observation_metadata() -> None:
 
     assert observation.metadata["tool_trace"] == "complete"
     assert observation.evidence[0].kind == "tool_trace"
+    assert "response_complete" not in observation.metadata
+
+
+def test_explicit_caller_response_completeness_is_preserved_separately() -> None:
+    observer = ResponseObserver()
+    for complete in (True, False):
+        observation = observer.observe(ExecutionResult(
+            success=True, status_code=200, output_text="Observed answer.",
+            response_complete=complete,
+        ))
+        assert observation.metadata["response_complete"] is complete
+        assert "tool_trace" not in observation.metadata
 
 
 def test_absent_trace_event_does_not_claim_trace_completeness() -> None:
