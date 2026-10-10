@@ -5,6 +5,7 @@ from core.models.evaluation import (
     EvaluationResult,
     EvaluationRule,
     EvaluationStatus,
+    SemanticEvaluationConfig,
 )
 from core.models.execution import ExecutionResult
 from core.models.observation import Observation
@@ -23,6 +24,7 @@ __all__ = [
     "EvaluationConfig",
     "EvaluationResult",
     "EvaluationStatus",
+    "SemanticEvaluationConfig",
     "ExecutionResult",
     "ExternalReference",
     "Observation",

@@ -1,5 +1,10 @@
 Bạn đang hỗ trợ tôi phát triển đồ án:
 
+> Cập nhật Week 5 (2026-10-06): xem `docs/week5-member2-handoff.md` và
+> `docs/week5-evaluation-contract.md` cho trạng thái mới nhất. Bản handoff mới
+> chuyển sang hybrid evaluation bằng external agent đọc Markdown skills;
+> phần Người 2 đã có assets/configuration, phần connector/resolver thuộc Người 1.
+
 **AI Agent Security Testing Framework**
 
 ## 1. Mục tiêu project
@@ -128,6 +133,7 @@ Các nhóm lỗ hổng đã được triển khai:
 * Prompt Injection
 * Tool Misuse
 * Sensitive Data Disclosure
+* Goal Hijacking
 
 Framework hiện hỗ trợ:
 
@@ -137,7 +143,9 @@ Framework hiện hỗ trợ:
 * Garak external-tool PoC thông qua `SecurityToolProvider` và `GarakProvider`, tách biệt
   khỏi `TargetAdapter`.
 
-Goal Hijacking là công việc dự kiến cho Week 5 và chưa được triển khai.
+Goal Hijacking đã có attack module, payload và ba testcase. Week 5 Người 2 đã
+bổ sung trusted original/attacker goals, Markdown evaluator skills và dataset.
+Native runner hiện vẫn rule-only; external evaluator integration chưa triển khai.
 
 Grey-box và white-box nằm ngoài phạm vi của project 10 tuần này.
 
@@ -147,7 +155,8 @@ Các thành phần chưa thuộc phạm vi hiện tại gồm:
 * database
 * FastAPI
 * SSE
-* LLM Judge
+* LLM judge hard-code methodology trong Python (external skill-driven evaluator
+  thuộc phạm vi Week 5 mới; connector/resolver do Người 1 phụ trách)
 * PyRIT
 * attack orchestration phức tạp
 * ExecutionPlan

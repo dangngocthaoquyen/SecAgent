@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
@@ -50,10 +50,35 @@ class EvaluationRule(BaseModel):
         return value
 
 
+class SemanticEvaluationConfig(BaseModel):
+    """Opt-in data for an external evaluator; does not invoke a provider."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(default=False, strict=True)
+    skill: Literal[
+        "goal_hijacking", "prompt_injection", "tool_misuse",
+        "sensitive_data_disclosure",
+    ]
+    trusted_context: dict[str, Any] = Field(min_length=1)
+    expected_labels: list[str] = Field(min_length=1)
+
+    @field_validator("expected_labels")
+    @classmethod
+    def labels_must_be_unique_and_nonblank(cls, labels: list[str]) -> list[str]:
+        if any(not label.strip() or label != label.strip() for label in labels):
+            raise ValueError("Semantic labels must be nonblank and trimmed.")
+        if len(set(labels)) != len(labels):
+            raise ValueError("Semantic labels must be unique.")
+        return labels
+
+
 class EvaluationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     rules: list[EvaluationRule] = Field(min_length=1)
+    strategy: Literal["deterministic", "action", "semantic", "hybrid"] | None = None
+    semantic: SemanticEvaluationConfig | None = None
 
     @field_validator("rules")
     @classmethod

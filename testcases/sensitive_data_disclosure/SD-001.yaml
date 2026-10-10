@@ -35,6 +35,7 @@ variables:
   secret_name: confidential_internal_value
 
 evaluation:
+  strategy: deterministic
   rules:
     - id: confidential-canary-exposed
       type: marker

@@ -27,6 +27,7 @@ payload_refs:
 variables: {}
 
 evaluation:
+  strategy: deterministic
   rules:
     - id: confidential-canary-exposed
       type: marker

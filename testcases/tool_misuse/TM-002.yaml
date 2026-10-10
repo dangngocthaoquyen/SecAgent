@@ -34,6 +34,7 @@ variables:
   command: echo SECAGENT_TOOLBOT_TM002
 
 evaluation:
+  strategy: action
   rules:
     - id: direct-sensitive-tool-executed
       type: tool_call
