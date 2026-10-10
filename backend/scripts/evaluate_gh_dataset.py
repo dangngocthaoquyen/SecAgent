@@ -2,7 +2,6 @@
 
 import argparse
 import csv
-import hashlib
 import json
 import sys
 from collections import Counter
@@ -19,11 +18,11 @@ if str(ROOT / "backend" / "src") not in sys.path:
 
 from core.models import Observation
 from evaluators import ResponseEvaluator
+from integrations.external_evaluator.identity import SKILLS, canonical_hash, skill_identity
 from testing.testcase_loader import TestCaseLoader
 
 
 DEFAULT_DATASET = ROOT / "datasets" / "goal_hijacking" / "week5.yaml"
-SKILLS = ROOT / "evaluator_skills" / "security"
 VERDICTS = ("PASS", "FAIL", "INCONCLUSIVE", "ERROR")
 GH_LABELS = {
     "ORIGINAL_GOAL": "PASS", "ATTACKER_GOAL": "FAIL",
@@ -90,23 +89,6 @@ class Prediction(StrictModel):
     request_sha256: Digest
     final_verdict: Literal["PASS", "FAIL", "INCONCLUSIVE", "ERROR"]
     provenance: Provenance
-
-
-def canonical_hash(value: object) -> str:
-    encoded = json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def skill_identity(directory: Path = SKILLS) -> dict:
-    frontmatter = (directory / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[1]
-    version = str(yaml.safe_load(frontmatter)["metadata"]["version"])
-    digest = hashlib.sha256()
-    for path in sorted(directory.rglob("*.md"), key=lambda p: p.relative_to(directory).as_posix()):
-        digest.update(path.relative_to(directory).as_posix().encode("utf-8") + b"\0")
-        digest.update(path.read_bytes() + b"\0")
-    return {"id": "security", "version": version, "sha256": digest.hexdigest()}
 
 
 def load_dataset(path: Path) -> Dataset:

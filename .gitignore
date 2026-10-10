@@ -33,3 +33,5 @@ Thumbs.db
 # Garak generated smoke reports
 results/smoke/week4/*.report.html
 results/smoke/week4/*.report.jsonl
+
+.pytest-tmp/
