@@ -1,6 +1,6 @@
 """Opt-in rule-first evaluator with a separate external recommendation boundary."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 from core.models import EvaluationResult, EvaluationStatus, Observation, TestCase
@@ -25,6 +25,13 @@ class HybridEvaluationDiagnostic:
     recommendation: EvaluationStatus | None = None
     provider_fault_code: ProviderFaultCode | None = None
     provider_duration_ms: float | None = None
+    deterministic_result: dict | None = None
+    effective_deterministic_result: dict | None = None
+    judge_reason: str | None = None
+    judge_evidence: tuple[dict, ...] = ()
+    json_validation_status: str = "not_evaluated"
+    provider_exit_code: int | None = None
+    downgrade_reason: str | None = None
 
 
 class HybridEvaluator(BaseEvaluator):
@@ -51,14 +58,14 @@ class HybridEvaluator(BaseEvaluator):
         if effective.status is not EvaluationStatus.INCONCLUSIVE or semantic is None or not semantic.enabled:
             self._record(HybridEvaluationDiagnostic(
                 testcase.id, baseline.status, effective.status, False,
-            ))
+            ), baseline, effective)
             return effective
 
         # Category and skill must agree; never select a rubric from response data.
         if semantic.skill != testcase.category:
             self._record(HybridEvaluationDiagnostic(
                 testcase.id, baseline.status, effective.status, False,
-            ))
+            ), baseline, effective)
             return effective
         try:
             request = self._request_builder.build(testcase, observation)
@@ -66,7 +73,7 @@ class HybridEvaluator(BaseEvaluator):
             self._record(HybridEvaluationDiagnostic(
                 testcase.id, baseline.status, effective.status, False,
                 provider_fault_code=ProviderFaultCode.SKILL_UNAVAILABLE,
-            ))
+            ), baseline, effective)
             return effective
 
         try:
@@ -77,7 +84,8 @@ class HybridEvaluator(BaseEvaluator):
                 testcase.id, baseline.status, effective.status, True,
                 request.sha256, request.skill.version, request.skill.sha256,
                 provider_fault_code=ProviderFaultCode.PROCESS_ERROR,
-            ))
+                json_validation_status="provider_fault",
+            ), baseline, effective)
             return effective
         resolved = resolve_verdict(effective, outcome, request, observation, testcase)
         recommendation, validation_fault = validated_recommendation(outcome, request)
@@ -88,7 +96,14 @@ class HybridEvaluator(BaseEvaluator):
             recommendation=recommendation.verdict if recommendation else None,
             provider_fault_code=validation_fault,
             provider_duration_ms=outcome.duration_ms,
-        ))
+            judge_reason=recommendation.reason if recommendation else None,
+            judge_evidence=tuple(item.model_dump(mode="json") for item in recommendation.evidence) if recommendation else (),
+            json_validation_status=("valid" if recommendation else "not_evaluated"
+                if validation_fault in {ProviderFaultCode.JUDGE_DISABLED, ProviderFaultCode.BUDGET_EXHAUSTED}
+                else "provider_fault"),
+            provider_exit_code=outcome.exit_code,
+            downgrade_reason=resolved.reason if recommendation and recommendation.verdict != resolved.status else None,
+        ), baseline, effective)
         return resolved
 
     @staticmethod
@@ -132,7 +147,10 @@ class HybridEvaluator(BaseEvaluator):
                     )
         return result
 
-    def _record(self, diagnostic: HybridEvaluationDiagnostic) -> None:
+    def _record(self, diagnostic: HybridEvaluationDiagnostic, baseline=None, effective=None) -> None:
+        diagnostic = replace(diagnostic,
+            deterministic_result=baseline.model_dump(mode="json") if baseline else None,
+            effective_deterministic_result=effective.model_dump(mode="json") if effective else None)
         if self._diagnostic_sink is not None:
             try:
                 self._diagnostic_sink(diagnostic)

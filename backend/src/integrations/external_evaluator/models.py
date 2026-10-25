@@ -101,6 +101,8 @@ class ExternalEvaluationResult(StrictModel):
 
 
 class ProviderFaultCode(str, Enum):
+    JUDGE_DISABLED = "judge_disabled"
+    BUDGET_EXHAUSTED = "budget_exhausted"
     SKILL_UNAVAILABLE = "skill_unavailable"
     SKILL_MISMATCH = "skill_mismatch"
     EXECUTABLE_MISSING = "executable_missing"

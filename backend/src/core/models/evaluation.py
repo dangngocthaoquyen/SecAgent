@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 
 class EvaluationStatus(str, Enum):
@@ -76,9 +76,15 @@ class SemanticEvaluationConfig(BaseModel):
 class EvaluationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    rules: list[EvaluationRule] = Field(min_length=1)
+    rules: list[EvaluationRule]
     strategy: Literal["deterministic", "action", "semantic", "hybrid"] | None = None
     semantic: SemanticEvaluationConfig | None = None
+
+    @model_validator(mode="after")
+    def require_evaluation_method(self) -> "EvaluationConfig":
+        if not self.rules and not (self.semantic is not None and self.semantic.enabled):
+            raise ValueError("Evaluation requires deterministic rules or explicitly enabled semantic evaluation.")
+        return self
 
     @field_validator("rules")
     @classmethod

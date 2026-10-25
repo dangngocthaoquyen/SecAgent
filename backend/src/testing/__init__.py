@@ -3,9 +3,11 @@
 from testing.executor import Executor
 from testing.runner import Runner
 from testing.testcase_loader import TestCaseLoader
+from testing.evaluation_config import RunnerEvaluationConfig
 
 __all__ = [
     "Executor",
     "Runner",
     "TestCaseLoader",
+    "RunnerEvaluationConfig",
 ]
