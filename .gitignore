@@ -35,3 +35,15 @@ results/smoke/week4/*.report.html
 results/smoke/week4/*.report.jsonl
 
 .pytest-tmp/
+
+# Local Judge captures, prepared requests, live/offline run reports and smoke output.
+# Reviewed replay inputs belong under backend/tests/fixtures, not results/.
+results/judge-validation/
+results/smoke/week5/
+
+# Local agent auth/workspaces (never version credentials or session state).
+.pi/
+.pi-coding-agent/
+.codex/auth.json
+.aws/credentials
+*.credentials.json

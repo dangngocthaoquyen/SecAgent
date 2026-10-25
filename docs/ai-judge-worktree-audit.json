@@ -1,0 +1,376 @@
+{
+  "branch": "Q/w5-external-judge",
+  "head": "00ba445ece710e100949ccd82ac86ed6f8618d83",
+  "scope": "All nonignored tracked modifications and untracked files present at start of finalization; inventory and final report themselves excluded.",
+  "counts": {
+    "tracked_modified": 2,
+    "untracked": 39
+  },
+  "changes_made_this_phase": [
+    "docs/ai-judge-poc-final.md",
+    "docs/ai-judge-worktree-audit.json"
+  ],
+  "tests": {
+    "focused": {
+      "passed": 140,
+      "seconds": 7.55
+    },
+    "regression": {
+      "passed": 463,
+      "seconds": 16.71
+    }
+  },
+  "limits": "Inventory is not a comprehensive credential scanner; review any artifact before publication. Ignored caches/environment files are excluded and were not exposed. No source changes, deletion or model calls in this phase.",
+  "files": [
+    {
+      "path": "backend/src/core/models/evaluation.py",
+      "git_state_at_audit": "tracked_modified",
+      "bytes": 3891,
+      "sha256": "8fba0f2d5865b0f439010bc7cc3ea55bbba15098a7a95fc5313bd2f9a52fb51f",
+      "category": "essential infrastructure source",
+      "recommendation": "preserve tracked change"
+    },
+    {
+      "path": "backend/src/evaluators/verdict_resolver.py",
+      "git_state_at_audit": "tracked_modified",
+      "bytes": 3069,
+      "sha256": "d91c6c4ef16f8cc58345855a88fff4e9bca3cbc6813a3868668b2b93d9aa4d9d",
+      "category": "essential infrastructure source",
+      "recommendation": "preserve tracked change"
+    },
+    {
+      "path": "backend/scripts/run_dvaa_judge.py",
+      "git_state_at_audit": "untracked",
+      "bytes": 12504,
+      "sha256": "92d8d102337b8ba267f31db986c3095df495b1e3b43233751ef605fc1e618b70",
+      "category": "essential developer entry point",
+      "recommendation": "version with tests"
+    },
+    {
+      "path": "backend/scripts/run_native_smoke.py",
+      "git_state_at_audit": "untracked",
+      "bytes": 6370,
+      "sha256": "ea8cef85535099e8a6119ff1559c4ab6cb5d699c5a1f35b1318d230af62fe3bd",
+      "category": "pre-existing native smoke entry point",
+      "recommendation": "separate owner-reviewed change; not independent Judge prerequisite"
+    },
+    {
+      "path": "backend/scripts/validate_independent_judge.py",
+      "git_state_at_audit": "untracked",
+      "bytes": 18308,
+      "sha256": "591e2eadd019da245b14cf173e0b2fff1fb666a54f584630fb36a6519a99af10",
+      "category": "essential developer entry point",
+      "recommendation": "version with tests"
+    },
+    {
+      "path": "backend/tests/test_dvaa_judge_flow.py",
+      "git_state_at_audit": "untracked",
+      "bytes": 11157,
+      "sha256": "ebb29aa2542e5606c83f3e22a475d108abfecc28c946ddfabd17938c433a6d81",
+      "category": "essential offline regression tests",
+      "recommendation": "version; retain required replay fixture"
+    },
+    {
+      "path": "backend/tests/test_independent_judge.py",
+      "git_state_at_audit": "untracked",
+      "bytes": 15338,
+      "sha256": "07f18a6f23de31bd268020f73696885472d9102bce5a54a3787ccb1070ed8e23",
+      "category": "essential offline regression tests",
+      "recommendation": "version; retain required replay fixture"
+    },
+    {
+      "path": "configs/targets/dvaa-legacybot.yaml",
+      "git_state_at_audit": "untracked",
+      "bytes": 540,
+      "sha256": "b099e7bc1a917407b629a843b0346d35cc657ae697c8cdbaa9f3ce9b7a1c135c",
+      "category": "public HTTP target configuration; required by new tests",
+      "recommendation": "version with integration tests"
+    },
+    {
+      "path": "configs/targets/dvaa-ragbot.yaml",
+      "git_state_at_audit": "untracked",
+      "bytes": 531,
+      "sha256": "b58e32fc804459879f891bbcc23b527f361ccc2dd042dec2f615f6cdc038b211",
+      "category": "pre-existing optional RAG target configuration",
+      "recommendation": "separate owner-reviewed change"
+    },
+    {
+      "path": "configs/targets/dvaa-securebot.yaml",
+      "git_state_at_audit": "untracked",
+      "bytes": 480,
+      "sha256": "d90ad5fd8f28548ca3fa4ac9b62466a4bd6b8d56f5c8cbf535e846cec233e159",
+      "category": "public HTTP target configuration; required by new tests",
+      "recommendation": "version with integration tests"
+    },
+    {
+      "path": "docs/dvaa-judge-integration.md",
+      "git_state_at_audit": "untracked",
+      "bytes": 8020,
+      "sha256": "06b697dba22a6701bc04fabf1138e972bcca7b6176c32caa5cab1be3867a1605",
+      "category": "developer documentation",
+      "recommendation": "version; use final report as current status"
+    },
+    {
+      "path": "docs/independent-judge-validation.md",
+      "git_state_at_audit": "untracked",
+      "bytes": 13551,
+      "sha256": "bc62ef616fd53cad774903715ef1c9616ee1020b3f48bb825b2b014db67b721f",
+      "category": "developer documentation",
+      "recommendation": "version; use final report as current status"
+    },
+    {
+      "path": "docs/judge-reliability-readiness.md",
+      "git_state_at_audit": "untracked",
+      "bytes": 12373,
+      "sha256": "ba12226d6c875a751d12900f339723ac60cff94bf422f2075315fbf71e33eea2",
+      "category": "developer documentation",
+      "recommendation": "version; use final report as current status"
+    },
+    {
+      "path": "results/judge-validation/dvaa-asi01-observations.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 2963,
+      "sha256": "86a1f02359ae479ad7ceb312de8aa1ae06736395dcb0bd22cd68586b1c4cb632",
+      "category": "fixed sanitized capture fixture required by current tests",
+      "recommendation": "version explicitly at current path or approve relocation and test updates",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/dvaa-fake.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 11732,
+      "sha256": "3048a9dd56e02de57d0f0fcc0df30a796cced5afb9b35cb7bc4aa0613f75afcc",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/dvaa-securebot-live.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 7170,
+      "sha256": "9a116a2b46a482813d09f244d320bc8313880b10ed712ce41229a9847baf59e0",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/fake.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 16810,
+      "sha256": "9f29c4f62b21871bf4a3ee303986372b7d5c375a5b910c9b050d9c3662903df4",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/gate4-summary.md",
+      "git_state_at_audit": "untracked",
+      "bytes": 1659,
+      "sha256": "b957626b214466b505929b2e3f209cb67e5f1eefa7303bbe4f592be988ec1f0a",
+      "category": "generated historical gate summary",
+      "recommendation": "keep local; final consolidated report is versionable"
+    },
+    {
+      "path": "results/judge-validation/gate4b-dvaa-fake.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 12667,
+      "sha256": "26813f5c2b5df475134b7e96e12ad262da6a7ceaf2c9d8b394d403777a646bd2",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/gate4b-summary.md",
+      "git_state_at_audit": "untracked",
+      "bytes": 2315,
+      "sha256": "9d79b6e436e8bfb8cd1cbb71afb560c6921d466044b2977bc6a93a85090ba4ee",
+      "category": "generated historical gate summary",
+      "recommendation": "keep local; final consolidated report is versionable"
+    },
+    {
+      "path": "results/judge-validation/gate5-controlled-prompt.txt",
+      "git_state_at_audit": "untracked",
+      "bytes": 373,
+      "sha256": "ca42d689c4fe46e5166396375ddb2ffbe5e93c8d700b232a3359fd8852798af0",
+      "category": "public manually specified simulated probe input",
+      "recommendation": "optional versioned example; filename summary-only does not mean clean baseline"
+    },
+    {
+      "path": "results/judge-validation/gate5-legacybot-offline.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 6817,
+      "sha256": "229ec20f77d52b0c32a7e04420328d27082c052b6e55dfbe13260e4e17afcfba",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/gate5-securebot-live.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 5541,
+      "sha256": "26c960e37f575dc167f4941089c593a5dfbed1c5dc4fc7eaff03ca830fd9675d",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/gate5-securebot-offline.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 6817,
+      "sha256": "25fb7cee2dce54291d566e02d9c604d132d33ec3e333dfe50d3afe9d0bf1d3a9",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/reliability-readiness/gate5-synthetic-offline-matrix.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 36365,
+      "sha256": "d6ac900f7a6bfa8930774a8f9ab6f2554a7c6f1f4091396a6af8eeea7187b215",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/reliability-readiness/historical-dvaa-index.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 3610,
+      "sha256": "97f9c07a4dc915ec2ff53cf01112a1156b6b0c9888c8e4a3a5d18989afc560d0",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/reliability-readiness/legacybot-b-collected.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 3589,
+      "sha256": "edd32fb8eedc925635b2b1661f2e3df890da0233f9d48a224af3fcf4f6234e35",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/reliability-readiness/legacybot-b-evaluation-request.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 3279,
+      "sha256": "0084f28e578b062dffd494c88e238e6042bc39af68eab9d7f8700027363dc7e5",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/reliability-readiness/legacybot-b-judge-live.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 6672,
+      "sha256": "2080de35790bd70d1236caacf563b101fac0d941269514edc0bf608aa5fe485b",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/reliability-readiness/legacybot-b-request-provenance.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 1264,
+      "sha256": "cbfe012cf964429e8ec0a0ae007845e3da07eb714ba4e8ba6066c9be1f040f04",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/reliability-readiness/securebot-b-collected.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 3471,
+      "sha256": "ef9c6bd44fd07ee65c577b57d8ca0a8bad04c550c57e94b3c4cc0ce27417c054",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/reliability-readiness/securebot-b-evaluation-request.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 3167,
+      "sha256": "e7896f4079423d3b22f1a2b15477490881e1029441a1ee89fe1310ea2ae3bb1a",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/reliability-readiness/securebot-b-judge-live.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 6379,
+      "sha256": "c429815f9168efc37eb2091f4975dccdbae0e616c5aae4fc0d34223f82343bf1",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/reliability-readiness/securebot-b-provisional-human-assessment.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 1320,
+      "sha256": "d1537e00db7c840a3082e0f69216517885d86253575fe63454d25c593e42df82",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/reliability-readiness/securebot-b-request-provenance.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 1676,
+      "sha256": "d7d1b77e098cabd956c7c649e23e69c8c483a45c3da24052e207b48cc5bd1ecd",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/reliability-readiness/securebot-legacybot-b-paired-comparison.md",
+      "git_state_at_audit": "untracked",
+      "bytes": 4637,
+      "sha256": "1b4c2df40d9322b76e1f0612fcbaf31c536baa1905dc8b33bbe35c0a703e11e2",
+      "category": "generated historical paired report",
+      "recommendation": "keep local; Unicode transcription differs from authoritative JSON"
+    },
+    {
+      "path": "results/judge-validation/reliability-readiness/summary-only-prompt.txt",
+      "git_state_at_audit": "untracked",
+      "bytes": 293,
+      "sha256": "682f1bbea94c2ad0d9faac98461214dfc2ade22d63193f03e7b110d85e1cec6c",
+      "category": "public manually specified simulated probe input",
+      "recommendation": "optional versioned example; filename summary-only does not mean clean baseline"
+    },
+    {
+      "path": "results/judge-validation/reliability-readiness/synthetic-offline-matrix.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 37727,
+      "sha256": "99261e88641b26827e31733154f2919e2e1bb4623fc2f3430f05ea29d557aa22",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/judge-validation/validation-summary.md",
+      "git_state_at_audit": "untracked",
+      "bytes": 1865,
+      "sha256": "3019bbbde61bc2a60585e231e10022fb3a2e8c16ee76265608f037ee57d96211",
+      "category": "generated historical gate summary",
+      "recommendation": "keep local; final consolidated report is versionable"
+    },
+    {
+      "path": "results/smoke/week5/native-20261010T081022398946Z-GH-001-dvaa-ragbot.secagent.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 531,
+      "sha256": "c9bc181f5455343b08a598f7e5ad661cce0962aaefc4456091a609f2789fdf6b",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    },
+    {
+      "path": "results/smoke/week5/native-20261010T082015112805Z-GH-001-dvaa-legacybot.secagent.json",
+      "git_state_at_audit": "untracked",
+      "bytes": 534,
+      "sha256": "aa7ca701bafc30ba033e961db4c91a09f68dda01c98375288964f7c210a98ab5",
+      "category": "generated runtime result/capture/request/provenance",
+      "recommendation": "keep local by default; promote only reviewed frozen sanitized fixtures",
+      "json_valid": true
+    }
+  ]
+}
