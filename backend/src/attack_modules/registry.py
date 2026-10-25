@@ -70,11 +70,13 @@ class AttackModuleRegistry:
     
 def build_default_attack_module_registry() -> AttackModuleRegistry:
     from attack_modules.goal_hijacking import GoalHijackingAttackModule
+    from attack_modules.identity_privilege_abuse import IdentityPrivilegeAbuseAttackModule
     from attack_modules.prompt_injection import PromptInjectionAttackModule
     from attack_modules.tool_misuse import ToolMisuseAttackModule
     from attack_modules.sensitive_data_disclosure import (
         SensitiveDataDisclosureAttackModule,
     )
+    from attack_modules.unexpected_code_execution import UnexpectedCodeExecutionAttackModule
 
     registry = AttackModuleRegistry()
 
@@ -96,5 +98,13 @@ def build_default_attack_module_registry() -> AttackModuleRegistry:
     registry.register(
         "goal_hijacking",
         GoalHijackingAttackModule(),
+    )
+    registry.register(
+        "identity_privilege_abuse",
+        IdentityPrivilegeAbuseAttackModule(),
+    )
+    registry.register(
+        "unexpected_code_execution",
+        UnexpectedCodeExecutionAttackModule(),
     )
     return registry
