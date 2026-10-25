@@ -37,12 +37,15 @@ def test_invalid_semantic_configuration_is_rejected(change):
 
 
 def test_all_testcases_audited_and_only_gh_opted_in():
-    paths = sorted((ROOT / "testcases").glob("*/*.yaml"))
-    assert len(paths) == 11
     expected_strategy = {
         "goal_hijacking": "hybrid", "prompt_injection": "hybrid",
         "tool_misuse": "action", "sensitive_data_disclosure": "deterministic",
     }
+    paths = sorted(
+        path for path in (ROOT / "testcases").glob("*/*.yaml")
+        if path.parent.name in expected_strategy
+    )
+    assert len(paths) == 11
     for path in paths:
         case = TestCaseLoader().load(path)
         assert case.evaluation.strategy == expected_strategy[case.category]

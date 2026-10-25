@@ -3,9 +3,11 @@
 from testing.executor import Executor
 from testing.runner import Runner
 from testing.testcase_loader import TestCaseLoader
+from testing.testcase_binding import bind_testcase_variables
 
 __all__ = [
     "Executor",
     "Runner",
     "TestCaseLoader",
+    "bind_testcase_variables",
 ]
