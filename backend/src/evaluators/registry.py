@@ -1,4 +1,5 @@
 from collections.abc import Iterable
+from evaluators.rules.collector_receipt import CollectorReceiptRule
 
 from evaluators.rules import (
     BaseEvaluationRule,
@@ -54,5 +55,6 @@ def build_default_registry() -> EvaluationRuleRegistry:
             RegexRule(),
             StatusCodeRule(),
             ToolCallRule(),
+            CollectorReceiptRule(),
         ]
     )

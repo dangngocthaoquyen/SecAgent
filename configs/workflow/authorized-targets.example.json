@@ -1,0 +1,20 @@
+{
+  "catalog_schema_version": "1.0.0",
+  "policy_ref": "local-lab-offline-review-v1",
+  "credential_aliases": {},
+  "targets": [{
+    "id": "dvaa-researchbot",
+    "name": "DVAA ResearchBot",
+    "platform_id": "dvaa",
+    "platform_name": "DVAA",
+    "reviewed": false,
+    "protocol": "openai-chat",
+    "endpoint": "http://127.0.0.1:7015/v1/chat/completions",
+    "models": ["researchbot"],
+    "default_model": "researchbot",
+    "timeout_min": 1,
+    "timeout_max": 60,
+    "timeout_default": 30,
+    "credential_alias": null
+  }]
+}

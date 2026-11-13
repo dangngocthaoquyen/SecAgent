@@ -117,8 +117,8 @@ class HybridEvaluator(BaseEvaluator):
                 reason="An explicitly partial response cannot establish deterministic completion.",
             )
         if result.status is EvaluationStatus.PASS and result.matched_rule_type == "tool_call":
-            # Legacy tool_call PASS accepts a metadata string alone. The hybrid
-            # path requires an actual trace matching a trusted configured scope.
+            # Require the semantic contract's scope as well as the deterministic
+            # rule's independently verified scoped trace.
             semantic = testcase.evaluation.semantic
             required_scope = (semantic.trusted_context.get("required_trace_scope")
                               if semantic is not None and semantic.enabled else None)
@@ -126,6 +126,9 @@ class HybridEvaluator(BaseEvaluator):
                        item.kind == "tool_trace"
                        and item.data.get("completeness") == "complete"
                        and item.data.get("scope") == required_scope
+                       and item.data.get("execution_verified") is True
+                       and item.data.get("provenance") == "independent_observer"
+                       and item.source != "http_response"
                        for item in observation.evidence):
                 return EvaluationResult(
                     status=EvaluationStatus.INCONCLUSIVE,

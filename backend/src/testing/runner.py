@@ -18,6 +18,7 @@ from core.models import (
     TestInput,
 )
 from evaluators import BaseEvaluator
+from core.models.evidence import public_evidence_data
 from observers import BaseObserver, ResponseObserver
 from testing.executor import Executor
 from testing.evaluation_config import RunnerEvaluationConfig, configured_evaluator
@@ -147,12 +148,11 @@ class Runner:
                 "success": executed.success, "status_code": executed.status_code,
                 "duration_ms": executed.duration_ms, "response_complete": executed.response_complete},
             "observation": None if observed is None else {
-                "response_text": observed.response_text,
+                "response_text": observed.response_text if executed is not None and executed.success else None,
                 "response_complete": observed.metadata.get("response_complete"),
                 "evidence": [{"kind": item.kind, "source": item.source, "name": item.name,
                     "success": item.success, "reference": item.reference,
-                    "data": {key: item.data[key] for key in ("scope", "completeness")
-                             if key in item.data and isinstance(item.data[key], str)}} for item in observed.evidence]},
+                    "data": public_evidence_data(item)} for item in observed.evidence]},
             "deterministic_result": diagnostic["deterministic_result"] if diagnostic else (
                 final if not self._custom_evaluator and observed is not None
                 and self._evaluation_config.mode == "rule_only" else None),

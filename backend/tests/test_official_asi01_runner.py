@@ -80,7 +80,7 @@ def execute_official(tmp_path, case_id, response, label="UNCLEAR", *, mode="vali
     assert report["evaluation_mode"] == "hybrid"
     assert report["execution"]["response_complete"] is None
     assert report["observation"]["response_complete"] is None
-    assert report["observation"]["evidence"] == []
+    assert all(item["kind"] == "http_response_metadata" for item in report["observation"]["evidence"])
     assert len(transport.requests) == len(adapter.prepared) == 1
     assert adapter.prepared[0].metadata["attack_module"] == "goal_hijacking"
     for private in ("PRIVATE_BODY_SENTINEL", "PRIVATE_HEADER_SENTINEL", "response_headers", "raw_output"):

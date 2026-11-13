@@ -3,6 +3,7 @@
 from uuid import uuid4
 
 from core.models import Observation, TestCase
+from core.models.evidence import public_evidence_data
 from integrations.external_evaluator.models import EvaluationRequest
 from integrations.external_evaluator.skills import SkillBundleLoader
 
@@ -25,8 +26,7 @@ class EvaluationRequestBuilder:
         for item in observation.evidence:
             # Evidence identity is adapter/observer supplied. Do not forward tool
             # arguments, results, private headers, or arbitrary event data.
-            data = {key: item.data[key] for key in ("scope", "completeness")
-                    if key in item.data and isinstance(item.data[key], str)}
+            data = public_evidence_data(item)
             evidence.append({
                 "kind": item.kind, "source": item.source, "name": item.name,
                 "success": item.success, "data": data, "reference": item.reference,

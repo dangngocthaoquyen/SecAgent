@@ -29,8 +29,9 @@ class HttpClientError(Exception):
 class HttpClient:
     """Perform HTTP requests without target-specific behavior."""
 
-    def __init__(self, client: httpx.Client | None = None) -> None:
+    def __init__(self, client: httpx.Client | None = None, *, trust_env: bool = True) -> None:
         self._client = client
+        self._trust_env = trust_env
 
     def request(
         self,
@@ -57,7 +58,7 @@ class HttpClient:
             if self._client is not None:
                 response = self._client.request(**request_kwargs)
             else:
-                with httpx.Client() as client:
+                with httpx.Client(trust_env=self._trust_env, follow_redirects=False) as client:
                     response = client.request(**request_kwargs)
         except httpx.RequestError as exc:
             duration_ms = (perf_counter() - started_at) * 1000

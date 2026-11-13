@@ -136,7 +136,7 @@ def test_normalized_events_become_existing_evidence_models() -> None:
     assert observation.evidence[0].data["arguments"] == {"value": "harmless"}
 
 
-def test_complete_tool_trace_event_propagates_to_observation_metadata() -> None:
+def test_complete_tool_trace_remains_scoped_evidence_only() -> None:
     result = ExecutionResult(
         success=True,
         events=[
@@ -150,7 +150,7 @@ def test_complete_tool_trace_event_propagates_to_observation_metadata() -> None:
 
     observation = ResponseObserver().observe(result)
 
-    assert observation.metadata["tool_trace"] == "complete"
+    assert "tool_trace" not in observation.metadata
     assert observation.evidence[0].kind == "tool_trace"
     assert "response_complete" not in observation.metadata
 

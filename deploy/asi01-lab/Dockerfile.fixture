@@ -1,0 +1,10 @@
+# Resolve the base tag to a reviewed digest before building (see runbook).
+ARG PYTHON_IMAGE
+FROM ${PYTHON_IMAGE}
+COPY requirements.fixture.txt /tmp/requirements.fixture.txt
+RUN python -m pip install --no-cache-dir -r /tmp/requirements.fixture.txt \
+    && python -m pip check
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+USER 10001:10001
+WORKDIR /workspace
+# Application source is supplied by narrow read-only Compose mounts.

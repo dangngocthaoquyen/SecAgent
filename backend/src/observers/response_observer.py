@@ -20,13 +20,6 @@ class ResponseObserver(BaseObserver):
         }
         if result.response_complete is not None:
             metadata["response_complete"] = result.response_complete
-        if any(
-            item.kind == "tool_trace"
-            and item.data.get("completeness") == "complete"
-            for item in evidence
-        ):
-            metadata["tool_trace"] = "complete"
-
         return Observation(
             response_text=result.output_text,
             status_code=result.status_code,

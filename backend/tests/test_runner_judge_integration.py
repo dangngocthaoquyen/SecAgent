@@ -1,6 +1,7 @@
 """Production Runner wiring: in-memory cases, registered modules, no network."""
 import importlib.util
 import json
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -257,11 +258,37 @@ def test_native_entry_point_persists_runner_diagnostics_without_legacy_case_file
     monkeypatch.setattr(native, "load_target", lambda path: target())
     prompt = tmp_path / "prompt.txt"
     prompt.write_text("Controlled public prompt.")
-    output, report = native.run_smoke(tmp_path / "unused-target", tmp_path / "unused-case", tmp_path,
+    run_id = "a" * 32
+    run_dir = tmp_path / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    output, report = native.run_smoke(tmp_path / "unused-target", tmp_path / "unused-case", run_dir,
         executor=FakeExecutor(), prompt_file=prompt, judge_provider=FakeJudge(),
         evaluation_config=RunnerEvaluationConfig(mode="hybrid", judge_enabled=True, max_judge_calls=1))
     assert report["evaluation_status"] == "FAIL"
     assert json.loads(output.read_text())["evaluation"]["judge"]["classification"] == "ATTACKER_GOAL"
+    (run_dir / "run-summary.json").write_text(json.dumps({
+        "run_id": run_id, "report_persisted": True, "report_file": output.name,
+        "report_sha256": sha256(output.read_bytes()).hexdigest(),
+        "native_execution_id": report["evaluation"]["run_id"],
+        "testcase_id": report["testcase_id"], "target_id": report["target_id"],
+    }), encoding="utf-8")
+    manifest = tmp_path / "reporting-selection.json"
+    manifest.write_text(json.dumps({"dataset_schema_version": "1.0.0",
+        "allowed_roots": {"controlled": "runs"}, "controlled_runs_root": "controlled",
+        "reports": [], "verification_jobs": []}), encoding="utf-8")
+    from reporting.api import create_app
+    from reporting.repository import load_dataset, load_controlled_run
+    from reporting.normalizers import normalize_report_bytes
+    normalized_direct = normalize_report_bytes(output.read_bytes())
+    normalized = load_controlled_run(load_dataset(manifest), run_id)
+    assert normalized == normalized_direct
+    client = create_app(load_dataset(manifest)).test_client()
+    result = client.get("/api/reports/runs/" + run_id)
+    assert result.status_code == 200
+    detail = result.get_json()["execution"]
+    assert detail["security"]["verdict"] == report["evaluation"]["final_verdict"]
+    assert detail["observation"]["response_preview"] == report["evaluation"]["observation"]["response_text"]
+    assert client.get("/api/reports/executions").get_json()["total"] == 0
 
 
 def test_successful_calls_share_runner_lifetime_budget_without_reset():

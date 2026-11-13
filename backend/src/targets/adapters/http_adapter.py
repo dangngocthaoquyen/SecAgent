@@ -7,6 +7,7 @@ from typing import Any
 
 from core.models import ExecutionResult, TargetProfile, TestInput
 from targets.adapters.base import BaseTargetAdapter, TargetAdapterError
+from targets.adapters.http_evidence import reported_http_evidence
 from tools.http import HttpClient, HttpClientError, HttpResponse
 
 
@@ -24,7 +25,7 @@ class HttpTargetAdapter(BaseTargetAdapter):
     """Render configured HTTP requests and normalize their responses."""
 
     def __init__(self, http_client: HttpClient | None = None) -> None:
-        self._http_client = http_client or HttpClient()
+        self._http_client = http_client
 
     def execute(
         self,
@@ -41,7 +42,7 @@ class HttpTargetAdapter(BaseTargetAdapter):
         timeout = self._timeout(config.get("timeout"))
 
         try:
-            response = self._http_client.request(
+            response = (self._http_client or HttpClient(trust_env=config.get("trust_env", True))).request(
                 method=method,
                 url=url,
                 headers=headers,
@@ -148,6 +149,7 @@ class HttpTargetAdapter(BaseTargetAdapter):
                 headers=response.headers,
                 duration_ms=response.duration_ms,
                 error=f"HTTP request returned status code {response.status_code}.",
+                events=reported_http_evidence(response.json_body),
             )
 
         try:
@@ -163,6 +165,7 @@ class HttpTargetAdapter(BaseTargetAdapter):
                 headers=response.headers,
                 duration_ms=response.duration_ms,
                 error=str(exc),
+                events=reported_http_evidence(response.json_body),
             )
 
         return ExecutionResult(
@@ -173,6 +176,7 @@ class HttpTargetAdapter(BaseTargetAdapter):
             headers=response.headers,
             duration_ms=response.duration_ms,
             error=None,
+            events=reported_http_evidence(response.json_body),
         )
 
     @classmethod

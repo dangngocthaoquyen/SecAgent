@@ -102,6 +102,13 @@ def test_success_uses_exact_request_and_preloaded_allowlisted_skill(monkeypatch)
                  "--no-context-files"):
         assert flag in call["argv"]
     assert "--no-mcp" not in call["argv"]  # Not in installed Pi 0.78.1 help.
+    assert call["argv"] == [
+        "pi.cmd", "--print", "--no-session", "--no-tools",
+        "--no-extensions", "--no-skills", "--no-prompt-templates",
+        "--no-themes", "--no-context-files", "--system-prompt",
+        str(call["cwd"] / "trusted-system.md"),
+        "--provider", "deepseek", "--model", "configured-model",
+    ]
     assert call["argv"][call["argv"].index("--model") + 1] == "configured-model"
     assert call["env"]["PI_CODING_AGENT_DIR"] == str(call["cwd"])
     assert call["env"]["SECAGENT_TEST_FAKE_CREDENTIAL"] == "test-only"

@@ -1,0 +1,104 @@
+name: secagent-asi01-lab
+services:
+  dvaa:
+    image: ${DVAA_IMAGE:-dvaa-deepseek:local}
+    pull_policy: never
+    environment:
+      DVAA_ALLOW_INTERNAL_FETCH: "1"
+      DVAA_RESEARCH_CACHE: "off"
+    networks:
+      lab:
+        ipv4_address: 172.30.77.2
+    restart: "no"
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+  fixture:
+    image: secagent-asi01-fixture:lab
+    build:
+      context: .
+      dockerfile: Dockerfile.fixture
+      args:
+        PYTHON_IMAGE: ${FIXTURE_PYTHON_IMAGE:?Provide a reviewed Python image digest}
+    user: "10001:10001"
+    read_only: true
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    working_dir: /workspace
+    entrypoint: [python, /workspace/backend/scripts/serve_asi01_web_fixture.py]
+    command: [serve, --state-dir, /state, --bind, 172.30.77.3]
+    volumes:
+      - type: bind
+        source: ../../backend/src
+        target: /workspace/backend/src
+        read_only: true
+      - type: bind
+        source: ../../backend/scripts/serve_asi01_web_fixture.py
+        target: /workspace/backend/scripts/serve_asi01_web_fixture.py
+        read_only: true
+      - type: bind
+        source: ../../fixtures/asi01_web
+        target: /workspace/fixtures/asi01_web
+        read_only: true
+      - type: bind
+        source: ${FIXTURE_STATE_DIR:?Initialize a fresh fixture run first}
+        target: /state
+        bind:
+          create_host_path: false
+    tmpfs: ["/tmp:size=16m,noexec,nosuid,nodev"]
+    networks:
+      lab:
+        ipv4_address: 172.30.77.3
+    restart: "no"
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+  proxy:
+    image: ${PROXY_IMAGE:?Provide a reviewed Nginx image digest}
+    entrypoint: [nginx]
+    command: [-g, "daemon off;"]
+    user: "101:101"
+    read_only: true
+    volumes:
+      - type: bind
+        source: ./nginx.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+    tmpfs: 
+      - "/tmp:size=16m,noexec,nosuid,nodev"
+      - "/var/cache/nginx:size=16m,noexec,nosuid,nodev,mode=1777"
+    ports:
+      - target: 8080
+        published: "17015"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    networks:
+      lab:
+        ipv4_address: 172.30.77.4
+      access:
+        ipv4_address: 172.30.78.2
+        gw_priority: 1
+    sysctls:
+      net.ipv4.ip_forward: "0"
+    depends_on: [dvaa, fixture]
+    restart: "no"
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+networks:
+  lab:
+    name: secagent-asi01-lab-private
+    internal: true
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config:
+        - subnet: 172.30.77.0/24
+  access:
+    name: secagent-asi01-lab-access
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.78.0/24
