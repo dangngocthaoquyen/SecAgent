@@ -1,0 +1,140 @@
+name: secagent-asi01-web-lab
+services:
+  netns:
+    image: ${PROXY_IMAGE:?Set reviewed namespace image ID}
+    pull_policy: never
+    entrypoint: [sleep]
+    command: ["2147483647"]
+    user: "10001:10001"
+    networks:
+      private:
+        ipv4_address: 172.30.79.2
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    restart: "no"
+
+  researchbot:
+    image: ${DVAA_IMAGE:?Set reviewed DVAA image ID}
+    pull_policy: never
+    user: "1000:1000"
+    environment:
+      DVAA_ALLOW_INTERNAL_FETCH: "1"
+      DVAA_RESEARCH_CACHE: "off"
+    network_mode: service:netns
+    depends_on:
+      egress_guard:
+        condition: service_completed_successfully
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: ["/tmp:size=16m,noexec,nosuid,nodev"]
+    restart: "no"
+
+  egress_guard:
+    image: secagent-asi01-web-guard:lab
+    build:
+      context: .
+      dockerfile: Dockerfile.guard
+      args:
+        BASE_IMAGE: ${GUARD_BASE_IMAGE:?Set reviewed Alpine base image digest}
+    network_mode: service:netns
+    depends_on: [netns]
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    command: ["172.30.79.3", "8787", "1000"]
+    restart: "no"
+
+  fixture:
+    image: ${FIXTURE_IMAGE:?Set reviewed fixture image ID}
+    pull_policy: never
+    user: "10001:10001"
+    read_only: true
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    working_dir: /workspace
+    entrypoint: [python, /workspace/backend/scripts/serve_asi01_web_lab.py]
+    command: [serve, --state-dir, /state, --bind, 172.30.79.3]
+    volumes:
+      - type: bind
+        source: ../../backend/src
+        target: /workspace/backend/src
+        read_only: true
+      - type: bind
+        source: ../../backend/scripts/serve_asi01_web_lab.py
+        target: /workspace/backend/scripts/serve_asi01_web_lab.py
+        read_only: true
+      - type: bind
+        source: ../../fixtures/asi01_web
+        target: /workspace/fixtures/asi01_web
+        read_only: true
+      - type: bind
+        source: ${WEB_LAB_STATE_DIR:?Initialize a fresh assessment}
+        target: /state
+        bind:
+          create_host_path: false
+    tmpfs: ["/tmp:size=16m,noexec,nosuid,nodev"]
+    networks:
+      private:
+        ipv4_address: 172.30.79.3
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
+
+  ingress:
+    image: ${PROXY_IMAGE:?Set reviewed Nginx image digest}
+    pull_policy: never
+    user: "101:101"
+    read_only: true
+    entrypoint: [nginx]
+    command: [-g, "daemon off;"]
+    volumes:
+      - type: bind
+        source: ./nginx.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+    tmpfs:
+      - "/tmp:size=16m,noexec,nosuid,nodev"
+      - "/var/cache/nginx:size=16m,noexec,nosuid,nodev,mode=1777"
+    ports:
+      - target: 8080
+        published: "17016"
+        host_ip: 127.0.0.1
+    networks:
+      private:
+        ipv4_address: 172.30.79.4
+      access:
+        ipv4_address: 172.30.80.2
+        gw_priority: 1
+    sysctls:
+      net.ipv4.ip_forward: "0"
+    depends_on:
+      egress_guard:
+        condition: service_completed_successfully
+      researchbot:
+        condition: service_started
+      fixture:
+        condition: service_started
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
+
+networks:
+  private:
+    name: secagent-asi01-web-private
+    internal: true
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config:
+        - subnet: 172.30.79.0/24
+  access:
+    name: secagent-asi01-web-access
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.80.0/24

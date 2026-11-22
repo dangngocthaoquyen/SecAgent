@@ -77,6 +77,7 @@ def build_default_attack_module_registry() -> AttackModuleRegistry:
         SensitiveDataDisclosureAttackModule,
     )
     from attack_modules.unexpected_code_execution import UnexpectedCodeExecutionAttackModule
+    from attack_modules.asi05_direct_mcp import Asi05DirectMcpDelivery
 
     registry = AttackModuleRegistry()
 
@@ -107,4 +108,5 @@ def build_default_attack_module_registry() -> AttackModuleRegistry:
         "unexpected_code_execution",
         UnexpectedCodeExecutionAttackModule(),
     )
+    registry.register("asi05_direct_mcp", Asi05DirectMcpDelivery())
     return registry

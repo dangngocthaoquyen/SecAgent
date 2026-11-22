@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { detailApi, type Detail } from "./detailApi";
 import { ApiError } from "./api";
 import { Badge, Notice } from "./components";
+import DownloadReport from './DownloadReport';
 import {
   EvidenceCard,
   EvidenceSequence,
@@ -22,11 +23,13 @@ export default function ExecutionDetail({
   run?: boolean;
 }) {
   const [data, setData] = useState<Detail | null>(null),
+    [requestCount, setRequestCount] = useState<number | null>(null),
     [error, setError] = useState(""),
     [retry, setRetry] = useState(0);
   useEffect(() => {
     const c = new AbortController();
     setData(null);
+    setRequestCount(null);
     setError("");
     (run ? detailApi.run(id, c.signal) : detailApi.execution(id, c.signal))
       .then((r) => {
@@ -36,14 +39,17 @@ export default function ExecutionDetail({
             "Reporting snapshot or execution identity changed. Reload API snapshot.",
           );
         setData(r.execution);
+        setRequestCount(r.target_request_count ?? null);
         onConnection(true);
       })
       .catch((e) => {
         if (!c.signal.aborted) {
           setError(run && e instanceof ApiError && e.status === 404
             ? "Saved report unavailable in the selected reporting dataset. Ask the operator to select the controlled-run root or verify the artifact."
-            : e.message);
-          onConnection(false);
+            : run && e instanceof ApiError && e.status === 409
+              ? "Saved run failed integrity or schema validation. Ask the operator to inspect the report artifact."
+              : e.message);
+          onConnection(e instanceof ApiError);
         }
       });
     return () => c.abort();
@@ -58,14 +64,17 @@ export default function ExecutionDetail({
     );
   const d = data,
     a = d.artifact_verification;
+  const responseMetadata = d.observation.evidence.find(item=>item.kind==='http_response_metadata'
+    && item.reported_source==='http_response');
   return (
     <div className="detail-page">
       <a className="back-link" href="#executions">
         ← Back to execution results
       </a>
+      <DownloadReport kind={run?'runs':'executions'} id={id}/>
       <div className="page-title">
         <div>
-          <span className="eyebrow">HISTORICAL EXECUTION</span>
+          <span className="eyebrow">{run ? "CONTROLLED RUN" : "HISTORICAL EXECUTION"}</span>
           <h1>{value(d.identity.testcase_id)}</h1>
           <p>
             {value(d.identity.target_id)} · {value(d.identity.asi_category)}
@@ -82,8 +91,9 @@ export default function ExecutionDetail({
         <Text text={d.security.reason as string | null} />
         <Facts
           rows={[
-            ["Historical status", d.security.historical_status],
+            [run ? "Recorded status" : "Historical status", d.security.historical_status],
             ["Technical execution status", d.execution.status],
+            ...(run ? [["Recorded target requests", requestCount] as [string, unknown]] : []),
             [
               "Response completeness",
               d.observation.response_completeness.state,
@@ -93,10 +103,15 @@ export default function ExecutionDetail({
           ]}
         />
         <p className="caption">
-          Historical decision preserved. Execution success is not security PASS;
+          Recorded decision preserved. Execution success is not security PASS;
           unknown completeness is not complete.
         </p>
       </section>
+      {d.imported_provenance&&<section className="panel">
+        <h2>Imported testcase provenance</h2>
+        <Facts rows={Object.entries(d.imported_provenance).map(([key,item])=>[key.replaceAll('_',' '),item])}/>
+        <p>Source taxonomy and assertions are untrusted metadata. A pinned native binding, when shown above, supplies reviewed response rules. Direct chat alone does not establish a fetched-page injection or independently verified tool effect.</p>
+      </section>}
       <section className="panel">
         <h2>Task context · original execution record</h2>
         <Facts
@@ -125,6 +140,12 @@ export default function ExecutionDetail({
             : "no truncation reported"}
         </p>
         <Text text={d.observation.response_preview} />
+        {d.imported_provenance&&responseMetadata&&<Facts rows={[
+          ['Target-reported finish reason',responseMetadata.details.finish_reason],
+          ['Assistant text field present',responseMetadata.details.assistant_content_present],
+          ['Target-declared tool calls',responseMetadata.details.declared_tool_call_count],
+        ]}/>}
+        {d.imported_provenance&&!d.observation.response_preview&&<p role="status">No assistant response text was captured. HTTP success can still accompany a null assistant message, a tool-call finish, or an incomplete response; see the target-reported response metadata below. No response content is inferred.</p>}
       </section>
       <section className="panel">
         <h2>Deterministic evaluation</h2>

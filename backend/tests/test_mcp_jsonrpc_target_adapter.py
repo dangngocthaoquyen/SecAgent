@@ -112,28 +112,23 @@ def test_successful_tool_result_is_normalized_into_events() -> None:
 
     result = McpJsonRpcTargetAdapter(client).execute(make_target(), make_input())
 
-    assert result.events == [
-        {
-            "kind": "tool_call",
-            "source": "mcp_jsonrpc",
-            "name": "generic_tool",
-            "success": True,
-            "data": {
-                "arguments": {"value": "harmless"},
-                "result": {"success": True, "output": "completed"},
-            },
-            "reference": "result.content.0.text",
-        },
-        {
-            "kind": "tool_trace",
-            "source": "mcp_jsonrpc",
-            "data": {
-                "completeness": "complete",
-                "scope": "direct_request",
-            },
-            "reference": "result.content",
-        },
-    ]
+    assert [item["kind"] for item in result.events] == ["tool_request", "target_tool_result"]
+    assert result.events[0]["source"] == "mcp_jsonrpc_adapter"
+    assert result.events[0]["name"] == "generic_tool"
+    assert result.events[0]["data"]["provenance"] == "secagent_request"
+    assert len(result.events[0]["data"]["arguments_sha256"]) == 64
+    assert result.events[0]["data"]["correlation_reference"] == result.events[1]["data"]["correlation_reference"]
+    assert result.events[0]["data"]["arguments_sha256"] == result.events[1]["data"]["arguments_sha256"]
+    assert result.events[0]["data"]["execution_semantics"] == "direct_tool_request"
+    assert result.events[1]["data"] == {
+        "provenance": "target_reported", "execution_verified": False,
+        "reported_success": True, "request_id": 1,
+        "arguments_sha256": result.events[0]["data"]["arguments_sha256"],
+        "correlation_reference": result.events[0]["data"]["correlation_reference"],
+        "observation_scope": "mcp_target_result",
+        "execution_semantics": "target_reported_result",
+        "verification_status": "target_reported_unverified"}
+    assert not any(item["kind"] == "tool_call" for item in result.events)
 
 
 def test_unsuccessful_tool_result_remains_observable() -> None:
@@ -145,10 +140,9 @@ def test_unsuccessful_tool_result_remains_observable() -> None:
 
     assert result.success is True
     assert result.error is None
-    assert result.events[0]["success"] is False
-    assert result.events[0]["data"]["result"]["error"] == "denied"
-    assert result.events[1]["data"]["completeness"] == "complete"
-    assert result.events[1]["data"]["scope"] == "direct_request"
+    assert result.events[1]["data"]["reported_success"] is False
+    assert result.events[1]["data"]["execution_verified"] is False
+    assert not any(item["kind"] == "tool_trace" for item in result.events)
 
 
 def test_mismatched_jsonrpc_response_id_is_rejected() -> None:

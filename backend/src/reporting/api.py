@@ -1,16 +1,25 @@
 """Local, GET-only reporting API with an opt-in bounded controlled-run lookup."""
 import argparse
+from datetime import date
+import hashlib
 import ipaddress
 import json
+import os
 import re
+from pathlib import Path
+import secrets
 import sys
+import threading
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from werkzeug.exceptions import HTTPException
 
 from reporting.aggregation import _artifact_state
 from reporting.models import ArchivedAssessmentReport, ExecutionReport
-from reporting.repository import DatasetError, ReportDataset, load_controlled_run, load_dataset
+from reporting.exports import batch_download, report_document, canonical
+from reporting.repository import (ControlledRunInvalid, ControlledRunMissing,
+    DatasetError, ReportDataset, load_controlled_run_with_count, load_mcp_run,
+    list_saved_runs, load_dataset)
 
 API_VERSION = "1.0.0"
 
@@ -27,11 +36,29 @@ def _public(value):
     return value
 
 
-def create_app(dataset: ReportDataset):
+def create_app(dataset: ReportDataset, *, history_index_path: Path | None = None):
     app = Flask(__name__, static_folder=None)
     app.config.update(DEBUG=False, TESTING=False, MAX_CONTENT_LENGTH=0, PROPAGATE_EXCEPTIONS=False)
     app.json.sort_keys = True
     app.json.ensure_ascii = True
+    saved_index_lock = threading.Lock()
+    saved_index = {"names": None, "rows": [], "invalid": 0, "persisted": False}
+    index_root_hash = hashlib.sha256(str(dataset.controlled_runs_root).encode()).hexdigest()
+    if history_index_path is not None and dataset.controlled_runs_root is not None:
+        try:
+            index_file = Path(history_index_path)
+            if index_file.is_file() and not index_file.is_symlink() and index_file.stat().st_size <= 5_000_000:
+                cached = json.loads(index_file.read_text(encoding='utf-8'))
+                names = frozenset(p.name for p in dataset.controlled_runs_root.iterdir())
+                if (cached.get('schema_version') == '1.0.1' and cached.get('root_sha256') == index_root_hash
+                        and isinstance(cached.get('names'), list) and frozenset(cached['names']) == names
+                        and isinstance(cached.get('rows'), list) and len(cached['rows']) <= 10000
+                        and all(isinstance(row, dict) and re.fullmatch(r'[a-f0-9]{32}', str(row.get('run_id')))
+                            and row.get('kind') in {'controlled','mcp_action'} for row in cached['rows'])
+                        and type(cached.get('invalid')) is int and cached['invalid'] == 0):
+                    saved_index.update(names=names, rows=cached['rows'], invalid=0, persisted=True)
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass  # Cache failure never changes native report authority.
     # Detached serialized views: incoming requests cannot mutate normalized records.
     executions = {r.report_id: r for r in dataset.records if isinstance(r, ExecutionReport)}
     assessments = {r.source.file_byte_sha256: r for r in dataset.records if isinstance(r, ArchivedAssessmentReport)}
@@ -99,7 +126,10 @@ def create_app(dataset: ReportDataset):
             return fail("body_not_allowed", "GET request bodies are not supported.", 400)
         if len(request.query_string) > 2048 or "\\" in request.path or ".." in request.path.split("/"):
             return fail("invalid_request", "Invalid request path or query.", 400)
-        allowed = {"asi_category", "target_id", "testcase_id", "verdict", "page", "page_size"} if request.path == "/api/reports/executions" else set()
+        allowed = ({"asi_category", "target_id", "testcase_id", "verdict", "page", "page_size", "date_from", "date_to"}
+            if request.path == "/api/reports/saved-runs" else
+            {"asi_category", "target_id", "testcase_id", "verdict", "page", "page_size"}
+            if request.path == "/api/reports/executions" else set())
         if any(key not in allowed or len(request.args.getlist(key)) != 1 for key in request.args):
             return fail("invalid_query", "Unsupported or repeated query parameter.", 400)
 
@@ -166,15 +196,157 @@ def create_app(dataset: ReportDataset):
         if not re.fullmatch(r"[a-f0-9]{32}", run_id):
             return fail("invalid_run_id", "Invalid controlled run identity.", 400)
         try:
-            record = load_controlled_run(dataset, run_id)
-        except DatasetError:
+            record, request_count = load_controlled_run_with_count(dataset, run_id)
+        except ControlledRunMissing:
             return fail("run_not_found", "Run is unavailable in the selected reporting dataset.", 404)
+        except ControlledRunInvalid:
+            return fail("run_invalid", "Saved run failed integrity or schema validation.", 409)
         return jsonify(api_schema_version=API_VERSION, snapshot_sha256=dataset.summary.snapshot_sha256,
-            run_id=run_id, execution=detail_view(record, []))
+            run_id=run_id, target_request_count=request_count,
+            execution=detail_view(record, []))
+
+    @app.get("/api/reports/saved-runs")
+    def saved_runs():
+        args = request.args
+        if args.get("asi_category") not in {None, "ASI01", "ASI02", "ASI03", "ASI05", "unknown"} or args.get("verdict") not in {None, "PASS", "FAIL", "INCONCLUSIVE", "ERROR"}:
+            return fail("invalid_filter", "Invalid ASI category or verdict.", 400)
+        for key in ("target_id", "testcase_id"):
+            if key in args and not re.fullmatch(r"[A-Za-z0-9_.:\[\]-]{1,256}", args[key]):
+                return fail("invalid_filter", "Invalid identifier filter.", 400)
+        for key in ("page", "page_size"):
+            if key in args and not re.fullmatch(r"[1-9][0-9]{0,5}", args[key]):
+                return fail("invalid_pagination", "Invalid pagination.", 400)
+        page, size = int(args.get("page", 1)), int(args.get("page_size", 25))
+        if size > 100:
+            return fail("invalid_pagination", "Page size exceeds 100.", 400)
+        parsed_dates = {}
+        for key in ("date_from", "date_to"):
+            if key in args:
+                if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", args[key]):
+                    return fail("invalid_filter", "Invalid date filter.", 400)
+                try:
+                    parsed_dates[key] = date.fromisoformat(args[key])
+                except ValueError:
+                    return fail("invalid_filter", "Invalid date filter.", 400)
+        if "date_from" in parsed_dates and "date_to" in parsed_dates and parsed_dates["date_from"] > parsed_dates["date_to"]:
+            return fail("invalid_filter", "Invalid date range.", 400)
+        try:
+            with saved_index_lock:
+                names = frozenset(p.name for p in dataset.controlled_runs_root.iterdir()) if dataset.controlled_runs_root else frozenset()
+                if names != saved_index["names"] or saved_index["invalid"]:
+                    saved_index["rows"], saved_index["invalid"] = list_saved_runs(dataset)
+                    saved_index["names"] = names
+                    saved_index["persisted"] = False
+                    if history_index_path is not None and not saved_index["invalid"]:
+                        try:
+                            index_file = Path(history_index_path)
+                            payload = json.dumps({'schema_version':'1.0.1','root_sha256':index_root_hash,
+                                'names':sorted(names),'rows':saved_index['rows'],'invalid':0},
+                                sort_keys=True, separators=(',',':')).encode()
+                            if len(payload) <= 5_000_000:
+                                temporary = index_file.with_name('.history-' + secrets.token_hex(8) + '.tmp')
+                                with temporary.open('xb') as stream:
+                                    stream.write(payload);stream.flush();os.fsync(stream.fileno())
+                                os.replace(temporary, index_file)
+                                saved_index['persisted'] = True
+                        except OSError:
+                            pass  # History remains readable from native files.
+                rows, invalid = saved_index["rows"], saved_index["invalid"]
+        except (DatasetError, OSError, ValueError):
+            return fail("history_unavailable", "Saved run inventory could not be safely read.", 409)
+        for query in ("asi_category", "target_id", "testcase_id", "verdict"):
+            if query in args:
+                expected = None if query == "asi_category" and args[query] == "unknown" else args[query]
+                rows = [row for row in rows if row[query] == expected]
+        if 'date_from' in args:
+            rows = [
+                row for row in rows
+                if isinstance(row.get('started_at'), str)
+                and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", row['started_at'][:10])
+                and row['started_at'][:10] >= args['date_from']
+            ]
+        if 'date_to' in args:
+            rows = [
+                row for row in rows
+                if isinstance(row.get('started_at'), str)
+                and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", row['started_at'][:10])
+                and row['started_at'][:10] <= args['date_to']
+            ]
+        return jsonify(api_schema_version=API_VERSION, page=page, page_size=size,
+            total=len(rows), invalid_artifact_count=invalid, index_persisted=saved_index['persisted'],
+            items=_public(rows[(page - 1) * size:page * size]))
+
+    @app.get("/api/reports/mcp-runs/<run_id>")
+    def mcp_run_detail(run_id):
+        if not re.fullmatch(r"[a-f0-9]{32}", run_id):
+            return fail("invalid_run_id", "Invalid MCP run identity.", 400)
+        try:
+            record, digest = load_mcp_run(dataset, run_id)
+        except ControlledRunMissing:
+            return fail("run_not_found", "MCP run is unavailable.", 404)
+        except ControlledRunInvalid:
+            return fail("run_invalid", "MCP report failed schema validation.", 409)
+        return jsonify(api_schema_version=API_VERSION, run_id=run_id,
+            report_sha256=digest, native_report=_public(record),
+            provenance_limit="Native MCP report is target and collector telemetry; independent effect verification requires its own evidence.")
+
+    @app.get('/api/reports/mcp-runs/<run_id>/download')
+    def mcp_run_export(run_id):
+        if not re.fullmatch(r'[a-f0-9]{32}', run_id):
+            return fail('invalid_run_id', 'Invalid MCP run identity.', 400)
+        try:
+            record, digest = load_mcp_run(dataset, run_id)
+            document = {"api_schema_version":API_VERSION,"run_id":run_id,
+                "source_report_sha256":digest,"native_report":_public(record)}
+            return download_response(canonical(document), f'secagent-mcp-run-{run_id}.json', 'application/json')
+        except ControlledRunMissing:
+            return fail('run_not_found', 'MCP run is unavailable.', 404)
+        except ControlledRunInvalid:
+            return fail('run_invalid', 'MCP report failed schema validation.', 409)
 
     @app.get("/api/reports/comparisons")
     def comparisons():
         return jsonify(api_schema_version=API_VERSION, snapshot_sha256=dataset.summary.snapshot_sha256, **comparison_views)
+
+    def download_response(raw, filename, mimetype):
+        return Response(raw, mimetype=mimetype, headers={
+            'Content-Disposition': f'attachment; filename="{filename}"',
+            'X-SecAgent-Export-Schema': '1.0.0'})
+
+    @app.get('/api/reports/batches/<batch_id>/download')
+    def batch_export(batch_id):
+        if not re.fullmatch(r'[a-f0-9]{32}', batch_id):
+            return fail('invalid_batch_id', 'Invalid batch identity.', 400)
+        try:
+            raw, filename = batch_download(dataset, batch_id, _public, detail_view)
+            return download_response(raw, filename, 'application/zip')
+        except ControlledRunMissing:
+            return fail('batch_not_found', 'Batch or linked report is unavailable in the selected reporting root.', 404)
+        except ControlledRunInvalid:
+            return fail('batch_export_rejected', 'Batch must be terminal with intact, correctly linked reports. No export was produced.', 409)
+
+    @app.get('/api/reports/runs/<run_id>/download')
+    def run_export(run_id):
+        if not re.fullmatch(r'[a-f0-9]{32}', run_id):
+            return fail('invalid_run_id', 'Invalid controlled run identity.', 400)
+        try:
+            record, count = load_controlled_run_with_count(dataset, run_id)
+            document = report_document(record, count, _public, detail_view, run_id)
+            return download_response(canonical(document), f'secagent-run-{run_id}.json', 'application/json')
+        except ControlledRunMissing:
+            return fail('run_not_found', 'Run is unavailable in the selected reporting dataset.', 404)
+        except ControlledRunInvalid:
+            return fail('run_invalid', 'Saved run failed integrity or schema validation.', 409)
+
+    @app.get('/api/reports/executions/<report_id>/download')
+    def execution_export(report_id):
+        if not re.fullmatch(r'execution:[a-f0-9]{64}', report_id):
+            return fail('invalid_report_id', 'Invalid execution report identity.', 400)
+        record = executions.get(report_id)
+        if record is None:
+            return fail('report_not_found', 'Report is not in the selected dataset.', 404)
+        document = report_document(record, None, _public, detail_view)
+        return download_response(canonical(document), f'secagent-report-{report_id[10:]}.json', 'application/json')
 
     return app
 
@@ -187,7 +359,7 @@ def main(argv=None):
     if not 1 <= args.port <= 65535:
         parser.error("Port must be between 1 and 65535.")
     try:
-        app = create_app(load_dataset(args.manifest))
+        app = create_app(load_dataset(args.manifest), history_index_path=Path(args.manifest).resolve().parent / 'history-index.json')
     except DatasetError:
         print(json.dumps({"error": {"code": "invalid_dataset", "message": "Dataset selection could not be loaded."}}), file=sys.stderr)
         return 2

@@ -9,8 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 
-from backend.scripts.serve_asi01_web_fixture import handler_for
-from testing.web_fixture import WebFixture
+from testing.web_fixture import WebFixture, handler_for
 
 
 class LocalMockFixtureRuntime:
@@ -19,14 +18,16 @@ class LocalMockFixtureRuntime:
     provenance = "synthetic_mock"
 
     @contextmanager
-    def open(self, run_dir: Path, target_id: str):
+    def open(self, run_dir: Path, target_id: str, *, condition: str = "attack"):
+        if condition not in {"control", "attack"}:
+            raise ValueError("Unsupported fixture condition.")
         server = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
         server.daemon_threads = True
         started = False
         thread = None
         try:
             origin = f"http://127.0.0.1:{server.server_address[1]}"
-            fixture = WebFixture.create(run_dir / "fixture", origin, "attack", target_id,
+            fixture = WebFixture.create(run_dir / "fixture", origin, condition, target_id,
                                         "127.0.0.1")
             server.RequestHandlerClass = handler_for(fixture)
             thread = Thread(target=server.serve_forever, daemon=True)

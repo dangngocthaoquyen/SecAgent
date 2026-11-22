@@ -1,0 +1,254 @@
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { testingApi, type ArchivedTarget, type DiscoveryResult, type ManagedProfile, type ProbeResult, type TargetPreset } from './testingApi';
+import DiscoveryPanel from './DiscoveryPanel';
+import EvidenceSources from './EvidenceSources';
+import ApplicationContext from './ApplicationContext';
+
+const researchBot: ManagedProfile = {
+  id:'dvaa-researchbot',name:'DVAA ResearchBot',platform_id:'dvaa',platform_name:'DVAA',
+  protocol:'openai-chat',endpoint:'http://127.0.0.1:7015/v1/chat/completions',
+  model:'researchbot',timeout_seconds:30,
+};
+const toolBotLab: ManagedProfile = {id:'dvaa-toolbot-lab',name:'DVAA ToolBot Lab',
+ platform_id:'dvaa',platform_name:'DVAA',protocol:'mcp-jsonrpc',
+ endpoint:'http://127.0.0.1:17022/mcp',model:'toolbot-lab',timeout_seconds:30};
+const empty: ManagedProfile = {...researchBot,id:'',name:'',platform_id:'unknown',platform_name:'Unknown',endpoint:'',model:''};
+
+export type ConnectionState = 'Not checked'|'Checking'|'Connected'|'Connection failed';
+export function targetKey(target?:TargetPreset){return target?JSON.stringify([target.id,target.profile_revision,target.policy_ref,target.endpoint,target.default_model]):'';}
+export default function TargetManager({enabled,nonce,target,onChanged,onDiscoveryFlowChange,localSingleUser=false,toolbotLabEnabled=false,onConnectionChange,settingsMatch=true,configurationInvalid=false,evidenceEnabled=false,initialConnect=false,existingSelector,existingTargetIds=[],existingProfiles=[]}:{existingTargetIds?:string[];existingProfiles?:TargetPreset[];existingSelector?:ReactNode;initialConnect?:boolean;evidenceEnabled?:boolean;enabled:boolean;nonce:string;target?:TargetPreset;onChanged:(id:string)=>void;onDiscoveryFlowChange?:(active:boolean)=>void;localSingleUser?:boolean;toolbotLabEnabled?:boolean;onConnectionChange?:(key:string,state:ConnectionState)=>void;settingsMatch?:boolean;configurationInvalid?:boolean}){
+ const [secret,setSecret]=useState(''),[unlocked,setUnlocked]=useState(false),[busy,setBusy]=useState(false);
+ const [mode,setMode]=useState<'create'|'edit'|null>(null),[form,setForm]=useState<ManagedProfile>(empty);
+ const [expected,setExpected]=useState<string|null>(null),[checked,setChecked]=useState(false);
+ const [confirmed,setConfirmed]=useState(false),[message,setMessage]=useState(''),[error,setError]=useState('');
+ const [probe,setProbe]=useState<ProbeResult|null>(null);
+ const [discovering,setDiscovering]=useState(initialConnect),[discoveryId,setDiscoveryId]=useState<string|null>(null);
+ const [discoveryResult,setDiscoveryResult]=useState<DiscoveryResult|null>(null);
+ const [discoveryEndpoint,setDiscoveryEndpoint]=useState<string|null>(null);
+ const [discoveryProtocol,setDiscoveryProtocol]=useState<ManagedProfile['protocol']|null>(null);
+ const [quickProbe,setQuickProbe]=useState<ProbeResult|null>(null),[quickConfirmed,setQuickConfirmed]=useState(false);
+ const [quickError,setQuickError]=useState(''),[quickSavedProbe,setQuickSavedProbe]=useState(false);
+ const [awaitingSelection,setAwaitingSelection]=useState(false);
+ const [query,setQuery]=useState(''),[selectedArchiveIds,setSelectedArchiveIds]=useState<string[]>([]);
+ const [archiveCandidates,setArchiveCandidates]=useState<TargetPreset[]>([]);
+ const [archiveConfirmed,setArchiveConfirmed]=useState(false),[archivedTargets,setArchivedTargets]=useState<ArchivedTarget[]>([]);
+ const [editingOriginal,setEditingOriginal]=useState<TargetPreset|null>(null),[platformConfirmed,setPlatformConfirmed]=useState(false);
+ const carryProbe=useRef<{id:string;revision:string;result:ProbeResult|null}|null>(null);
+ const [checking,setChecking]=useState(false),[probeFailed,setProbeFailed]=useState(false);
+ const [probeKey,setProbeKey]=useState('');
+ const identity=targetKey(target),current=useRef(identity+nonce),generation=useRef(0);
+ if(current.current!==identity+nonce){current.current=identity+nonce;generation.current++;}
+ useEffect(()=>{const carry=carryProbe.current;
+  if(carry&&target?.id===carry.id&&target.profile_revision===carry.revision){
+   setProbe(carry.result);setProbeKey(identity+nonce);setQuickSavedProbe(true);carryProbe.current=null;
+  }else{setProbe(null);setQuickSavedProbe(false);}
+  setConfirmed(false);setProbeFailed(false);setChecking(false);setBusy(false);setQuickConfirmed(false);setAwaitingSelection(false);setMessage('');setError('');
+ },[identity,nonce]);
+ useEffect(()=>()=>{generation.current++;},[]);
+ useEffect(()=>{setConfirmed(false);},[settingsMatch]);
+ useEffect(()=>{if(!enabled||!(localSingleUser||unlocked)||!nonce)return;
+  testingApi.archivedTargets(secret,nonce).then(setArchivedTargets).catch(()=>setArchivedTargets([]));
+ },[enabled,localSingleUser,unlocked,secret,nonce]);
+ useEffect(()=>{if(['stale','expired'].includes(target?.connection_verification?.status??''))setProbe(null);},[target?.connection_verification?.status]);
+ const ownProbe=probeKey===identity+nonce?probe:null;
+ const connection:ConnectionState=!settingsMatch?'Not checked':probeKey===identity+nonce&&checking?'Checking':probeKey===identity+nonce&&probeFailed?'Connection failed':ownProbe?
+  ownProbe.connection_status==='succeeded'&&ownProbe.runtime_protocol_compatible===true?'Connected':'Connection failed':
+  target?.connection_verification?.status==='compatible'&&target.connection_verification.profile_revision===target.profile_revision?'Connected':'Not checked';
+ useEffect(()=>{onConnectionChange?.(identity,connection);},[identity,connection,onConnectionChange]);
+ async function unlock(){if(!secret)return;setBusy(true);setError('');try{await testingApi.unlock(secret,nonce);setUnlocked(true);setMessage('Operator access verified for this browser session.');}catch{setError('Operator access was rejected. Check the local operator secret and service configuration.');}finally{setBusy(false);}}
+ function resetDiscoveryPreview(){generation.current++;setMode(null);setDiscoveryId(null);setDiscoveryResult(null);setDiscoveryEndpoint(null);setDiscoveryProtocol(null);setChecked(false);setQuickProbe(null);setQuickConfirmed(false);setQuickError('');setMessage('');setError('');}
+ function start(which:'create'|'edit',profile:TargetPreset|undefined=target,renameTo?:string){
+  if(which==='edit'&&!profile)return;
+  generation.current++;setDiscovering(false);onDiscoveryFlowChange?.(false);setMode(which);setDiscoveryId(null);setDiscoveryEndpoint(null);setDiscoveryProtocol(null);setChecked(false);setConfirmed(false);setMessage('');setError('');if(which==='create')setProbe(null);setQuickProbe(null);
+  setEditingOriginal(which==='edit'?profile!:null);setPlatformConfirmed(false);
+  setExpected(which==='edit'?profile!.profile_revision:null);
+  setForm(which==='edit'?{id:profile!.id,name:renameTo??profile!.name,platform_id:profile!.platform_id??'',
+    platform_name:profile!.platform_name??'',endpoint:profile!.endpoint,protocol:profile!.protocol,
+    model:profile!.default_model,timeout_seconds:profile!.timeout_default}:empty);
+  if(which==='edit'&&profile!.id!==target?.id)onChanged(profile!.id);
+ }
+ function change<K extends keyof ManagedProfile>(key:K,v:ManagedProfile[K]){const token=++generation.current;setBusy(false);const updated={...form,[key]:v};setForm(updated);setChecked(false);setError('');
+  if(key==='platform_id'||key==='platform_name')setPlatformConfirmed(false);
+  if(['name','platform_id','platform_name'].includes(key)){if(discoveryId)void validateForSave(updated,token);return;}
+  setQuickProbe(null);setQuickConfirmed(false);setQuickError('');}
+ const discoveryBindingValid=!discoveryId||(form.endpoint===discoveryEndpoint&&form.protocol===discoveryProtocol);
+ const existingEndpoint=mode==='create'?existingProfiles.find(item=>item.endpoint===form.endpoint&&item.protocol===form.protocol):undefined;
+ const archivedEndpoint=mode==='create'?archivedTargets.find(item=>item.endpoint===form.endpoint&&item.protocol===form.protocol):undefined;
+ const platformChanged=mode==='edit'&&!!editingOriginal&&(editingOriginal.platform_id!==form.platform_id||editingOriginal.platform_name!==form.platform_name);
+ const discoveredPlatformChanged=mode==='create'&&!!discoveryId&&!!discoveryResult?.proposed_profile&&
+  (discoveryResult.proposed_profile.platform_id!==form.platform_id||discoveryResult.proposed_profile.platform_name!==form.platform_name);
+ const platformNeedsConfirmation=platformChanged||discoveredPlatformChanged;
+ const knownPlatforms=Array.from(new Map(existingProfiles.filter(item=>item.platform_id&&item.platform_name)
+  .map(item=>[item.platform_id!,item.platform_name!])).entries());
+ function choosePlatform(id:string){const value=id==='unknown'?['unknown','Unknown']:
+  knownPlatforms.find(([key])=>key===id)??[form.platform_id,form.platform_name];
+  const updated={...form,platform_id:value[0],platform_name:value[1]};setForm(updated);setChecked(false);setPlatformConfirmed(false);
+  if(discoveryId){const token=++generation.current;void validateForSave(updated,token);}
+ }
+ const matchingProfiles=existingProfiles.filter(item=>`${item.name} ${item.endpoint} ${item.platform_name??''}`.toLowerCase().includes(query.trim().toLowerCase()));
+ const platformGroups=Array.from(new Map(matchingProfiles.map(item=>[item.platform_id??'unknown',item.platform_name??'Unknown platform'])).entries());
+ async function archiveSelected(){if(!archiveConfirmed||!archiveCandidates.length||busy)return;
+  const token=++generation.current;setBusy(true);setError('');
+  try{await testingApi.archiveTargets(archiveCandidates.map(item=>({target_id:item.id,profile_revision:item.profile_revision})),secret,nonce);
+   if(token!==generation.current)return;
+   setArchiveCandidates([]);setArchiveConfirmed(false);setSelectedArchiveIds([]);
+   setArchivedTargets(await testingApi.archivedTargets(secret,nonce));
+   setMessage('Selected targets archived. Historical reports and policy records were retained.');
+   onChanged(archiveCandidates.some(item=>item.id===target?.id)?'':target?.id??'');
+  }catch(e){if(token===generation.current)setError(e instanceof Error?e.message:'Archive rejected. Reload targets.');}
+  finally{if(token===generation.current)setBusy(false);}
+ }
+ async function restoreArchived(item:ArchivedTarget){if(busy)return;setBusy(true);setError('');
+  try{const restored=await testingApi.restoreTarget(item,secret,nonce);setArchivedTargets(await testingApi.archivedTargets(secret,nonce));onChanged(restored.id);}
+  catch(e){setError(e instanceof Error?e.message:'Restore rejected.');}finally{setBusy(false);}
+ }
+ function probeError(e:unknown){return e instanceof Error&&e.message.startsWith('Workflow API')?e.message:
+  'Connection could not be verified. Check the endpoint and retry the benign probe.';}
+ async function validateForSave(profile:ManagedProfile,token:number){
+  if(existingTargetIds.includes(profile.id)){
+   setError('Target identifier already exists. Select the existing target, or change Target identifier under Advanced target fields before saving a new profile.');
+   return;
+  }
+  if(existingProfiles.some(item=>item.endpoint===profile.endpoint&&item.protocol===profile.protocol&&item.default_model===profile.model)){
+   setError('This endpoint, protocol and model are already saved. Select the existing target instead of creating a duplicate.');return;
+  }
+  try{await testingApi.validateManaged(profile,null,secret,nonce);
+   if(token===generation.current)setChecked(true);
+  }catch(e){if(token===generation.current)setError(probeError(e));}
+ }
+ async function acceptDiscovery(profile:ManagedProfile,id:string,result:DiscoveryResult){
+  const token=generation.current;
+  setMode('create');setForm(profile);setExpected(null);setChecked(false);setDiscoveryId(id);setDiscoveryResult(result);
+  setDiscoveryEndpoint(profile.endpoint);setDiscoveryProtocol(profile.protocol);
+  setQuickProbe(null);setQuickConfirmed(false);setQuickError('');setError('');
+  if(!profile.model)return;
+  setBusy(true);
+  try{
+   const result=await testingApi.probeDiscovery(profile,id,secret,nonce);
+   if(token===generation.current)setQuickProbe(result);
+  }catch(e){if(token===generation.current)setQuickError(probeError(e));}
+  if(token===generation.current)await validateForSave(profile,token);
+  if(token===generation.current)setBusy(false);
+ }
+ async function validate(){const token=generation.current;setBusy(true);setError('');setMessage('');try{await testingApi.validateManaged(form,expected,secret,nonce);if(token!==generation.current)return;setChecked(true);setMessage('Target details are valid. Save to create an unreviewed profile.');}catch{if(token!==generation.current)return;setChecked(false);setError('Target details are invalid or stale. Check the identifier, endpoint, model, timeout and current revision.');}finally{if(token===generation.current)setBusy(false);}}
+ async function probeQuick(){if(!discoveryId||!discoveryBindingValid||!quickConfirmed||busy||!form.model||!enabled||!(localSingleUser||unlocked))return;
+  const token=generation.current;setBusy(true);setQuickProbe(null);setQuickError('');setChecked(false);
+  try{const result=await testingApi.probeDiscovery(form,discoveryId,secret,nonce);
+   if(token!==generation.current)return;
+   setQuickProbe(result);setQuickConfirmed(false);
+  }catch(e){if(token===generation.current){setQuickError(probeError(e));setQuickConfirmed(false);}}
+  if(token===generation.current)await validateForSave(form,token);
+  if(token===generation.current)setBusy(false);
+ }
+ async function save(e:FormEvent){e.preventDefault();if(!checked||busy||!discoveryBindingValid)return;const token=generation.current;setBusy(true);setError('');try{const wasDiscovered=!!discoveryId;
+  const row=await (discoveryId?testingApi.saveManaged(form,expected,secret,nonce,discoveryId,!!discoveredPlatformChanged&&platformConfirmed):
+   platformChanged?testingApi.saveManaged(form,expected,secret,nonce,undefined,platformConfirmed):
+   testingApi.saveManaged(form,expected,secret,nonce));
+  if(token!==generation.current)return;
+  if(wasDiscovered&&row.id===form.id&&row.endpoint===form.endpoint&&row.protocol===form.protocol&&
+     row.default_model===form.model&&row.timeout_default===form.timeout_seconds)
+   carryProbe.current={id:row.id,revision:row.profile_revision,result:quickProbe};
+  setAwaitingSelection(!(mode==='edit'&&row.profile_revision===target?.profile_revision));setMode(null);setDiscovering(false);setDiscoveryId(null);setDiscoveryProtocol(null);setChecked(false);
+  setMessage('Target saved without review or security execution permission. Review this exact profile before testcase selection.');onDiscoveryFlowChange?.(false);onChanged(row.id);
+ }catch{if(token===generation.current)setError('Configuration could not be saved. Reload the catalog and check the profile.');}finally{if(token===generation.current)setBusy(false);}}
+ async function review(){if(!target||!confirmed||busy)return;const token=generation.current;setBusy(true);setError('');try{const row=await testingApi.reviewManaged(target,secret,nonce);if(token!==generation.current)return;setConfirmed(false);setMessage('Review saved for this exact profile revision and policy. A separate execution grant is still required.');onChanged(row.id);}catch{if(token!==generation.current)return;setError('Review was rejected. Reload the target and confirm its current endpoint and policy.');}finally{if(token===generation.current)setBusy(false);}}
+ const probeAvailable=!!target&&['supported','requires_confirmation'].includes(target.connection_probe.status);
+ const probeConfirmationRequired=probeAvailable;
+ async function testConnection(){if(!target||!probeAvailable||!enabled||!(localSingleUser||unlocked)||!settingsMatch||configurationInvalid||busy||!confirmed)return;
+  const first=target.connection_probe.status==='requires_confirmation',token=generation.current;
+  setProbeKey(identity+nonce);setBusy(true);setChecking(true);setError('');setProbe(null);setProbeFailed(false);
+  try{const result=await testingApi.probe(target,secret,nonce,first);
+   if(token!==generation.current)return;
+   setProbe(result);setConfirmed(false);onChanged(target.id);
+  }catch{if(token===generation.current){setProbeFailed(true);setConfirmed(false);setError('Connection check failed. Check the endpoint and try again.');}}
+  finally{if(token===generation.current){setBusy(false);setChecking(false);}}
+ }
+  const webLabReview=localSingleUser&&(target?.id==='dvaa-researchbot-web-lab'||target?.id==='dvaa-toolbot-lab');
+ return <div className="target-management" aria-label="Target management">
+  {!enabled&&existingSelector}
+  {enabled&&(!(localSingleUser||unlocked)?<div className="target-unlock"><label>Operator secret <input type="password" autoComplete="off" value={secret} onChange={e=>setSecret(e.target.value)}/></label> <button disabled={!secret||!nonce||busy} onClick={unlock}>Unlock target management</button><p className="caption">Local operator access. The secret is not saved.</p></div>:<>
+   <div className="target-journeys" role="group" aria-label="Choose target setup"><button className={discovering?'is-active':''} aria-pressed={discovering} onClick={()=>{if(!discovering){resetDiscoveryPreview();setDiscovering(true);onDiscoveryFlowChange?.(true);}}} disabled={busy}>Connect new target</button><button className={!discovering?'is-active':''} aria-pressed={!discovering} onClick={()=>{if(discovering){setDiscovering(false);resetDiscoveryPreview();onDiscoveryFlowChange?.(false);}}} disabled={busy}>Select existing target</button></div>
+   {discovering&&<DiscoveryPanel nonce={nonce} secret={secret} onReset={resetDiscoveryPreview} onUse={acceptDiscovery}/>}
+   {!discovering&&<section className="target-list" aria-label="Existing targets"><div className="target-list-head"><div><h2>Existing targets</h2><p className="caption">Select a target directly. Platform is an association, separate from protocol and Target ID.</p></div><button type="button" onClick={()=>start('create')} disabled={busy}>Add Target</button></div>
+    <label className="target-search">Search targets<input type="search" value={query} onChange={e=>setQuery(e.target.value)} placeholder="Name, platform or endpoint"/></label>
+    {matchingProfiles.length===0?<p className="target-empty">{existingProfiles.length?'No targets match this search.':'No active targets. Connect or restore a target.'}</p>:platformGroups.map(([id,name])=><div className="target-platform-group" key={id}><h3>{name}</h3><div className="target-list-rows">{matchingProfiles.filter(item=>(item.platform_id??'unknown')===id).map(item=>{const active=item.id===target?.id;const itemConnection=active?connection:item.connection_verification?.status==='compatible'?'Connected':'Not checked';return <div className={`target-list-row ${active?'is-selected':''}`} key={item.id}>
+     <input aria-label={`Select ${item.name} for bulk archive`} type="checkbox" checked={selectedArchiveIds.includes(item.id)} onChange={e=>setSelectedArchiveIds(ids=>e.target.checked?[...ids,item.id]:ids.filter(id=>id!==item.id))}/>
+     <button type="button" className="target-list-select" aria-current={active?'true':undefined} onClick={()=>onChanged(item.id)}><strong>{item.name}</strong><span>{item.endpoint}</span><small>{item.protocol==='mcp-jsonrpc'?'MCP':'HTTP chat'} · {item.platform_provenance?.replaceAll('_',' ')??'platform source unknown'}</small></button>
+     <div className="target-row-status"><span>{itemConnection}</span><span>{item.authorization_status==='reviewed_for_offline_configuration'?'Reviewed':'Review required'}</span></div>
+     <div className="target-row-actions"><button type="button" onClick={()=>start('edit',item)} disabled={busy}>Edit</button><button type="button" onClick={()=>{setArchiveCandidates([item]);setArchiveConfirmed(false);}} disabled={busy}>Archive</button></div>
+    </div>;})}</div></div>)}
+    {existingProfiles.length===0&&target&&<button type="button" onClick={()=>start('edit')} disabled={busy}>Edit Target</button>}
+    {selectedArchiveIds.length>0&&<button type="button" onClick={()=>{setArchiveCandidates(existingProfiles.filter(item=>selectedArchiveIds.includes(item.id)));setArchiveConfirmed(false);}} disabled={busy}>Archive selected ({selectedArchiveIds.length})</button>}
+    {archivedTargets.length>0&&<details className="target-advanced"><summary>Archived targets ({archivedTargets.length})</summary><ul>{archivedTargets.map(item=><li key={item.id}><strong>{item.name}</strong> · {item.endpoint} <button type="button" disabled={busy} onClick={()=>void restoreArchived(item)}>Restore</button></li>)}</ul></details>}
+   </section>}
+   {!discovering&&!localSingleUser&&<button type="button" onClick={()=>{generation.current++;setUnlocked(false);setSecret('');setMode(null);setProbe(null);setConfirmed(false);setDiscovering(false);onDiscoveryFlowChange?.(false);}}>Lock</button>}
+   {archiveCandidates.length>0&&<div className="target-archive-overlay" role="dialog" aria-modal="true" aria-label="Confirm target archive"><div className="target-archive-dialog"><h2>Archive {archiveCandidates.length} target{archiveCandidates.length===1?'':'s'}?</h2><p>Archived targets cannot be selected for new tests. Their IDs, policy bindings and historical reports remain stored.</p><ul>{archiveCandidates.map(item=><li key={item.id}><strong>{item.name}</strong> · <code>{item.endpoint}</code></li>)}</ul><label className="target-consent"><input type="checkbox" checked={archiveConfirmed} onChange={e=>setArchiveConfirmed(e.target.checked)}/><span>I confirm the exact targets above should be archived.</span></label><div className="target-form-actions"><button type="button" disabled={!archiveConfirmed||busy} onClick={()=>void archiveSelected()}>Archive targets</button><button type="button" disabled={busy} onClick={()=>{setArchiveCandidates([]);setArchiveConfirmed(false);}}>Cancel</button></div></div></div>}
+   {mode&&<form className="target-form" onSubmit={save} aria-label="Manage target details">
+    <h3>{discoveryId?'Auto-detected Configuration':mode==='create'?'Add target':'Edit target'}</h3>
+   {discoveryId&&discoveryResult&&<p className="target-detected-count">{discoveryResult.advertised_tools.length} advertised tools · {discoveryResult.possible_contracts.length} candidate API contracts. Metadata does not verify tool execution.</p>}
+    {mode==='create'&&!discoveryId&&!discovering&&<button type="button" onClick={()=>{setForm(researchBot);setChecked(false);}}>Use DVAA ResearchBot example</button>}
+    {mode==='create'&&!discoveryId&&!discovering&&toolbotLabEnabled&&<button type="button" onClick={()=>{setForm(toolBotLab);setChecked(false);}}>Use offline ToolBot Lab example</button>}
+    <label>Platform association <span className="field-optional">Operator declared</span><select value={knownPlatforms.some(([id])=>id===form.platform_id)||form.platform_id==='unknown'?form.platform_id:'custom'} onChange={e=>choosePlatform(e.target.value)}><option value="unknown">Unknown / Local Agent</option>{knownPlatforms.filter(([id])=>id!=='unknown').map(([id,name])=><option key={id} value={id}>{name}</option>)}<option value="custom">Custom platform</option></select></label>
+    {discoveryId?<details><summary>Advanced target fields</summary>
+     <label>Platform identifier<input value={form.platform_id} required maxLength={128} onChange={e=>change('platform_id',e.target.value)}/></label>
+     <label>Platform name<input value={form.platform_name} required maxLength={80} onChange={e=>change('platform_name',e.target.value)}/></label>
+     <label>Target identifier<input value={form.id} required maxLength={128} onChange={e=>change('id',e.target.value)}/></label>
+     <label>Timeout (seconds)<input type="number" min="1" max="60" step="1" required value={Number.isNaN(form.timeout_seconds)?'':form.timeout_seconds} onChange={e=>change('timeout_seconds',e.target.valueAsNumber)}/></label>
+    </details>:<>
+     <label>Platform identifier<input autoFocus value={form.platform_id} required maxLength={128} onChange={e=>change('platform_id',e.target.value)}/></label>
+     <label>Platform name<input value={form.platform_name} required maxLength={80} onChange={e=>change('platform_name',e.target.value)}/></label>
+     <label>Target identifier<input value={form.id} required maxLength={128} readOnly={mode==='edit'} onChange={e=>change('id',e.target.value)}/></label>
+    </>}
+    <label>{discoveryId?'Agent Name (from connection step)':'Target display name'}<input value={form.name} required maxLength={100} pattern="[A-Za-z0-9 ._-]+" onChange={e=>change('name',e.target.value)}/></label>
+    {existingEndpoint&&<p role="status">Existing target: <strong>{existingEndpoint.name}</strong>. <button type="button" onClick={()=>{setDiscovering(false);setMode(null);onDiscoveryFlowChange?.(false);onChanged(existingEndpoint.id);}}>Use {existingEndpoint.name}</button> <button type="button" onClick={()=>start('edit',existingEndpoint,form.name.trim()||existingEndpoint.name)}>Rename Existing</button></p>}
+    {archivedEndpoint&&<p role="status">Archived target at this endpoint: <strong>{archivedEndpoint.name}</strong>. Restore it from the archived list before reconnecting.</p>}
+    <label>Protocol<select value={form.protocol} onChange={e=>change('protocol',e.target.value as ManagedProfile['protocol'])}><option value="openai-chat">HTTP / OpenAI-compatible chat</option><option value="mcp-jsonrpc">MCP JSON-RPC</option></select></label>
+    <label>Endpoint URL<input type="url" value={form.endpoint} required maxLength={256} onChange={e=>change('endpoint',e.target.value)}/></label>
+    <label>{form.protocol==='mcp-jsonrpc'?'MCP service identifier (not an LLM model)':'Model identifier'}<input value={form.model} required maxLength={128} onChange={e=>change('model',e.target.value)}/></label>
+    {discoveryId&&form.protocol==='openai-chat'&&!form.model&&<p role="note">Model not advertised. Enter the model identifier supplied by the target operator before testing the connection.</p>}
+    {!discoveryId&&<label>Timeout (seconds)<input type="number" min="1" max="60" step="1" required value={Number.isNaN(form.timeout_seconds)?'':form.timeout_seconds} onChange={e=>change('timeout_seconds',e.target.valueAsNumber)}/></label>}
+    <p className="target-adapter">Adapter: <strong>{form.protocol==='mcp-jsonrpc'?'generic_mcp_jsonrpc':'generic_http'}</strong>. {form.protocol==='mcp-jsonrpc'?'The service identifier is internal; tools/list never invokes a tool.':'Metadata alone does not verify chat behavior.'}</p>
+    {platformNeedsConfirmation&&<label className="target-consent"><input type="checkbox" checked={platformConfirmed} onChange={e=>setPlatformConfirmed(e.target.checked)}/><span>I confirm this operator-declared platform association. Target ID and connection binding remain unchanged.</span></label>}
+    {discoveryId&&<div className="quick-connect" aria-label="Discovered target connection">
+     <p>Testing endpoint: <code>{form.endpoint}</code> ({form.protocol}).</p>
+     {!discoveryBindingValid&&<p role="alert">Endpoint or protocol changed. Enter the new URL above and run Discover again before testing or saving.</p>}
+     {(!quickProbe||quickProbe.connection_status!=='succeeded'||quickProbe.runtime_protocol_compatible!==true)&&<><label className="target-consent"><input type="checkbox" checked={quickConfirmed} onChange={e=>setQuickConfirmed(e.target.checked)}/><span>I authorize one benign connection probe to this exact endpoint.</span></label>
+     <button className="primary" type="button" disabled={busy||!quickConfirmed||!form.model||!discoveryBindingValid} onClick={probeQuick}>{busy?'Checking...':'Test Connection'}</button></>}
+     <p className={`connection-feedback ${quickProbe?.connection_status==='succeeded'&&quickProbe.runtime_protocol_compatible===true?'is-connected':quickProbe||quickError?'is-failed':''}`} role="status">{busy?'Checking':quickProbe?.connection_status==='succeeded'&&quickProbe.runtime_protocol_compatible===true?'Connected':quickProbe||quickError?'Failed':'Unverified'}: {quickProbe?quickProbe.reason.replaceAll('_',' '):quickError||(!form.model?'Enter a model identifier to run the connection check.':'No connection probe has been sent.')}</p>
+    </div>}
+    {quickError&&<p role="alert">{quickError}</p>}
+    {!discoveryId&&<button type="button" disabled={busy} onClick={validate}>Validate Target Details</button>}
+    <div className="target-form-actions"><button className="primary target-save" type="submit" disabled={busy||!checked||!discoveryBindingValid||!!existingEndpoint||!!archivedEndpoint||!!platformNeedsConfirmation&&!platformConfirmed}>{discoveryId?'Save Target':'Save Configuration'}</button>
+    <button type="button" disabled={busy} onClick={()=>{generation.current++;setMode(null);setDiscovering(false);onDiscoveryFlowChange?.(false);}}>Cancel</button></div>
+   </form>}
+  </>)}
+  {target&&!mode&&!discovering&&!awaitingSelection&&<div className="target-summary" aria-label="Selected target">
+   <div className="target-summary-heading"><div><h2>{target.name}</h2><p className="caption">{target.protocol==='openai-chat'?'OpenAI-compatible HTTP':'MCP JSON-RPC'}</p></div>
+    <span className="target-pill">{target.authorization_status==='review_required'?'Review required':'Reviewed'}</span></div>
+   <div className="target-endpoint"><span title={target.endpoint}>{new URL(target.endpoint).host}</span><span>Model / Agent: <strong>{target.default_model}</strong></span></div>
+   <div className="target-connect">
+    <div role="status"><strong className={`target-connection ${connection==='Connected'?'is-connected':connection==='Connection failed'?'is-failed':''}`}>{connection}</strong>
+     <p className="caption">{connection==='Connected'?'Target responded successfully.':connection==='Checking'?'Sending one authorized benign request.':connection==='Connection failed'?'Unable to confirm a compatible response.':!settingsMatch?'Save changed settings with Edit Target before probing.':target.connection_verification?.status==='expired'||target.connection_verification?.status==='stale'?'Previous connection check expired. Test again.':'Connection not checked.'}</p></div>
+    {enabled&&(localSingleUser||unlocked)&&<div className="target-connect-actions">
+     {target.authorization_status==='review_required'&&(!localSingleUser||!probeAvailable||webLabReview||quickSavedProbe)?<>
+      <label className="target-consent"><input type="checkbox" checked={confirmed} onChange={e=>setConfirmed(e.target.checked)}/> I confirm authorization to test {target.endpoint}</label>
+      <button disabled={!confirmed||busy} onClick={review}>{localSingleUser?'Authorize target for test selection':'Review / Approve Target'}</button>
+      <p className="caption">Review this exact profile. No request is sent. Security payloads require a separate execution grant.</p>
+     </>:null}
+     {connection!=='Connected'&&((!quickSavedProbe&&(!webLabReview||target.authorization_status==='reviewed_for_offline_configuration'&&probeAvailable))||
+       (quickSavedProbe&&target.authorization_status==='reviewed_for_offline_configuration'))&&<>
+      {probeConfirmationRequired&&<label className="target-consent"><input type="checkbox" checked={confirmed} disabled={checking||!settingsMatch||configurationInvalid} onChange={e=>setConfirmed(e.target.checked)}/> I confirm authorization for one benign probe to {new URL(target.endpoint).host}</label>}
+      <button className="primary" disabled={busy||!nonce||!probeAvailable||!confirmed||!settingsMatch||configurationInvalid} onClick={testConnection}>{checking?'Checking...':connection==='Connection failed'?'Retry':'Test Connection'}</button>
+     </>}
+    </div>}
+    {(!enabled||!(localSingleUser||unlocked))&&<button disabled>Test Connection</button>}
+   </div>
+   {!probeAvailable&&<p className="caption">{target.authorization_status==='review_required'?'Review this profile before connecting.':'A safe connection probe is not supported for this profile.'}</p>}
+   {!enabled&&<p className="caption">Target management is unavailable in this service.</p>}
+   {(probe||probeFailed)&&<details className="target-probe-details"><summary>Connection details</summary><p>{probe?`Reason: ${probe.reason.replaceAll('_',' ')}. HTTP status: ${probe.http_status??'unavailable'}. API compatibility: ${probe.runtime_protocol_compatible===null?'unknown':probe.runtime_protocol_compatible?'yes':'no'}. Requests: ${probe.target_request_count}.`:'No connection proof was obtained.'}</p></details>}
+  </div>}
+  {message&&<p role="status">{message}</p>}{error&&<p role="alert">{error}</p>}
+  {target&&!discovering&&!awaitingSelection&&enabled&&(localSingleUser||unlocked)&&<details className="target-advanced target-context-drawer"><summary>Application Context · Optional</summary><ApplicationContext key={identity+nonce} target={target} nonce={nonce} secret={secret}/></details>}
+  {target&&evidenceEnabled&&!discovering&&!awaitingSelection&&<details className="target-advanced target-evidence-drawer"><summary>Evidence Sources · Optional</summary><EvidenceSources key={identity+nonce} target={target} nonce={nonce} secret={secret} authorized={enabled&&(localSingleUser||unlocked)}/></details>}
+ </div>;
+}

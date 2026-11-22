@@ -35,6 +35,10 @@ class Runner:
         evaluation_config: RunnerEvaluationConfig | None = None,
         judge_provider=None,
         report_sink=None,
+        progress_sink=None,
+        require_complete_response_for_pass: bool = False,
+        require_complete_response_for_fail: bool = False,
+        reviewed_judge_input_sha256: str | None = None,
     ) -> None:
         self._executor = executor if executor is not None else Executor()
         self._observer = observer if observer is not None else ResponseObserver()
@@ -48,6 +52,12 @@ class Runner:
             self._evaluator, self._budget = configured_evaluator(self._evaluation_config, judge_provider, self._diagnostics.append)
         self._custom_evaluator = evaluator is not None
         self._report_sink = report_sink
+        self._progress_sink = progress_sink
+        self._require_complete_response_for_pass = require_complete_response_for_pass
+        self._require_complete_response_for_fail = require_complete_response_for_fail
+        # Trusted caller permission to disclose one exact public text input.
+        # Never taken from TestInput metadata, an observation or imported labels.
+        self._reviewed_judge_input_sha256 = reviewed_judge_input_sha256
         self.last_report = None
         self._attack_module_registry = (
             attack_module_registry
@@ -97,6 +107,7 @@ class Runner:
             )
 
         try:
+            prepared_prompt = prepared_input.prompt
             execution_result = self._executor.execute(target, prepared_input)
             self._execution_result = execution_result
         except Exception:
@@ -106,7 +117,14 @@ class Runner:
             )
 
         try:
+            if self._progress_sink is not None:
+                self._progress_sink("collecting_evidence")
             observation = self._observer.observe(execution_result)
+            # These identities come from the trusted Runner call, not from
+            # target-reported metadata or an observer's existing values.
+            observation.metadata["secagent_testcase_id"] = testcase.id
+            observation.metadata["secagent_target_id"] = getattr(target, "id", None)
+            observation.metadata["secagent_execution_id"] = test_input.id
             self._observation = observation
         except Exception:
             return EvaluationResult(
@@ -115,12 +133,48 @@ class Runner:
             )
 
         try:
-            return self._evaluator.evaluate(testcase, observation)
+            if self._progress_sink is not None and not self._custom_evaluator and self._evaluation_config.mode == "rule_only":
+                self._progress_sink("running_rule_evaluator")
+            if not self._custom_evaluator and self._evaluation_config.mode == "hybrid":
+                evaluated = self._evaluator.evaluate(testcase, observation,
+                    prepared_prompt=(prepared_prompt if self._reviewed_judge_input_sha256 else None),
+                    reviewed_input_sha256=self._reviewed_judge_input_sha256,
+                    sensitive_values=self._judge_sensitive_values(target))
+            else:
+                evaluated = self._evaluator.evaluate(testcase, observation)
+            if (self._require_complete_response_for_pass
+                    and evaluated.status is EvaluationStatus.PASS
+                    and observation.metadata.get("response_complete") is not True):
+                return EvaluationResult(status=EvaluationStatus.INCONCLUSIVE,
+                    reason="Response-only PASS requires a complete observed response.")
+            if (self._require_complete_response_for_fail
+                    and evaluated.status is EvaluationStatus.FAIL
+                    and observation.metadata.get("response_complete") is not True):
+                return EvaluationResult(status=EvaluationStatus.INCONCLUSIVE,
+                    reason="Response-only FAIL requires a complete observed response.")
+            return evaluated
         except Exception:
             return EvaluationResult(
                 status=EvaluationStatus.ERROR,
                 reason="Evaluation stage failed.",
             )
+
+    def _judge_sensitive_values(self, target) -> tuple[str, ...]:
+        names = list(target.credential_refs)
+        if self._evaluation_config.pi:
+            names.extend(self._evaluation_config.pi.credential_env)
+        values = {os.environ[name] for name in names if os.environ.get(name)}
+        # Literal private headers are not necessarily environment-backed. Only
+        # use them for local rejection; never attach them to Judge/report input.
+        headers = target.interface.config.get("headers", {})
+        if isinstance(headers, dict):
+            for name, value in headers.items():
+                if (isinstance(value, str) and value
+                        and name.lower() not in {"content-type", "accept", "user-agent"}):
+                    values.add(value)
+                    if value.lower().startswith(("bearer ", "basic ")):
+                        values.add(value.split(" ", 1)[1])
+        return tuple(values)
 
     def _build_report(self, testcase, target, test_input, result):
         executed, observed = self._execution_result, self._observation
@@ -143,6 +197,8 @@ class Runner:
             "input_id": test_input.id,
             "evaluation_mode": "custom" if self._custom_evaluator else self._evaluation_config.mode,
             "evaluation_strategy": testcase.evaluation.strategy,
+            "evaluation_scope": context.get("evaluation_scope"),
+            "execution_evaluation": diagnostic.get("execution_evaluation") if diagnostic else None,
             "semantic_enabled": bool(semantic and semantic.enabled),
             "execution": None if executed is None else {
                 "success": executed.success, "status_code": executed.status_code,
@@ -167,6 +223,8 @@ class Runner:
             "sanitization": "Headers, raw transport bodies and tool arguments omitted; configured credential values redacted in the report only.",
             "evidence_limitations": {
                 "scope": context.get("evidence_scope", "Adapter-visible observations only; no inferred internal actions."),
+                "original_goal": context.get("original_goal"),
+                "attacker_goal": context.get("attacker_objective", context.get("attacker_goal")),
                 "attack_surface": context.get("attack_surface"),
                 "trust_boundary": context.get("trust_boundary"),
                 "actual_lower_trust_boundary": context.get("actual_lower_trust_boundary"),

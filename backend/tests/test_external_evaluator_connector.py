@@ -13,6 +13,7 @@ from integrations.external_evaluator import (
     ProviderFaultCode, SkillBundleLoader, canonical_hash, skill_identity,
 )
 from integrations.external_evaluator.pi import BoundedSubprocessRunner, ProcessOutput
+from integrations.external_evaluator.models import ProcessDiagnosticCode
 from integrations.external_evaluator.validation import JudgeOutputError, parse_judge_response
 
 
@@ -129,6 +130,64 @@ def test_provider_faults_are_not_target_verdicts(process_result, code):
     assert "private diagnostic" not in outcome.fault.message
 
 
+@pytest.mark.parametrize(("stderr", "expected"), [
+    (b"No API key found for deepseek.\n", ProcessDiagnosticCode.CREDENTIAL_MISSING),
+    (b"API Error: HTTP 401 Unauthorized\n", ProcessDiagnosticCode.AUTH_REJECTED),
+    (b"Model \"deepseek/configured-model\" not found. Use --list-models to see available models.\n",
+     ProcessDiagnosticCode.MODEL_REJECTED),
+    (b"Error: connect ECONNREFUSED 127.0.0.1\n", ProcessDiagnosticCode.NETWORK_ERROR),
+    (b"Error: Cannot find module 'pi'\n", ProcessDiagnosticCode.STARTUP_ERROR),
+    (b"opaque failure\nNo API key found for deepseek.\n", ProcessDiagnosticCode.UNKNOWN),
+    (b"No API key found for another-provider.\n", ProcessDiagnosticCode.UNKNOWN),
+    (b"401 unrelated numeric message\n", ProcessDiagnosticCode.UNKNOWN),
+    (b"Error: 429 quota exhausted\n", ProcessDiagnosticCode.UNKNOWN),
+    (b"", ProcessDiagnosticCode.UNKNOWN),
+])
+def test_nonzero_exit_uses_only_fixed_diagnostic_codes(stderr, expected):
+    secret = b"FAKE_SECRET_SENTINEL"
+    fake = FakeProcess(ProcessOutput(exit_code=1, stdout=secret,
+                                     stderr=stderr + secret))
+    outcome = provider(fake).evaluate(make_request())
+    assert outcome.result is None
+    assert outcome.exit_code == 1
+    assert outcome.fault.code == ProviderFaultCode.NONZERO_EXIT
+    assert outcome.fault.diagnostic_code == expected
+    assert secret.decode() not in outcome.model_dump_json()
+    if stderr.strip():
+        assert stderr.decode(errors="replace").strip() not in outcome.model_dump_json()
+
+
+def test_configured_credential_is_forwarded_only_from_python_environment(monkeypatch):
+    secret = "FAKE_SECRET_SENTINEL"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", secret)
+    monkeypatch.setenv("SECAGENT_UNRELATED_SECRET", secret)
+    config = PiEvaluatorConfig(
+        executable="pi.cmd", provider="deepseek", model="configured-model",
+        timeout_seconds=3, credential_env=("DEEPSEEK_API_KEY",),
+    )
+    fake = FakeProcess(ProcessOutput(exit_code=1, stderr=b"opaque error"))
+    outcome = PiEvaluatorProvider(config, process_runner=fake).evaluate(make_request())
+    assert fake.calls[0]["env"]["DEEPSEEK_API_KEY"] == secret
+    assert "SECAGENT_UNRELATED_SECRET" not in fake.calls[0]["env"]
+    assert outcome.fault.diagnostic_code == ProcessDiagnosticCode.UNKNOWN
+    assert secret not in outcome.model_dump_json()
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY")
+    fake_without_key = FakeProcess(ProcessOutput(exit_code=1, stderr=b"opaque error"))
+    outcome_without_key = PiEvaluatorProvider(config, process_runner=fake_without_key).evaluate(make_request())
+    assert "DEEPSEEK_API_KEY" not in fake_without_key.calls[0]["env"]
+    assert outcome_without_key.fault.diagnostic_code == ProcessDiagnosticCode.UNKNOWN
+
+
+def test_nonzero_exit_does_not_accept_even_valid_judge_json():
+    fake = FakeProcess(ProcessOutput(exit_code=1, stdout=recommendation().encode(),
+                                     stderr=b"opaque failure"))
+    outcome = provider(fake).evaluate(make_request())
+    assert outcome.result is None
+    assert outcome.fault.code == ProviderFaultCode.NONZERO_EXIT
+    assert outcome.fault.diagnostic_code == ProcessDiagnosticCode.UNKNOWN
+
+
 def test_isolated_workspace_failure_is_structured_process_fault(monkeypatch):
     def denied(**_kwargs):
         raise PermissionError("test-only denied")
@@ -241,7 +300,12 @@ def test_hash_matches_dataset_exporter_without_a_second_algorithm():
     spec.loader.exec_module(module)
     exported, _ = module.prepare(module.load_dataset(module.DEFAULT_DATASET))
     request = EvaluationRequest.model_validate(exported[0])
+    assert request.testcase.model_dump() == exported[0]["testcase"]
     assert request.sha256 == module.canonical_hash(exported[0]) == canonical_hash(exported[0])
+    with_input = EvaluationRequest.model_validate(exported[0] | {"testcase":
+        exported[0]["testcase"] | {"untrusted_input": "Untrusted imported prompt."}})
+    assert with_input.model_dump()["testcase"]["untrusted_input"] == "Untrusted imported prompt."
+    assert with_input.sha256 != request.sha256
     assert module.skill_identity() == skill_identity()
 
 

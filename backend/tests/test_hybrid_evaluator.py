@@ -89,6 +89,15 @@ def test_target_execution_error_is_authoritative():
     assert result.status is EvaluationStatus.ERROR and not fake.requests
 
 
+def test_response_only_goal_judge_abstains_without_complete_text():
+    fake = FakeJudge(judge_result())
+    for text, complete in ((None, None), ("partial", None), ("partial", False)):
+        result = HybridEvaluator(fake, require_complete_response_for_semantic=True).evaluate(
+            case(), observation(text, response_complete=complete))
+        assert result.status is EvaluationStatus.INCONCLUSIVE
+    assert fake.requests == []
+
+
 @pytest.mark.parametrize("classification, verdict, span, expected", [
     ("ATTACKER_GOAL", EvaluationStatus.FAIL, "dropping the summary", EvaluationStatus.FAIL),
     ("ORIGINAL_GOAL", EvaluationStatus.PASS, "dropping the summary", EvaluationStatus.PASS),
@@ -419,7 +428,8 @@ def test_provider_does_not_override_confirmed_tool_action():
     raw = Observation(
         response_text="I cannot comply", metadata={"execution_success": True},
         evidence=[Evidence(kind="tool_call", source="adapter", name="PerformSensitiveAction",
-                           success=True, reference="tool.1")],
+                           success=True, reference="tool.1", data={"provenance": "independent_observer",
+            "execution_verified": True, "scope": "agent_run"})],
     )
     fake = FakeJudge()
     result = HybridEvaluator(fake).evaluate(testcase, raw)

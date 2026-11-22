@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
 
 from core.models import EvaluationStatus, Evidence
 from integrations.external_evaluator.identity import canonical_hash
@@ -11,6 +11,7 @@ from integrations.external_evaluator.identity import canonical_hash
 
 EvaluationType = Literal[
     "goal_hijacking", "prompt_injection", "tool_misuse", "sensitive_data_disclosure",
+    "identity_privilege_abuse", "unexpected_code_execution",
 ]
 
 
@@ -21,6 +22,14 @@ class StrictModel(BaseModel):
 class RequestTestcase(StrictModel):
     id: str = Field(min_length=1)
     security_objective: str = Field(min_length=1)
+    untrusted_input: str | None = Field(default=None, max_length=65536)
+
+    @model_serializer(mode="wrap")
+    def serialize_optional_input(self, handler):
+        data = handler(self)
+        if self.untrusted_input is None:
+            data.pop("untrusted_input", None)
+        return data
 
 
 class RequestObservation(StrictModel):
@@ -113,9 +122,19 @@ class ProviderFaultCode(str, Enum):
     PROCESS_ERROR = "process_error"
 
 
+class ProcessDiagnosticCode(str, Enum):
+    CREDENTIAL_MISSING = "credential_missing"
+    AUTH_REJECTED = "auth_rejected"
+    MODEL_REJECTED = "model_rejected"
+    NETWORK_ERROR = "network_error"
+    STARTUP_ERROR = "startup_error"
+    UNKNOWN = "unknown"
+
+
 class ProviderFault(StrictModel):
     code: ProviderFaultCode
     message: str = Field(min_length=1)
+    diagnostic_code: ProcessDiagnosticCode | None = None
 
 
 class ExternalEvaluationOutcome(StrictModel):

@@ -21,9 +21,12 @@ by the caller's allowlisted `evaluation_type`:
 | prompt_injection | [prompt-injection.md](vulnerabilities/prompt-injection.md) |
 | tool_misuse | [tool-misuse.md](vulnerabilities/tool-misuse.md) |
 | sensitive_data_disclosure | [sensitive-data-disclosure.md](vulnerabilities/sensitive-data-disclosure.md) |
+| identity_privilege_abuse | [identity-privilege-abuse.md](vulnerabilities/identity-privilege-abuse.md) |
+| unexpected_code_execution | [unexpected-code-execution-response.md](vulnerabilities/unexpected-code-execution-response.md) |
 
-Only GH is opted into semantic fallback in the Week 5 native testcases. Existence
-of a skill does not activate an evaluator or authorize additional actions.
+Native action testcases retain their own evidence contracts. Reviewed imported
+response policies can opt into ASI03 or ASI05 response-only semantic evaluation.
+Existence of a skill never authorizes target execution or tool actions.
 
 ## Input and output
 

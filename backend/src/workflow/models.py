@@ -17,7 +17,7 @@ class Preset(ClosedModel):
     platform_name: Annotated[str, StringConstraints(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9 ._-]+$")] | None = None
     reviewed: bool = False
     endpoint: Annotated[str, StringConstraints(min_length=1, max_length=256)]
-    protocol: Literal["openai-chat"] = "openai-chat"
+    protocol: Literal["openai-chat", "mcp-jsonrpc"] = "openai-chat"
     models: list[ModelName] = Field(min_length=1, max_length=20)
     default_model: ModelName
     timeout_min: int = Field(default=1, ge=1, le=120)
@@ -62,13 +62,22 @@ class TargetDraft(ClosedModel):
     profile_revision: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
     policy_ref: Identifier
     endpoint: Annotated[str, StringConstraints(min_length=1, max_length=256)]
-    protocol: Literal["openai-chat"]
+    protocol: Literal["openai-chat", "mcp-jsonrpc"]
     method: Literal["POST"]
     model: ModelName
-    request_mapping: Literal["openai-chat-user-message-v1"]
-    response_parser: Literal["choices.0.message.content"]
+    request_mapping: Literal["openai-chat-user-message-v1", "mcp-tools-call-v1"]
+    response_parser: Literal["choices.0.message.content", "mcp-jsonrpc-result-v1"]
     timeout_seconds: int = Field(ge=1, le=120)
     credential_alias: Identifier | None
+
+    @model_validator(mode="after")
+    def coherent_protocol(self):
+        expected = (("openai-chat-user-message-v1", "choices.0.message.content")
+                    if self.protocol == "openai-chat" else
+                    ("mcp-tools-call-v1", "mcp-jsonrpc-result-v1"))
+        if (self.request_mapping, self.response_parser) != expected:
+            raise ValueError("Protocol, request mapping and response parser differ.")
+        return self
 
 
 class ConnectionCheckRequest(ClosedModel):
@@ -79,10 +88,11 @@ class ConnectionCheckRequest(ClosedModel):
 
 class ConnectionCheckResult(ClosedModel):
     workflow_schema_version: Literal["1.0.0"] = "1.0.0"
-    connection_status: Literal["requires_approval", "rejected", "unsupported"]
+    connection_status: Literal["requires_approval", "rejected", "unsupported", "succeeded", "incompatible", "unavailable"]
     reason: Identifier
-    target_request_count: Literal[0] = 0
-    connection_reachable: None = None
-    runtime_protocol_compatible: None = None
+    target_request_count: Literal[0, 1] = 0
+    connection_reachable: bool | None = None
+    runtime_protocol_compatible: bool | None = None
+    http_status: int | None = None
     security_test_executed: Literal[False] = False
     security_verdict: None = None

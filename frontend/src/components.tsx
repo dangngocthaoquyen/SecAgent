@@ -4,6 +4,8 @@ const descriptions: Record<string, string> = {
   FAIL: "Historical test detected the attacker objective or another specified security failure condition.",
   INCONCLUSIVE:
     "Available evidence did not support a definitive security verdict.",
+  ERROR:
+    "Technical execution error occurred; this is not a security FAIL verdict or discovered vulnerability.",
   succeeded:
     "Target execution reported success. This does not mean security PASS.",
   failed: "Technical execution failed; this is not a security FAIL.",
@@ -23,7 +25,9 @@ export function Badge({ value }: { value: string | null }) {
         ? "success"
         : name === "INCONCLUSIVE" || name === "partial"
           ? "warning"
-          : "neutral";
+          : name === "ERROR"
+            ? "error"
+            : "neutral";
   return (
     <span
       className={`badge ${tone}`}

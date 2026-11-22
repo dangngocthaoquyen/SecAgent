@@ -40,6 +40,7 @@ results/smoke/week4/*.report.jsonl
 # Reviewed replay inputs belong under backend/tests/fixtures, not results/.
 results/judge-validation/
 results/smoke/week5/
+results/local-controlled-runs/
 
 # Local agent auth/workspaces (never version credentials or session state).
 .pi/

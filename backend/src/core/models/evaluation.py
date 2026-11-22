@@ -58,7 +58,7 @@ class SemanticEvaluationConfig(BaseModel):
     enabled: bool = Field(default=False, strict=True)
     skill: Literal[
         "goal_hijacking", "prompt_injection", "tool_misuse",
-        "sensitive_data_disclosure",
+        "sensitive_data_disclosure", "identity_privilege_abuse", "unexpected_code_execution",
     ]
     trusted_context: dict[str, Any] = Field(min_length=1)
     expected_labels: list[str] = Field(min_length=1)
@@ -77,11 +77,15 @@ class EvaluationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     rules: list[EvaluationRule]
-    strategy: Literal["deterministic", "action", "semantic", "hybrid"] | None = None
+    strategy: Literal["deterministic", "action", "semantic", "hybrid", "unavailable"] | None = None
     semantic: SemanticEvaluationConfig | None = None
 
     @model_validator(mode="after")
     def require_evaluation_method(self) -> "EvaluationConfig":
+        if self.strategy == "unavailable":
+            if self.rules or self.semantic is not None:
+                raise ValueError("Unavailable evaluation cannot contain executable rules or a Judge contract.")
+            return self
         if not self.rules and not (self.semantic is not None and self.semantic.enabled):
             raise ValueError("Evaluation requires deterministic rules or explicitly enabled semantic evaluation.")
         return self

@@ -54,6 +54,7 @@ export type Verification = {
   limitations: string[];
 };
 export type Detail = {
+  imported_provenance?: Fields | null;
   report_id: string;
   execution_id: string | null;
   identity: Fields;
@@ -88,7 +89,7 @@ export type Detail = {
   limitations: string[];
   technical_errors: Fields[];
 };
-export type DetailResponse = { snapshot_sha256: string; execution: Detail };
+export type DetailResponse = { snapshot_sha256: string; execution: Detail; target_request_count?: number|null };
 export type Comparison = {
   report_id: string;
   mode: string;
@@ -194,6 +195,9 @@ function envelope(v: unknown) {
 export function parseDetail(v: unknown): DetailResponse {
   const o = envelope(v),
     d = obj(o.execution);
+  if (o.target_request_count !== undefined && o.target_request_count !== null &&
+      (typeof o.target_request_count !== "number" || !Number.isSafeInteger(o.target_request_count) || o.target_request_count < 0))
+    throw Error("contract");
   if (
     d.report_kind !== "execution" ||
     d.report_schema_version !== "2.0.0" ||
@@ -204,6 +208,7 @@ export function parseDetail(v: unknown): DetailResponse {
   nullable(d.source_reported_at);
   for (const k of ["identity", "source", "execution", "security", "context"])
     fields(d[k]);
+  if(d.imported_provenance!==undefined&&d.imported_provenance!==null)fields(d.imported_provenance);
   const ob = obj(d.observation);
   nullable(ob.response_preview);
   for (const k of ["preview_redacted", "preview_truncated"])

@@ -1,5 +1,25 @@
 # SecAgent
 
+## Start the local application
+
+With Python and Node on `PATH`, install dependencies once and start all three
+loopback services with:
+
+```powershell
+python -m pip install -r backend/requirements.txt -r backend/requirements-reporting.txt
+Push-Location frontend
+npm ci
+Pop-Location
+python start_secagent_local.py
+```
+
+The launcher opens the frontend and stops its own services on Ctrl+C. It
+generates a private session credential in memory; the browser never asks for
+an operator token. Target profiles persist in the user's local application
+data. A target requires an explicit confirmation for its first benign probe,
+and execution still requires a fresh, bounded grant. The default evaluation
+mode is rule-only. See [local target management](docs/target-management.md).
+
 AI Agent Security Testing Framework — Python prototype for PI, TM, SD and GH.
 
 ASI03 Identity & Privilege Abuse and ASI05 Unexpected Code Execution now have

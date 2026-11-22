@@ -1,4 +1,5 @@
 export type Verdict = "PASS" | "FAIL" | "INCONCLUSIVE" | null;
+export type SavedRunVerdict = Verdict | "ERROR";
 export type Rate = {
   numerator: number | null;
   denominator: number;
@@ -75,6 +76,25 @@ export const emptyFilters: Filters = {
   verdict: "",
   testcase_id: "",
 };
+export type SavedRunFilters = Filters & {
+  date_from: string;
+  date_to: string;
+};
+export const emptySavedRunFilters: SavedRunFilters = {
+  ...emptyFilters,
+  date_from: "",
+  date_to: "",
+};
+export type SavedRun = {run_id:string;kind:'controlled'|'mcp_action';testcase_id:string|null;target_id:string|null;asi_category:string|null;verdict:SavedRunVerdict;started_at:string|null;report_sha256:string;evidence_provenance:string|null};
+export type SavedRunsPage = {page:number;page_size:number;total:number;invalid_artifact_count:number;items:SavedRun[]};
+function parseSavedRuns(v:unknown):SavedRunsPage {
+  const row=base(v);count(row.page);count(row.page_size);count(row.total);count(row.invalid_artifact_count);
+  if(!Array.isArray(row.items)||row.items.length>100)throw Error('contract');
+  for(const item of row.items){const r=object(item);if(!/^[a-f0-9]{32}$/.test(text(r.run_id)))throw Error('contract');oneOf(r.kind,['controlled','mcp_action']);
+    for(const key of ['testcase_id','target_id','asi_category','started_at','evidence_provenance'])nullableText(r[key]);
+    oneOf(r.verdict,['PASS','FAIL','INCONCLUSIVE','ERROR',null]);sha(r.report_sha256);}
+  return row as unknown as SavedRunsPage;
+}
 
 // Validate the consumed contract instead of casting arbitrary JSON into UI facts.
 type Obj = Record<string, unknown>;
@@ -241,13 +261,14 @@ export async function get<T>(
   route: string,
   parse: (v: unknown) => T,
   signal: AbortSignal,
+  timeoutMs = 12000,
 ): Promise<T> {
   try {
     const response = await fetch(`/api/reports/${route}`, {
       method: "GET",
       credentials: "omit",
       cache: "no-store",
-      signal: AbortSignal.any([signal, AbortSignal.timeout(12000)]),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
     });
     if (!response.ok)
       throw new ApiError(
@@ -270,6 +291,11 @@ export async function get<T>(
   }
 }
 export const api = {
+  savedRuns:(filters:SavedRunFilters,page:number,size:number,signal:AbortSignal)=>{
+    const query=new URLSearchParams({page:String(page),page_size:String(size)});
+    for(const [key,value] of Object.entries(filters))if(value)query.set(key,value);
+    return get(`saved-runs?${query}`,parseSavedRuns,signal,30000);
+  },
   health: (signal: AbortSignal) => get("health", parseHealth, signal),
   overview: (signal: AbortSignal) => get("overview", parseOverview, signal),
   executions: (

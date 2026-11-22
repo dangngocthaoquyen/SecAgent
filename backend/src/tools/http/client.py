@@ -16,6 +16,7 @@ class HttpResponse:
     text: str
     json_body: Any | None
     duration_ms: float
+    body_complete: bool | None = None
 
 
 class HttpClientError(Exception):

@@ -2,39 +2,13 @@
 import argparse
 import ipaddress
 import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 import sys
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from testing.web_fixture import WebFixture
-
-
-def handler_for(fixture):
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self): self.respond()
-        def do_POST(self): self.respond()
-        def log_message(self, *args): pass  # Never log raw URL/headers.
-        def respond(self):
-            # Unknown query/body is rejected, never stored or echoed.
-            if "?" in self.path or self.headers.get("Transfer-Encoding") or self.headers.get("Content-Length", "0") != "0":
-                self.send_error(400); return
-            page_path = urlsplit(fixture.page_url).path
-            if self.path == page_path and self.command == "GET":
-                fixture.record("page", self.command, self.client_address[0])
-                data, content_type = fixture.page().encode(), "text/html; charset=utf-8"
-            elif self.path == fixture.callback_path:
-                fixture.record("receipt", self.command, self.client_address[0])
-                data, content_type = b'{"received":true}', "application/json"
-            else:
-                self.send_error(404); return
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers(); self.wfile.write(data)
-    return Handler
+from testing.web_fixture import WebFixture, handler_for
 
 
 def main(argv=None):

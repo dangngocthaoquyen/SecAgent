@@ -2,26 +2,76 @@ export type TargetPreset = {
   id: string; name: string; profile_revision: string; policy_ref: string;
   platform_id?: string|null; platform_name?: string|null;
   authorization_status: 'review_required'|'reviewed_for_offline_configuration';
-  endpoint: string; protocol: 'openai-chat'; method: 'POST'; models: string[]; default_model: string;
+  endpoint: string; protocol: 'openai-chat'|'mcp-jsonrpc'; method: 'POST'; models: string[]; default_model: string;
   timeout_min: number; timeout_max: number; timeout_default: number;
   credential_alias: string|null; credential_availability: string;
-  request_mapping: 'openai-chat-user-message-v1'; response_parser: 'choices.0.message.content';
-  connection_probe: {status:'unsupported';reason:'safe_probe_not_verified';active_probe_authorized:false;security_execution_authorized:false};
+  request_mapping: 'openai-chat-user-message-v1'|'mcp-tools-call-v1'; response_parser: 'choices.0.message.content'|'mcp-jsonrpc-result-v1';
+  connection_probe: {status:'unsupported'|'supported'|'requires_confirmation';reason:string;active_probe_authorized:boolean;security_execution_authorized:false};
+  connection_verification?: {status:'compatible'|'expired'|'stale'|'not_checked';basis:'benign_chat_probe';profile_revision:string;security_execution_authorized:false};
+  reviewed_at?: string|null;
+  platform_provenance?: 'seed_configured'|'discovery_suggested'|'operator_declared'|'legacy_unknown';
   capabilities: string[]; capability_basis: string; limitations: string[];
 };
 export type Draft = Pick<TargetPreset,'profile_revision'|'policy_ref'|'endpoint'|'protocol'|'method'|'request_mapping'|'response_parser'|'credential_alias'> & {target_id:string;model:string;timeout_seconds:number};
 export type ValidationResult = {configuration_status:'valid'|'invalid';errors:string[];target_id:string;profile_revision:string;connection_reachable:null;runtime_protocol_compatible:null;target_execution_performed:false;security_verdict:null};
 export type EvaluationMode = 'rule_only'|'hybrid';
+export type Asi01TextTarget = {target_id:string;endpoint:string;model:string};
+export type ManagedProfile = {id:string;name:string;platform_id:string;platform_name:string;endpoint:string;protocol:'openai-chat'|'mcp-jsonrpc';model:string;timeout_seconds:number};
+export type ArchivedTarget={id:string;name:string;platform_id:string|null;platform_name:string|null;endpoint:string;protocol:'openai-chat'|'mcp-jsonrpc';profile_revision:string;archived_at:string};
+export type ApplicationContextDraft={target_id:string;target_revision:string;purpose:string;features:string;available_tools:string;users:string;allowed_resources:string;prohibited_resources:string;sensitive_data_categories:string;protected_assets:string;high_risk_actions:string;required_instructions:string;authorization_required:string;trust_boundaries:string};
+export type ApplicationContextRecord={schema_version:'1.0.0';provenance:'operator_declared';revision_sha256:string;updated_at:string;draft:ApplicationContextDraft};
+export type ProbeResult = {connection_status:'succeeded'|'incompatible'|'unavailable'|'requires_approval'|'rejected'|'unsupported';reason:string;target_request_count:0|1;connection_reachable:boolean|null;runtime_protocol_compatible:boolean|null;http_status:number|null;security_test_executed:false;security_verdict:null};
+export type DiscoveryResult = {discovery_id:string;input_url:string;canonical_endpoint:string|null;status:string;request_count:number;request_budget:number;
+ connection_status?:'reachable'|'unavailable';
+ metadata_sources:{url:string;status:string;classification:string}[];
+ evidence_candidates?:{source_name:string;url:string;evidence_type:string;discovery_provenance:string;availability:string;verification_status:string;correlation_capability:string;required_authorization:string;limitations:string}[];
+ protocol_candidates:{id:string;classification:string;source:string;runtime_verified:false}[];
+ advertised_models:{id:string;source:string;classification:string}[];
+ advertised_agent:{name:string;source:string;classification:string}|null;
+ advertised_tools:{name:string;source:string;classification:string}[];
+ advertised_skills:{name:string;source:string;classification:string}[];
+ possible_contracts:{request:string;response:string;classification:string}[];
+ protocol_hint:string|null;
+ unknown_fields:string[];warnings:string[];
+ recommendations:{testcase_id:string;asi_category:string;status:'SUPPORTED'|'CONDITIONAL'|'UNSUPPORTED'|'UNKNOWN';reason:string;security_verdict:null}[];
+ proposed_profile:ManagedProfile|null;security_test_executed:false;security_verdict:null};
+export type DatasetSummary = {
+ dataset_id: string; name: string; schema_version: string; source_tool: string;
+ platform?: string|null; bot?: string|null; run_id?: string|null;
+ imported_at: string; file_sha256: string; total_testcases: number;
+};
+export type ImportedTestcase = {
+ testcase_id: string; internal_id: string; description: string|null; plugin_id: string|null; strategy_id: string|null;
+ prompt: string; prompt_sha256: string;
+ assertions: Record<string, unknown>[]; metadata: Record<string, unknown>;
+ options: Record<string, unknown>; extra: Record<string, unknown>; index: number;
+};
+export type DatasetEnvelope = DatasetSummary & {
+ testcases: ImportedTestcase[]; source_metadata: Record<string, unknown>;
+};
 type Obj=Record<string,unknown>;
 function obj(v:unknown):Obj{if(!v||typeof v!=='object'||Array.isArray(v))throw Error('contract');return v as Obj;}
 function strings(v:unknown){if(!Array.isArray(v)||v.some(s=>typeof s!=='string'))throw Error('contract');}
 function envelope(v:unknown){const o=obj(v);if(o.workflow_schema_version!=='1.0.0')throw Error('contract');return o;}
+function textTargets(value:unknown):Asi01TextTarget[]{
+ if(!Array.isArray(value)||value.length>10)throw Error('contract');
+ return value.map(entry=>{const row=obj(entry);
+  if(typeof row.target_id!=='string'||typeof row.endpoint!=='string'||typeof row.model!=='string'||
+     !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(row.target_id)||
+     !/^http:\/\/127\.0\.0\.1:\d{2,5}\/v1\/chat\/completions$/.test(row.endpoint)||
+     !/^[A-Za-z0-9_.-]{1,128}$/.test(row.model))throw Error('contract');
+  return {target_id:row.target_id,endpoint:row.endpoint,model:row.model};
+ });
+}
 export function parseTargets(v:unknown):{targets:TargetPreset[];protocols:{id:string;state:string}[]}{
  const o=envelope(v);if(!Array.isArray(o.targets)||!Array.isArray(o.protocols))throw Error('contract');
  const identities=new Set<string>(),platforms=new Map<string,string>();
  for(const t of o.targets){
   const p=obj(t),probe=obj(p.connection_probe);
-  if(probe.status!=='unsupported'||probe.reason!=='safe_probe_not_verified'||probe.active_probe_authorized!==false||probe.security_execution_authorized!==false)throw Error('contract');
+  if(probe.security_execution_authorized!==false||
+    !(probe.status==='unsupported'&&probe.active_probe_authorized===false&&['safe_probe_not_verified','operator_review_required'].includes(String(probe.reason))||
+      probe.status==='supported'&&probe.active_probe_authorized===true&&probe.reason==='reviewed_exact_endpoint'&&p.authorization_status==='reviewed_for_offline_configuration'||
+      probe.status==='requires_confirmation'&&probe.active_probe_authorized===false&&probe.reason==='authorization_confirmation_required'&&p.authorization_status==='review_required'))throw Error('contract');
   const url=new URL(String(p.endpoint));if(!["http:","https:"].includes(url.protocol)||url.username||url.password||url.search||url.hash)throw Error('contract');
   for(const k of ['id','name','profile_revision','policy_ref','endpoint','default_model','credential_availability','capability_basis'])if(typeof p[k]!=='string')throw Error('contract');
   const id=String(p.id);if(identities.has(id))throw Error('contract');identities.add(id);
@@ -31,8 +81,12 @@ export function parseTargets(v:unknown):{targets:TargetPreset[];protocols:{id:st
    if(typeof platformId!=='string'||!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(platformId)||typeof platformName!=='string'||!(/^[A-Za-z0-9 ._-]{1,80}$/.test(platformName)))throw Error('contract');
    if(platforms.has(platformId)&&platforms.get(platformId)!==platformName)throw Error('contract');platforms.set(platformId,platformName);
   }
-  if(!/^[a-f0-9]{64}$/.test(String(p.profile_revision))||p.protocol!=='openai-chat'||p.method!=='POST'||p.request_mapping!=='openai-chat-user-message-v1'||p.response_parser!=='choices.0.message.content')throw Error('contract');
+  if(p.platform_provenance!==undefined&&!['seed_configured','discovery_suggested','operator_declared','legacy_unknown'].includes(String(p.platform_provenance)))throw Error('contract');
+  if(!/^[a-f0-9]{64}$/.test(String(p.profile_revision))||p.method!=='POST'||!(p.protocol==='openai-chat'&&p.request_mapping==='openai-chat-user-message-v1'&&p.response_parser==='choices.0.message.content'||p.protocol==='mcp-jsonrpc'&&p.request_mapping==='mcp-tools-call-v1'&&p.response_parser==='mcp-jsonrpc-result-v1'))throw Error('contract');
   if(!['review_required','reviewed_for_offline_configuration'].includes(String(p.authorization_status)))throw Error('contract');
+  if(p.connection_verification!==undefined){const check=obj(p.connection_verification);
+   if(!['compatible','expired','stale','not_checked'].includes(String(check.status))||check.basis!=='benign_chat_probe'||
+    check.profile_revision!==p.profile_revision||check.security_execution_authorized!==false)throw Error('contract');}
   if(p.credential_alias!==null&&typeof p.credential_alias!=='string')throw Error('contract');
   for(const k of ['models','capabilities','limitations'])strings(p[k]);
   for(const k of ['timeout_min','timeout_max','timeout_default'])if(!Number.isSafeInteger(p[k])||Number(p[k])<1||Number(p[k])>120)throw Error('contract');
@@ -44,9 +98,94 @@ async function request<T>(route:string,parse:(v:unknown)=>T,signal:AbortSignal,b
  try{const r=await fetch(`/api/testing/${route}`,{method:body?'POST':'GET',credentials:'omit',cache:'no-store',signal:AbortSignal.any([signal,AbortSignal.timeout(10000)]),headers:body?{'Content-Type':'application/json','X-SecAgent-Validation':nonce!}:undefined,body:body?JSON.stringify(body):undefined});if(!r.ok)throw Error(`Workflow API rejected the request (HTTP ${r.status}). Reload the catalog and check the operator configuration. No target request was made.`);try{return parse(await r.json());}catch{throw Error('Workflow API returned an unsupported response. Configuration has not been validated.');}}
  catch(e){if(signal.aborted)throw e;if(e instanceof Error&&e.message.startsWith('Workflow API'))throw e;throw Error('Workflow API unavailable or timed out. Start the offline service on port 8092.');}
 }
+function parseProfile(v:unknown):TargetPreset{const o=envelope(v);return parseTargets({workflow_schema_version:'1.0.0',targets:[o.profile],protocols:[]}).targets[0];}
+function parseProbe(v:unknown):ProbeResult{const o=envelope(v);if(!['succeeded','incompatible','unavailable','requires_approval','rejected','unsupported'].includes(String(o.connection_status))||
+ ![0,1].includes(Number(o.target_request_count))||![null,true,false].includes(o.connection_reachable as null|boolean)||![null,true,false].includes(o.runtime_protocol_compatible as null|boolean)||o.security_test_executed!==false||o.security_verdict!==null||typeof o.reason!=='string')throw Error('contract');return o as unknown as ProbeResult;}
+function parseDiscovery(v:unknown):DiscoveryResult{const o=envelope(v);
+ if(typeof o.discovery_id!=='string'||!/^[a-f0-9]{32}$/.test(o.discovery_id)||
+  typeof o.input_url!=='string'||!(o.canonical_endpoint===null||typeof o.canonical_endpoint==='string')||
+  !Number.isSafeInteger(o.request_count)||Number(o.request_count)>3||o.request_budget!==3||
+  !(o.connection_status===undefined||['reachable','unavailable'].includes(String(o.connection_status)))||
+  !Array.isArray(o.metadata_sources)||o.metadata_sources.length!==o.request_count||
+  !(o.evidence_candidates===undefined||Array.isArray(o.evidence_candidates)&&o.evidence_candidates.length<=20)||
+  !Array.isArray(o.protocol_candidates)||!Array.isArray(o.advertised_models)||
+  !Array.isArray(o.advertised_tools)||!Array.isArray(o.advertised_skills)||!Array.isArray(o.possible_contracts)||
+  !Array.isArray(o.unknown_fields)||!Array.isArray(o.warnings)||!Array.isArray(o.recommendations)||
+  o.security_test_executed!==false||o.security_verdict!==null)throw Error('contract');
+ return o as unknown as DiscoveryResult;
+}
+async function adminRequest<T>(route:string,parse:(v:unknown)=>T,secret:string,nonce:string,body?:unknown,timeout=10000,extraHeaders?:Record<string,string>,rawBody?:Blob):Promise<T>{
+ try{const r=await fetch(`/api/testing/${route}`,{method:body===undefined?'GET':'POST',credentials:'omit',cache:'no-store',signal:AbortSignal.timeout(timeout),
+  headers:{...(secret?{'X-SecAgent-Operator':secret}:{}),...(nonce?{'X-SecAgent-Validation':nonce}:{}),...(body===undefined?{}:{'Content-Type':'application/json'}),...(extraHeaders||{})},body:rawBody??(body===undefined?undefined:JSON.stringify(body))});
+  if(!r.ok){const value=await r.json().catch(()=>null);const message=value?.error?.message,code=value?.error?.code;
+   const safeCode=typeof code==='string'&&/^[a-z0-9_]{1,80}$/.test(code)?` [${code}]`:'';
+   throw Error(typeof message==='string'&&message.length<=240?`Workflow API${safeCode}: ${message}`:`Workflow API${safeCode} rejected the operator action (HTTP ${r.status}). Check authentication, profile revision and server readiness.`);}
+  try{return parse(await r.json());}catch{throw Error('Workflow API returned an unsupported operator response.');}}
+ catch(e){if(e instanceof Error&&e.message.startsWith('Workflow API'))throw e;throw Error('Workflow API unavailable or timed out.');}
+}
+export type Asi03ContractDraft={
+ source_dataset_id:string;source_testcase_id:string;target_id:string;
+ evaluation_scope:'identity_claim_response';legitimate_agent_identity:string;allowed_roles:string[];
+ legitimate_user_goal:string;attacker_objective:string;prohibited_identity_claim:string|null;
+ prohibited_authority_claim:string|null;attack_surface:string;delivery_surface:'direct_chat';
+ required_evidence:['complete_response_text'];expected_security_boundary:string;
+};
+export type Asi03Contract={contract_id:string;revision_sha256:string;review_status:'draft'|'reviewed'|'stale';
+ response_contract_ready:boolean;readiness_blockers:string[];draft:Asi03ContractDraft};
+export type Asi03TargetPolicyDraft={target_id:string;legitimate_agent_identity:string;allowed_roles:string[];
+ prohibited_identity_claim:string|null;prohibited_authority_claim:string|null;expected_security_boundary:string;
+ evaluation_scope:'identity_claim_response';delivery_surface:'direct_chat'};
+export type Asi03TargetPolicy={policy_id:string;revision_sha256:string;review_status:'draft'|'reviewed'|'stale';
+ response_policy_ready:boolean;readiness_blockers:string[];draft:Asi03TargetPolicyDraft};
+export type Asi05PolicyDraft={target_id:string;prohibited_command_behavior:string;allowed_benign_context:string;
+ expected_response_boundary:string;evaluation_scope:'response_command_artifact';delivery_surface:'direct_chat'};
+export type Asi05Policy={policy_id:string;revision_sha256:string;review_status:'draft'|'reviewed'|'stale';
+ response_policy_ready:boolean;readiness_blockers:string[];draft:Asi05PolicyDraft};
+export type EvidenceMapping={items:string;event_id?:string|null;request_id?:string|null;invocation_id?:string|null;timestamp?:string|null;tool?:string|null;content?:string|null};
+export type EvidenceSemantics='detector_reported'|'declared_tool_call'|'tool_handler_invoked'|'simulated_execution'|'runtime_execution_verified';
+export type EvidenceSourceDraft={name:string;target_id:string;target_revision:string;source_type:'http_json';endpoint:string;credential_ref:string|null;collection_mode:'snapshot';mapping:EvidenceMapping;semantics:EvidenceSemantics;timeout_seconds:number;max_response_bytes:number;max_events:number;enabled:boolean};
+export type EvidenceSource=EvidenceSourceDraft&{id:string;revision:string;schema_version:string;availability?:'not_checked'|'available'|'unavailable';correlation_status?:'uncorrelated';action_eligible?:false;configuration_status?:string;last_checked_at?:string|null;latest_capture_id?:string|null;collection_error?:string|null};
+export type EvidenceCapture={id:string;source_id:string;source_revision:string;availability:'available'|'unavailable';error:string|null;action_eligible:false;correlation_status:'uncorrelated';request_count:number;events:unknown[];external_judge_disclosure:'forbidden'};
+export type EvidenceSourceList={sources:EvidenceSource[];allowed_endpoints:{url:string;credential_ref:string|null}[]};
+export type McpActionCase={testcase_id:string;asi_category:'ASI05';evaluation_scope:'execution_action';legitimate_objective:string;attacker_objective:string;target_id:string;tool_name:string;arguments_sha256:string;expected_evidence:string[];attribution:'tool_service/direct_request';policy_id:string;policy_revision_sha256:string;policy_status:'draft'|'reviewed';evidence_status:string;adapter_evidence_available:boolean;judge_status:string;official_verdict_eligible:boolean};
+export type McpActionCatalog={catalog_sha256:string;cases:McpActionCase[];hybrid_configured:boolean};
+export type McpActionResult={testcase_id:string;execution_id:string;target_id:string;profile_revision:string;catalog_sha256:string;target_request_count:number;evaluation_scope:'execution_action';attribution:'tool_service/direct_request';evidence_configuration:'request_only'|'configured_adapter';final_verdict:string;policy_status:string;semantic_invoked:boolean;report_path:string};
+function evidenceSource(v:unknown):EvidenceSource{
+ const o=obj(v);if(typeof o.id!=='string'||!/^[a-f0-9]{32}$/.test(o.id)||typeof o.revision!=='string'||!/^[a-f0-9]{64}$/.test(o.revision)||o.source_type!=='http_json'||o.collection_mode!=='snapshot'||typeof o.target_id!=='string'||typeof o.endpoint!=='string'||typeof o.name!=='string')throw Error('contract');return o as unknown as EvidenceSource;
+}
 export const testingApi={
- health:(signal:AbortSignal)=>request('health',v=>{const h=envelope(v);if(h.status!=='ok'||!['offline_configuration_only','controlled_execution_enabled'].includes(String(h.mode))||h.target_network_access!==(h.mode==='controlled_execution_enabled')||typeof h.validation_nonce!=='string'||!/^[A-Za-z0-9_-]{43}$/.test(h.validation_nonce))throw Error('contract');const modes=h.evaluation_modes??['rule_only'];if(!Array.isArray(modes)||modes.length<1||modes.length>2||modes[0]!=='rule_only'||(modes.length===2&&modes[1]!=='hybrid')||(modes.length===2&&h.judge_configuration!=='configured_unverified'))throw Error('contract');return {nonce:h.validation_nonce as string,evaluationModes:modes as EvaluationMode[]};},signal),
+ listMcpActions:(secret:string,nonce:string)=>adminRequest('mcp-actions',v=>{const o=envelope(v);if(!/^[a-f0-9]{64}$/.test(String(o.catalog_sha256))||!Array.isArray(o.cases)||typeof o.hybrid_configured!=='boolean')throw Error('contract');return o as unknown as McpActionCatalog;},secret,nonce),
+ runMcpAction:(request:{testcase_id:string;target_id:string;profile_revision:string;catalog_sha256:string;evaluation_mode:'rule_only'|'hybrid';evidence_configuration:'request_only'|'configured_adapter';authorization_confirmed:true},secret:string,nonce:string)=>adminRequest('mcp-actions/run',v=>{const o=envelope(v),r=obj(o.result);if(r.testcase_id!==request.testcase_id||r.target_id!==request.target_id||r.profile_revision!==request.profile_revision||r.catalog_sha256!==request.catalog_sha256||r.attribution!=='tool_service/direct_request'||r.evaluation_scope!=='execution_action'||r.evidence_configuration!==request.evidence_configuration||![0,1].includes(Number(r.target_request_count))||!['PASS','FAIL','INCONCLUSIVE','ERROR'].includes(String(r.final_verdict)))throw Error('contract');return r as unknown as McpActionResult;},secret,nonce,request,70000),
+ getApplicationContext:(targetId:string,secret:string,nonce:string)=>adminRequest(`application-contexts/target/${encodeURIComponent(targetId)}`,v=>{const o=envelope(v);if(!['current','stale'].includes(String(o.binding_status)))throw Error('contract');const row=o.context===null?null:obj(o.context);if(row&&(row.provenance!=='operator_declared'||row.schema_version!=='1.0.0'||typeof row.revision_sha256!=='string'||!(/^[a-f0-9]{64}$/.test(row.revision_sha256))||obj(row.draft).target_id!==targetId))throw Error('contract');return {context:row as ApplicationContextRecord|null,binding_status:o.binding_status as 'current'|'stale'};},secret,nonce),
+ saveApplicationContext:(draft:ApplicationContextDraft,expectedRevision:string|null,secret:string,nonce:string)=>adminRequest('application-contexts/save',v=>{const o=envelope(v),row=obj(o.context);if(row.provenance!=='operator_declared'||row.schema_version!=='1.0.0'||obj(row.draft).target_id!==draft.target_id||obj(row.draft).target_revision!==draft.target_revision||o.binding_status!=='current')throw Error('contract');return row as ApplicationContextRecord;},secret,nonce,{draft,expected_revision:expectedRevision,safe_description_confirmed:true}),
+ listEvidenceSources:(targetId:string,secret:string,nonce:string)=>adminRequest(`evidence-sources/target/${encodeURIComponent(targetId)}`,v=>{const o=envelope(v);if(!Array.isArray(o.sources)||!Array.isArray(o.allowed_endpoints)||o.action_verification_supported!==false)throw Error('contract');return {sources:o.sources.map(v=>{const source=evidenceSource(v);if(source.target_id!==targetId)throw Error('contract');return source;}),allowed_endpoints:o.allowed_endpoints.map(p=>{const r=obj(p);if(typeof r.url!=='string'||(r.credential_ref!==null&&typeof r.credential_ref!=='string'))throw Error('contract');return {url:r.url,credential_ref:r.credential_ref as string|null};})};},secret,nonce),
+ saveEvidenceSource:(profile:EvidenceSourceDraft,sourceId:string|null,revision:string|null,secret:string,nonce:string)=>adminRequest('evidence-sources/save',v=>{const source=evidenceSource(envelope(v).source);if(source.target_id!==profile.target_id||source.target_revision!==profile.target_revision||(sourceId!==null&&source.id!==sourceId))throw Error('contract');return source;},secret,nonce,{profile,source_id:sourceId,expected_revision:revision}),
+ collectEvidenceSource:(sourceId:string,revision:string,secret:string,nonce:string)=>adminRequest('evidence-sources/collect',v=>{const c=obj(envelope(v).capture);if(c.source_id!==sourceId||c.source_revision!==revision||c.action_eligible!==false||c.correlation_status!=='uncorrelated'||c.external_judge_disclosure!=='forbidden'||!['available','unavailable'].includes(String(c.availability))||!Array.isArray(c.events))throw Error('contract');return c as unknown as EvidenceCapture;},secret,nonce,{source_id:sourceId,expected_revision:revision,authorization_confirmed:true},25000),
+ health:(signal:AbortSignal)=>request('health',v=>{const h=envelope(v);if(h.status!=='ok'||!['offline_configuration_only','controlled_execution_enabled'].includes(String(h.mode))||h.target_network_access!==(h.mode==='controlled_execution_enabled'&&h.toolbot_lab_batch_enabled!==true&&(h.custom_imported_batch_enabled!==true||(h.imported_live_local_enabled===true&&h.imported_live_local_mocked!==true)))||typeof h.validation_nonce!=='string'||!/^[A-Za-z0-9_-]{43}$/.test(h.validation_nonce)||!['local_single_user','authenticated',undefined].includes(h.operator_mode as string|undefined)||![true,false,undefined].includes(h.offline_batch_enabled as boolean|undefined)||![true,false,undefined].includes(h.asi01_batch_enabled as boolean|undefined)||![true,false,undefined].includes(h.web_lab_batch_enabled as boolean|undefined)||![true,false,undefined].includes(h.toolbot_lab_batch_enabled as boolean|undefined)||![true,false,undefined].includes(h.custom_imported_batch_enabled as boolean|undefined)||![true,false,undefined].includes(h.imported_live_local_enabled as boolean|undefined)||![true,false,undefined].includes(h.imported_live_local_mocked as boolean|undefined)||(h.imported_live_local_mocked===true&&h.imported_live_local_enabled!==true)||(h.imported_live_local_enabled===true&&h.custom_imported_batch_enabled!==true)||([h.offline_batch_enabled,h.asi01_batch_enabled,h.web_lab_batch_enabled,h.toolbot_lab_batch_enabled,h.custom_imported_batch_enabled].filter(Boolean).length>1&&!(h.asi01_batch_enabled===true&&h.custom_imported_batch_enabled===true&&h.offline_batch_enabled!==true&&h.web_lab_batch_enabled!==true&&h.toolbot_lab_batch_enabled!==true)))throw Error('contract');const modes=h.evaluation_modes??['rule_only'];if(!Array.isArray(modes)||modes.length<1||modes.length>2||modes[0]!=='rule_only'||(modes.length===2&&modes[1]!=='hybrid')||(modes.length===2&&h.judge_configuration!=='configured_unverified'))throw Error('contract');const targets=textTargets(h.asi01_text_targets??[]);if(!h.asi01_batch_enabled&&targets.length)throw Error('contract');return {...({evidenceSourcesEnabled:h.evidence_sources_enabled===true} as {evidenceSourcesEnabled?:boolean}),nonce:h.validation_nonce as string,evaluationModes:modes as EvaluationMode[],managementEnabled:h.target_management_enabled===true,controlledRunsEnabled:h.mode==='controlled_execution_enabled',localSingleUser:h.operator_mode==='local_single_user',offlineBatchEnabled:h.offline_batch_enabled===true,asi01BatchEnabled:h.asi01_batch_enabled===true,asi01TextTargets:targets,webLabBatchEnabled:h.web_lab_batch_enabled===true,toolbotLabBatchEnabled:h.toolbot_lab_batch_enabled===true,customImportedBatchEnabled:h.custom_imported_batch_enabled===true,importedLiveLocalEnabled:h.imported_live_local_enabled===true,importedLiveLocalMocked:h.imported_live_local_mocked===true,judgeSetupReason:typeof h.judge_setup_reason==='string'?h.judge_setup_reason:'judge_configuration_missing',mcpActionSetupReason:typeof h.mcp_action_setup_reason==='string'?h.mcp_action_setup_reason:'catalog_missing'};},signal),
  targets:(signal:AbortSignal)=>request('targets',parseTargets,signal),
  validate:(draft:Draft,nonce:string,signal:AbortSignal)=>request('target-drafts/validate',parseValidation,signal,draft,nonce),
+ unlock:(secret:string,nonce:string)=>adminRequest('managed-targets',v=>{const o=envelope(v);return parseTargets({workflow_schema_version:'1.0.0',targets:o.targets,protocols:[]}).targets;},secret,nonce),
+ validateManaged:(profile:ManagedProfile,expected:string|null,secret:string,nonce:string)=>adminRequest('managed-targets/validate',v=>{const o=envelope(v);if(o.configuration_status!=='valid'||o.target_request_count!==0||o.target_execution_performed!==false)throw Error('contract');return true;},secret,nonce,{profile,expected_profile_revision:expected}),
+ saveManaged:(profile:ManagedProfile,expected:string|null,secret:string,nonce:string,discoveryId?:string,platformChangeConfirmed=false)=>adminRequest(`managed-targets/${expected?'update':'create'}`,parseProfile,secret,nonce,{profile,expected_profile_revision:expected,...(discoveryId?{discovery_id:discoveryId}:{}),platform_change_confirmed:platformChangeConfirmed}),
+ archivedTargets:(secret:string,nonce:string)=>adminRequest('managed-targets/archived',v=>{const o=envelope(v);if(!Array.isArray(o.targets))throw Error('contract');return o.targets as ArchivedTarget[];},secret,nonce),
+ archiveTargets:(targets:{target_id:string;profile_revision:string}[],secret:string,nonce:string)=>adminRequest('managed-targets/archive',v=>{const o=envelope(v);if(!Array.isArray(o.archived)||!Array.isArray(o.active_targets))throw Error('contract');return {archived:o.archived as ArchivedTarget[],active:o.active_targets as TargetPreset[]};},secret,nonce,{targets,archive_confirmed:true}),
+ restoreTarget:(target:ArchivedTarget,secret:string,nonce:string)=>adminRequest('managed-targets/restore',parseProfile,secret,nonce,{target_id:target.id,profile_revision:target.profile_revision,restore_confirmed:true}),
+ discover:(url:string,nonce:string,secret:string,protocolHint?:string)=>adminRequest('discoveries',parseDiscovery,secret,nonce,{url,authorization_confirmed:true,...(protocolHint?{protocol_hint:protocolHint}:{})},15000),
+ probeDiscovery:(profile:ManagedProfile,discoveryId:string,secret:string,nonce:string)=>adminRequest('discovery-probes',parseProbe,secret,nonce,{profile,discovery_id:discoveryId,authorization_confirmed:true},Math.min(70000,(profile.timeout_seconds+10)*1000)),
+ reviewManaged:(target:TargetPreset,secret:string,nonce:string)=>adminRequest('managed-targets/review',parseProfile,secret,nonce,{target_id:target.id,profile_revision:target.profile_revision,policy_ref:target.policy_ref,endpoint:target.endpoint,protocol:target.protocol,model:target.default_model,capabilities:target.capabilities,authorization_confirmed:true}),
+ probe:(target:TargetPreset,secret:string,nonce:string,confirm=false)=>adminRequest('connection-checks',parseProbe,secret,nonce,{target_id:target.id,profile_revision:target.profile_revision,policy_ref:target.policy_ref,...(confirm?{endpoint:target.endpoint,authorization_confirmed:true}:{})},Math.min(70000,(target.timeout_default+10)*1000)),
+ listDatasets:(secret:string,nonce:string)=>adminRequest('datasets',v=>{const o=envelope(v);if(!Array.isArray(o.datasets))throw Error('contract');return o.datasets as DatasetSummary[];},secret,nonce),
+ validateDataset:(rawJson:File,filename:string,secret:string,nonce:string)=>adminRequest('datasets/validate',v=>{const o=envelope(v);if(!o.dataset)throw Error('contract');return o.dataset as DatasetEnvelope;},secret,nonce,{},10000,{'X-Dataset-Filename':encodeURIComponent(filename)},rawJson),
+ importDataset:(rawJson:File,filename:string,secret:string,nonce:string)=>adminRequest('datasets/import',v=>{const o=envelope(v);if(!o.dataset)throw Error('contract');return {dataset:o.dataset as DatasetEnvelope,created:o.created===true};},secret,nonce,{},10000,{'X-Dataset-Filename':encodeURIComponent(filename)},rawJson),
+ getDataset:(datasetId:string,secret:string,nonce:string)=>adminRequest(`datasets/${datasetId}`,v=>{const o=envelope(v);if(!o.dataset)throw Error('contract');return o.dataset as DatasetEnvelope;},secret,nonce),
+ getAsi03Contract:(datasetId:string,caseId:string,targetId:string,secret:string,nonce:string)=>adminRequest(`asi03-contracts/lookup/${datasetId}/${caseId}/${targetId}`,v=>{const o=envelope(v);return (o.contract??null) as Asi03Contract|null;},secret,nonce),
+ createAsi03Draft:(draft:Asi03ContractDraft,secret:string,nonce:string)=>adminRequest('asi03-contracts/drafts',v=>{const o=envelope(v);if(!o.contract)throw Error('contract');return o.contract as Asi03Contract;},secret,nonce,draft),
+ reviewAsi03Contract:(id:string,revision:string,secret:string,nonce:string)=>adminRequest(`asi03-contracts/${id}/review`,v=>{const o=envelope(v);if(!o.contract)throw Error('contract');return o.contract as Asi03Contract;},secret,nonce,{expected_revision_sha256:revision,review_confirmed:true}),
+ getAsi03TargetPolicy:(targetId:string,secret:string,nonce:string)=>adminRequest(`asi03-policies/target/${targetId}`,v=>{const o=envelope(v);return (o.policy??null) as Asi03TargetPolicy|null;},secret,nonce),
+ createAsi03TargetPolicy:(draft:Asi03TargetPolicyDraft,secret:string,nonce:string)=>adminRequest('asi03-policies/drafts',v=>{const o=envelope(v);if(!o.policy)throw Error('contract');return o.policy as Asi03TargetPolicy;},secret,nonce,draft),
+ reviewAsi03TargetPolicy:(id:string,revision:string,secret:string,nonce:string)=>adminRequest(`asi03-policies/${id}/review`,v=>{const o=envelope(v);if(!o.policy)throw Error('contract');return o.policy as Asi03TargetPolicy;},secret,nonce,{expected_revision_sha256:revision,review_confirmed:true}),
+ getAsi05Policy:(targetId:string,secret:string,nonce:string)=>adminRequest(`asi05-policies/target/${targetId}`,v=>{const o=envelope(v);return (o.policy??null) as Asi05Policy|null;},secret,nonce),
+ createAsi05Policy:(draft:Asi05PolicyDraft,secret:string,nonce:string)=>adminRequest('asi05-policies/drafts',v=>{const o=envelope(v);if(!o.policy)throw Error('contract');return o.policy as Asi05Policy;},secret,nonce,draft),
+ reviewAsi05Policy:(id:string,revision:string,secret:string,nonce:string)=>adminRequest(`asi05-policies/${id}/review`,v=>{const o=envelope(v);if(!o.policy)throw Error('contract');return o.policy as Asi05Policy;},secret,nonce,{expected_revision_sha256:revision,review_confirmed:true}),
 };
 export function draftFor(t:TargetPreset,model:string,timeout:number):Draft{return {target_id:t.id,profile_revision:t.profile_revision,policy_ref:t.policy_ref,endpoint:t.endpoint,protocol:t.protocol,method:t.method,model,request_mapping:t.request_mapping,response_parser:t.response_parser,timeout_seconds:timeout,credential_alias:t.credential_alias};}

@@ -1,6 +1,10 @@
 """Opt-in Runner composition and a shared, fail-closed provider call budget."""
+import os
+from pathlib import Path
+import re
+import shutil
 from threading import Lock
-from typing import Literal
+from typing import Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -17,6 +21,7 @@ class RunnerEvaluationConfig(BaseModel):
     allow_live_judge: bool = Field(default=False, strict=True)
     max_judge_calls: int = Field(default=0, ge=0, strict=True)
     pi: PiEvaluatorConfig | None = None
+    require_complete_response_for_semantic: bool = Field(default=False, strict=True)
 
     @model_validator(mode="after")
     def explicit_activation(self):
@@ -25,6 +30,29 @@ class RunnerEvaluationConfig(BaseModel):
         if self.allow_live_judge and (not self.judge_enabled or self.pi is None):
             raise ValueError("Live Judge opt-in requires judge_enabled and Pi configuration.")
         return self
+
+
+class LiveJudgeConfigurationError(ValueError):
+    """Fixed, credential-free preflight diagnostic for a live Pi configuration."""
+
+
+def validate_live_pi_config(config: RunnerEvaluationConfig, *,
+                            environ: Mapping[str, str] | None = None) -> None:
+    """Preflight one shared live Pi config without reading or reporting secrets."""
+    if (config.mode != "hybrid" or not config.judge_enabled
+            or not config.allow_live_judge or config.pi is None
+            or config.max_judge_calls != 1):
+        raise LiveJudgeConfigurationError("Live Judge requires one bounded Hybrid Pi attempt per testcase.")
+    names = config.pi.credential_env
+    if (not names or len(names) > 4 or any(
+            not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", name) for name in names)):
+        raise LiveJudgeConfigurationError("Live Judge credential environment names are invalid.")
+    source = os.environ if environ is None else environ
+    if any(not source.get(name) for name in names):
+        raise LiveJudgeConfigurationError("Configured Judge credential is unavailable in this process.")
+    executable = config.pi.executable
+    if not (Path(executable).is_file() or shutil.which(executable)):
+        raise LiveJudgeConfigurationError("Configured Pi executable is unavailable.")
 
 
 class BudgetedJudgeProvider(ExternalEvaluatorProvider):
@@ -66,4 +94,5 @@ def configured_evaluator(config, provider, diagnostic_sink):
             raise ValueError("Supply a trusted offline provider or explicitly opt into live Pi.")
         provider = PiEvaluatorProvider(config.pi)
     budget = BudgetedJudgeProvider(config, provider)
-    return HybridEvaluator(budget, diagnostic_sink=diagnostic_sink), budget
+    return HybridEvaluator(budget, diagnostic_sink=diagnostic_sink,
+        require_complete_response_for_semantic=config.require_complete_response_for_semantic), budget

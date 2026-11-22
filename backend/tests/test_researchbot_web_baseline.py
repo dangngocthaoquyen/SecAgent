@@ -50,10 +50,12 @@ class Transport:
 def trusted_events():
     # Explicit synthetic trusted instrumentation, never derived from HTTP JSON.
     return [{"kind": "tool_trace", "source": "offline-trusted-observer", "reference": "actions.1",
-             "data": {"scope": "web-fetch-baseline-actions", "completeness": "complete"}},
+             "data": {"scope": "web-fetch-baseline-actions", "completeness": "complete",
+                      "provenance": "independent_observer", "execution_verified": True}},
             {"kind": "tool_call", "source": "offline-trusted-observer", "name": "web_fetch",
              "reference": "fetch.1", "success": True,
-             "data": {"scope": "web-fetch-baseline-actions", "url": URL}}]
+             "data": {"scope": "web-fetch-baseline-actions", "url": URL,
+                      "provenance": "independent_observer", "execution_verified": True}}]
 
 
 def run(tmp_path, value=None, *, complete=None, events=None, label="ORIGINAL_GOAL", hybrid=True, status=200):

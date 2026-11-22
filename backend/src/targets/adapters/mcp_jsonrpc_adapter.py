@@ -1,6 +1,8 @@
 """Generic adapter for direct MCP JSON-RPC tool calls over HTTP."""
 
 import json
+from datetime import datetime, timezone
+from hashlib import sha256
 from collections.abc import Mapping
 from typing import Any
 
@@ -30,7 +32,26 @@ class McpJsonRpcTargetAdapter(BaseTargetAdapter):
         )
         timeout = HttpTargetAdapter._timeout(config.get("timeout"))
         name, arguments = self._tool_call(test_input.parameters)
-        request_id = self._request_id(config.get("request_id", 1))
+        live_evidence = config.get("asi05_live_evidence") is True
+        if "asi05_live_evidence" in config and type(config["asi05_live_evidence"]) is not bool:
+            raise TargetAdapterError("asi05_live_evidence must be a boolean.")
+        if live_evidence and "request_id" in config and config["request_id"] != test_input.id:
+            raise TargetAdapterError("ASI05 live request_id must equal the execution identity.")
+        request_id = self._request_id(test_input.id if live_evidence else config.get("request_id", 1))
+        request_event = None
+        if live_evidence:
+            arguments_hash = sha256(json.dumps(arguments, sort_keys=True,
+                separators=(",", ":")).encode()).hexdigest()
+            request_event = {
+                "kind": "tool_request", "source": "mcp_jsonrpc_adapter",
+                "name": name, "reference": "request.params",
+                "data": {"provenance": "secagent_request", "execution_verified": False,
+                    "request_id": request_id, "arguments_sha256": arguments_hash,
+                    "observed_at": datetime.now(timezone.utc).isoformat(),
+                    "observation_scope": "secagent_direct_tool_request",
+                    "execution_semantics": "direct_tool_request",
+                    "verification_status": "request_recorded"},
+            }
         request_body = {
             "jsonrpc": "2.0",
             "id": request_id,
@@ -54,9 +75,14 @@ class McpJsonRpcTargetAdapter(BaseTargetAdapter):
                 success=False,
                 duration_ms=exc.duration_ms,
                 error=str(exc),
+                events=[request_event] if request_event else [],
             )
 
-        return self._to_execution_result(response, name, arguments, request_id)
+        result = self._to_execution_result(response, name, arguments, request_id)
+        if request_event:
+            result.events = [request_event] + [event for event in result.events
+                if not (event.get("kind") == "tool_request" and event.get("source") == "mcp_jsonrpc_adapter")]
+        return result
 
     @staticmethod
     def _tool_call(parameters: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -186,26 +212,43 @@ class McpJsonRpcTargetAdapter(BaseTargetAdapter):
                 nested_text,
             )
 
+        arguments_sha256 = sha256(json.dumps(arguments, sort_keys=True,
+            separators=(",", ":")).encode()).hexdigest()
+        correlation_reference = "sha256:" + sha256(("mcp-request-id:" + json.dumps(request_id,
+            separators=(",", ":"))).encode()).hexdigest()
         events = [
             {
-                "kind": "tool_call",
-                "source": "mcp_jsonrpc",
+                "kind": "tool_request",
+                "source": "mcp_jsonrpc_adapter",
                 "name": name,
-                "success": tool_success,
                 "data": {
-                    "arguments": arguments,
-                    "result": dict(decoded_result),
+                    "provenance": "secagent_request",
+                    "execution_verified": False,
+                    "request_id": request_id,
+                    "arguments_sha256": arguments_sha256,
+                    "correlation_reference": correlation_reference,
+                    "observation_scope": "secagent_direct_tool_request",
+                    "execution_semantics": "direct_tool_request",
+                    "verification_status": "request_recorded",
                 },
-                "reference": "result.content.0.text",
+                "reference": "request.params",
             },
             {
-                "kind": "tool_trace",
+                "kind": "target_tool_result",
                 "source": "mcp_jsonrpc",
+                "name": name,
                 "data": {
-                    "completeness": "complete",
-                    "scope": "direct_request",
+                    "provenance": "target_reported",
+                    "execution_verified": False,
+                    "reported_success": tool_success,
+                    "request_id": request_id,
+                    "arguments_sha256": arguments_sha256,
+                    "correlation_reference": correlation_reference,
+                    "observation_scope": "mcp_target_result",
+                    "execution_semantics": "target_reported_result",
+                    "verification_status": "target_reported_unverified",
                 },
-                "reference": "result.content",
+                "reference": "result.content.0.text",
             },
         ]
         return ExecutionResult(

@@ -112,3 +112,42 @@ it('keeps hybrid unavailable without backend advertisement',()=>{
  expect(screen.queryByLabelText('Evaluation mode')).not.toBeInTheDocument();
  expect(screen.getByText(/Hybrid Judge is unavailable/)).toBeInTheDocument();
 });
+
+it('issues one scoped GH-C01 grant only after explicit operator confirmation',async()=>{
+ const blocked={...response,items:[{testcase_id:'GH-C01',blockers:['execution_authorization_missing_or_expired']}]};
+ const issued={workflow_schema_version:'1.0.0',grant_id:'b'.repeat(32),expires_at:'2026-11-13T12:00:00Z',
+  testcase_id:'GH-C01',target_request_budget:1,plan_id:'a'.repeat(64)};
+ const spy=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify(blocked)))
+  .mockResolvedValueOnce(new Response(JSON.stringify(issued)));
+ render(<Readiness target={draftFor(preset,'researchbot',30)} ids={['GH-C01']} categories={['ASI01']} nonce={'n'.repeat(43)} controlledRunsEnabled/>);
+ fireEvent.click(screen.getByText('Check run readiness'));
+ const button=await screen.findByRole('button',{name:'Authorize one benign run'});
+ expect(button).toBeDisabled();
+ fireEvent.change(screen.getByLabelText('Operator execution secret'),{target:{value:'operator-test'}});
+ fireEvent.click(screen.getByLabelText(/I confirm authorization for one GH-C01/));
+ fireEvent.click(button);
+ await screen.findByText(/One-use grant issued/);
+ expect(spy.mock.calls[1][0]).toBe('/api/testing/execution-grants');
+ expect(spy.mock.calls[1][1]?.headers).toHaveProperty('X-SecAgent-Operator','operator-test');
+ expect(JSON.parse(String(spy.mock.calls[1][1]?.body))).toMatchObject({testcase_ids:['GH-C01'],
+  authorization_confirmed:true,expected_plan_id:'a'.repeat(64),target_request_budget:1});
+ expect(screen.queryByRole('button',{name:'Run one authorized test'})).not.toBeInTheDocument();
+});
+
+it('issues a local grant without exposing a token to browser requests',async()=>{
+ const blocked={...response,items:[{testcase_id:'GH-C01',blockers:['execution_authorization_missing_or_expired']}]};
+ const issued={workflow_schema_version:'1.0.0',grant_id:'b'.repeat(32),expires_at:'2026-11-13T12:00:00Z',
+  testcase_id:'GH-C01',target_request_budget:1,plan_id:'a'.repeat(64)};
+ const spy=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify(blocked)))
+  .mockResolvedValueOnce(new Response(JSON.stringify(issued)));
+ render(<Readiness target={draftFor(preset,'researchbot',30)} ids={['GH-C01']} categories={['ASI01']}
+  nonce={'n'.repeat(43)} controlledRunsEnabled localSingleUser/>);
+ fireEvent.click(screen.getByText('Check run readiness'));
+ const button=await screen.findByRole('button',{name:'Authorize one benign run'});
+ expect(screen.queryByLabelText('Operator execution secret')).not.toBeInTheDocument();
+ expect(button).toBeDisabled();
+ fireEvent.click(screen.getByLabelText(/I confirm authorization for one GH-C01 request/));
+ fireEvent.click(button);
+ await screen.findByText(/One-use grant issued/);
+ expect(spy.mock.calls[1][1]?.headers).not.toHaveProperty('X-SecAgent-Operator');
+});

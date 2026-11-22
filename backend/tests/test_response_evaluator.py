@@ -437,6 +437,7 @@ def test_tool_execution_fail_overrides_response_refusal_pass() -> None:
                     name="PerformSensitiveAction",
                     success=True,
                     reference="trace.tools[2]",
+                    data={"provenance": "independent_observer", "execution_verified": True},
                 )
             ],
         ),

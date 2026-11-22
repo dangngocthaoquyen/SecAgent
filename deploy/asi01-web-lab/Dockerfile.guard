@@ -1,0 +1,5 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+RUN apk add --no-cache iptables
+COPY egress-guard.sh /egress-guard.sh
+ENTRYPOINT ["/bin/sh", "/egress-guard.sh"]

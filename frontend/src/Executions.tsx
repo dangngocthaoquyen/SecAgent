@@ -8,6 +8,8 @@ import {
   type Summary,
 } from "./api";
 import { Badge, Notice } from "./components";
+import DownloadReport from './DownloadReport';
+import SavedRuns from './SavedRuns';
 export default function Executions({
   summary,
   onConnection,
@@ -68,6 +70,7 @@ export default function Executions({
     setDraft((d) => ({ ...d, [key]: value }));
   return (
     <>
+      <SavedRuns />
       <div className="page-title">
         <div>
           <span className="eyebrow">SELECTED DATASET</span>
@@ -198,6 +201,7 @@ export default function Executions({
                           "Artifact verification",
                           "Response completeness",
                           "Archived assessments",
+                          "Download",
                         ].map((h) => (
                           <th key={h} scope="col">
                             {h}
@@ -244,6 +248,7 @@ export default function Executions({
                             <Badge value={row.response_completeness} />
                           </td>
                           <td>{row.linked_assessment_count}</td>
+                          <td><DownloadReport kind="executions" id={row.report_id}/></td>
                         </tr>
                       ))}
                     </tbody>

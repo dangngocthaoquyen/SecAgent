@@ -1,11 +1,14 @@
 """Operator-selected catalog; constructs profiles offline, never invokes adapters."""
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from targets.runtime import build_runtime_target
+from core.models import TargetProfile
+from targets.validator import validate_target
 from targets.validator import validate_target
 from workflow.models import CatalogConfig, TargetDraft, ConnectionCheckResult
 
@@ -35,9 +38,32 @@ def make_profile(preset, model, timeout, credential_env=None):
     if (not parts.path.startswith("/") or "%" in endpoint or "?" in endpoint or "#" in endpoint
             or any(s in {".", ".."} for s in parts.path.split("/")) or "//" in parts.path):
         raise ValueError("Invalid preset endpoint.")
-    profile = build_runtime_target(endpoint, preset.id, protocol=preset.protocol,
-        authorized_origin=f"{parts.scheme}://{parts.netloc}", model=model,
-        credential_env=credential_env, discover=False)
+    if preset.protocol == "mcp-jsonrpc":
+        if preset.id == "dvaa-toolbot-lab":
+            if (endpoint != "http://127.0.0.1:17022/mcp"
+                    or model != "toolbot-lab" or credential_env is not None):
+                raise ValueError("Only the exact offline ToolBot Lab MCP profile is supported.")
+        else:
+            try:
+                host = ipaddress.ip_address(parts.hostname or "")
+                safe = (parts.scheme in {"http", "https"} and parts.port is not None
+                    and host.is_loopback and parts.path in {"/", "/mcp", "/jsonrpc"}
+                    and parts.username is None and parts.password is None
+                    and credential_env is None)
+            except ValueError:
+                safe = False
+            if not safe:
+                raise ValueError("Generic MCP profile requires an exact loopback JSON-RPC endpoint.")
+        profile = TargetProfile(id=preset.id, name=preset.name, target_type="ai_agent",
+            interface={"type": "mcp", "adapter": "generic_mcp_jsonrpc", "config": {
+                "url": endpoint, "timeout": timeout, "headers": {"Content-Type": "application/json"}}},
+            capabilities=["tool_call"], observability=["tool_result"],
+            metadata={"configuration_source": "operator_reviewed_offline_lab" if preset.id == "dvaa-toolbot-lab" else "operator_configured",
+                      "protocol": "mcp-jsonrpc"})
+    else:
+        profile = build_runtime_target(endpoint, preset.id, protocol=preset.protocol,
+            authorized_origin=f"{parts.scheme}://{parts.netloc}", model=model,
+            credential_env=credential_env, discover=False)
     profile.interface.config["timeout"] = timeout
     validate_target(profile)
     return profile
@@ -73,8 +99,9 @@ class TargetCatalog:
             "models": list(p.models), "default_model": p.default_model,
             "timeout_min": p.timeout_min, "timeout_max": p.timeout_max, "timeout_default": p.timeout_default,
             "credential_alias": p.credential_alias, "credential_availability": self._available(p.credential_alias),
-            "request_mapping": "openai-chat-user-message-v1", "response_parser": "choices.0.message.content",
-            "capabilities": ["chat"], "capability_basis": "configured_claim_not_probed",
+            "request_mapping": "mcp-tools-call-v1" if p.protocol == "mcp-jsonrpc" else "openai-chat-user-message-v1",
+            "response_parser": "mcp-jsonrpc-result-v1" if p.protocol == "mcp-jsonrpc" else "choices.0.message.content",
+            "capabilities": ["tool_call"] if p.protocol == "mcp-jsonrpc" else ["chat"], "capability_basis": "configured_claim_not_probed",
             "connection_probe": {"status": "unsupported", "reason": "safe_probe_not_verified",
                                  "active_probe_authorized": False, "security_execution_authorized": False},
             "limitations": ["Offline configuration only; no target request is authorized or sent by this service.",
@@ -105,6 +132,10 @@ class TargetCatalog:
             errors.append("policy_mismatch")
         if draft.endpoint != p.endpoint:
             errors.append("unauthorized_endpoint")
+        if draft.protocol != p.protocol or draft.method != "POST" or (
+                draft.request_mapping, draft.response_parser) != (("mcp-tools-call-v1", "mcp-jsonrpc-result-v1")
+                    if p.protocol == "mcp-jsonrpc" else ("openai-chat-user-message-v1", "choices.0.message.content")):
+            errors.append("protocol_mapping_mismatch")
         if draft.model not in p.models:
             errors.append("model_not_approved")
         if not p.timeout_min <= draft.timeout_seconds <= p.timeout_max:

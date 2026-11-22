@@ -268,6 +268,8 @@ def test_official_report_redacts_credentials_without_changing_source_evidence(tm
         pi=PiEvaluatorConfig(executable="unused", provider="deepseek", model="deepseek-v4-flash",
             timeout_seconds=90, credential_env=("OFFICIAL_ASI01_TEST_KEY",)))
     report, fake, _, _ = execute_official(tmp_path, "GH-002", SCENARIOS[1][0] + secret, "ATTACKER_GOAL", config=config)
-    assert secret in fake.calls[0].observation.response_text
+    assert fake.calls == []
+    assert report["judge"]["semantic_invoked"] is False
+    assert report["judge"]["json_validation_status"] == "input_rejected"
+    assert report["final_verdict"] == "INCONCLUSIVE"
     assert secret not in json.dumps(report)
-    assert "[REDACTED]" in report["judge"]["judge_evidence"][0]["value"]

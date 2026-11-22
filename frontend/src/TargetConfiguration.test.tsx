@@ -5,13 +5,15 @@ import App from './App';
 import { parseTargets,parseValidation } from './testingApi';
 import { catalog,valid,workflowHealth } from './test/targetFixtures';
 import { health,overview,page } from './test/fixtures';
-function mock(data:unknown=catalog,result:unknown=valid){return vi.spyOn(globalThis,'fetch').mockImplementation(async(url)=>new Response(JSON.stringify(String(url).startsWith('/api/reports/')?(String(url).endsWith('/health')?health:String(url).endsWith('/overview')?overview:page):String(url).endsWith('/health')?workflowHealth:String(url).endsWith('/targets')?data:result)));}
+function mock(data:unknown=catalog,result:unknown=valid){return vi.spyOn(globalThis,'fetch').mockImplementation(async(url,init)=>new Response(JSON.stringify(String(url).startsWith('/api/reports/')?(String(url).endsWith('/health')?health:String(url).endsWith('/overview')?overview:page):String(url).endsWith('/health')?workflowHealth:String(url).endsWith('/targets')?data:{...(result as object),...(init?.body?{target_id:JSON.parse(String(init.body)).target_id,profile_revision:JSON.parse(String(init.body)).profile_revision}:{})})));}
 it('loads catalog and validates only via offline POST; changing options invalidates result',async()=>{
  const fetcher=mock();render(<TargetConfiguration/>);
  await screen.findByRole('heading',{name:'Reviewed lab'});
  expect(screen.getByLabelText('Platform')).toHaveValue('synthetic-lab');
  expect(screen.getByLabelText('Target').querySelectorAll('option')).toHaveLength(2);
- expect(screen.getByText(catalog.targets[0].endpoint)).toBeInTheDocument();
+ expect(screen.getByTitle(catalog.targets[0].endpoint)).toBeInTheDocument();
+ await screen.findByText('Configuration valid');
+ fireEvent.click(screen.getByText('Advanced Settings'));
  fireEvent.click(screen.getByRole('button',{name:'Validate Configuration'}));
  await screen.findByText('Configuration valid');
  const call=fetcher.mock.calls.find(([url])=>String(url).endsWith('/validate'))!;
@@ -19,9 +21,19 @@ it('loads catalog and validates only via offline POST; changing options invalida
  expect(JSON.parse(String(call[1]?.body))).toMatchObject({target_id:'lab-one',timeout_seconds:30});
  expect(fetcher.mock.calls.every(([url])=>String(url).startsWith('/api/testing/'))).toBe(true);
  fireEvent.change(screen.getByLabelText('Model'),{target:{value:'alternate'}});
- expect(screen.getByText('Configuration not validated')).toBeInTheDocument();
+ expect(screen.queryByText('Configuration valid')).not.toBeInTheDocument();
  expect(screen.getByRole('button',{name:/Test Connection/})).toBeDisabled();
  expect(screen.queryByRole('button',{name:/Run Security Test/})).not.toBeInTheDocument();
+});
+it('shows a session-compatible probe separately from review and configuration validation',async()=>{
+ const selected={...catalog.targets[0],connection_verification:{status:'compatible' as const,
+  basis:'benign_chat_probe' as const,profile_revision:catalog.targets[0].profile_revision,
+  security_execution_authorized:false as const}};
+ mock({...catalog,targets:[selected,catalog.targets[1]]});render(<TargetConfiguration/>);
+ await screen.findByRole('heading',{name:'Reviewed lab'});
+ expect(screen.getByText('Connected')).toBeInTheDocument();
+ await screen.findByText('Configuration valid');
+ expect(screen.getByRole('button',{name:'Continue'})).toBeEnabled();
 });
 it('switches platform and uses that agent’s own model and timeout without carrying validation',async()=>{
  const other={...catalog.targets[0],id:'lab-three',name:'Other platform agent',
@@ -36,7 +48,7 @@ it('switches platform and uses that agent’s own model and timeout without carr
  expect(screen.getByLabelText('Target').querySelectorAll('option')).toHaveLength(1);
  expect(screen.getByLabelText('Model')).toHaveValue('other-model');
  expect(screen.getByLabelText('Timeout (seconds)')).toHaveValue(12);
- expect(screen.getByText('Configuration not validated')).toBeInTheDocument();
+ expect(screen.queryByText('Configuration valid')).not.toBeInTheDocument();
  expect(screen.getByRole('button',{name:'Continue'})).toBeDisabled();
 });
 it('keeps a one-profile legacy catalog usable without platform metadata',async()=>{
@@ -56,23 +68,28 @@ it('resets model and timeout when selecting another agent on the same platform',
  fireEvent.change(screen.getByLabelText('Target'),{target:{value:'lab-two'}});
  expect(screen.getByLabelText('Model')).toHaveValue('second-model');
  expect(screen.getByLabelText('Timeout (seconds)')).toHaveValue(18);
- expect(screen.getByText('Requires approval')).toBeInTheDocument();
+ expect(screen.getAllByText('Review required').length).toBeGreaterThan(0);
 });
 it('selects a review-required preset without claiming connectivity',async()=>{
  mock(catalog,{...valid,target_id:'lab-two',configuration_status:'invalid',errors:['operator_review_required']});render(<TargetConfiguration/>);
  await screen.findByLabelText('Target');fireEvent.change(screen.getByLabelText('Target'),{target:{value:'lab-two'}});
- expect(screen.getByText('Requires approval')).toBeInTheDocument();
- fireEvent.click(screen.getByText('Validate Configuration'));await screen.findByText('Operator approval required');
+ expect(screen.getAllByText('Review required').length).toBeGreaterThan(0);
+ fireEvent.click(screen.getByText('Validate Configuration'));await waitFor(()=>expect(screen.getAllByText('Review required').length).toBeGreaterThan(0));
  expect(screen.getByText(/Connection not checked/)).toBeInTheDocument();
 });
 it.each(['unauthorized_endpoint','stale_profile_revision','credential_unavailable'])('shows offline invalid reason %s',async(code)=>{
  mock(catalog,{...valid,configuration_status:'invalid',errors:[code]});render(<TargetConfiguration/>);await screen.findByLabelText('Target');
- fireEvent.click(screen.getByText('Validate Configuration'));await screen.findByText('Configuration invalid');expect(screen.getByText(code.replaceAll('_',' '))).toBeInTheDocument();
+ fireEvent.click(screen.getByText('Validate Configuration'));await screen.findByRole('heading',{name:'Configuration invalid'});expect(screen.getByText(code.replaceAll('_',' '))).toBeInTheDocument();
 });
-it('handles empty catalog',async()=>{mock({...catalog,targets:[]});render(<TargetConfiguration/>);await screen.findByText('No target presets selected');expect(screen.queryByText('Validate Configuration')).not.toBeInTheDocument();});
+it('handles empty catalog',async()=>{mock({...catalog,targets:[]});render(<TargetConfiguration/>);await screen.findByText('No targets yet');expect(screen.queryByText('Validate Configuration')).not.toBeInTheDocument();});
 it('handles API unavailable without rendering raw errors',async()=>{vi.spyOn(globalThis,'fetch').mockRejectedValue(Error('secret-token'));render(<TargetConfiguration/>);await screen.findByRole('alert');expect(document.body.textContent).not.toContain('secret-token');});
 it('keeps reporting navigation operational',async()=>{mock();location.hash='#targets';render(<App/>);await screen.findByLabelText('Target');fireEvent.click(screen.getByRole('link',{name:'Evaluation Overview'}));await screen.findByRole('heading',{name:'Evaluation overview'});fireEvent.click(screen.getByRole('link',{name:'Targets'}));await screen.findByLabelText('Target');});
-it('does not allow stale validation to survive a target change',async()=>{mock();render(<TargetConfiguration/>);await screen.findByLabelText('Target');fireEvent.click(screen.getByText('Validate Configuration'));await screen.findByText('Configuration valid');fireEvent.change(screen.getByLabelText('Target'),{target:{value:'lab-two'}});await waitFor(()=>expect(screen.queryByText('Configuration valid')).not.toBeInTheDocument());});
+it('invalidates a validated configuration immediately when changing target',async()=>{
+ mock();render(<TargetConfiguration/>);await screen.findByText('Configuration valid');
+ fireEvent.change(screen.getByLabelText('Target'),{target:{value:'lab-two'}});
+ expect(screen.queryByText('Configuration valid')).not.toBeInTheDocument();
+ expect(screen.getByRole('button',{name:'Continue'})).toBeDisabled();
+});
 it.each(['http://user:secret@127.0.0.1/path','http://127.0.0.1/path?token=secret','http://127.0.0.1/path#secret'])('rejects sensitive endpoint %s',endpoint=>expect(()=>parseTargets({...catalog,targets:[{...catalog.targets[0],endpoint}]})).toThrow());
 it('rejects unsupported selectable protocols and fabricated execution',()=>{expect(()=>parseTargets({...catalog,targets:[{...catalog.targets[0],protocol:'a2a'}]})).toThrow();expect(()=>parseValidation({...valid,target_execution_performed:true})).toThrow();});
 it('keeps advanced metadata collapsed and refuses to invent a probe',async()=>{
@@ -80,9 +97,10 @@ it('keeps advanced metadata collapsed and refuses to invent a probe',async()=>{
  const details=screen.getByText('Advanced Settings').closest('details')!;
  expect(details.open).toBe(false);
  expect(screen.queryByText(/Approved endpoint/)).not.toBeInTheDocument();
- expect(screen.getByRole('button',{name:'Continue'})).toBeDisabled();
+ await screen.findByText('Configuration valid');
+ expect(screen.getByRole('button',{name:'Continue'})).toBeEnabled();
  expect(screen.getByRole('button',{name:'Test Connection'})).toBeDisabled();
- expect(screen.getByText('Probe unsupported')).toBeInTheDocument();
+ expect(screen.getByText('A safe connection probe is not supported for this profile.')).toBeInTheDocument();
  expect(fetcher.mock.calls.every(([url])=>!String(url).includes('connection-checks'))).toBe(true);
  fireEvent.click(screen.getByText('Advanced Settings'));expect(details.open).toBe(true);
 });

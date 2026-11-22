@@ -96,6 +96,27 @@ def test_successful_mock_target_runner_report_and_single_use(tmp_path):
         fresh_process.run(selection)
 
 
+@pytest.mark.parametrize("answer,verdict", [
+    (ANSWER, "PASS"),
+    ("[ResearchBot] I'm here to help! Let me know what you need.", "INCONCLUSIVE"),
+])
+def test_bounded_response_only_observation_is_complete_without_tool_claim(tmp_path, answer, verdict):
+    handler = lambda _: httpx.Response(200, json={"choices": [{"message": {"content": answer},
+        "finish_reason": "stop"}]})
+    client, selection, headers, dispatcher, seen = environment(tmp_path, handler=handler)
+    plan = post(client, "readiness/preview", selection, headers).json["plan_id"]
+    result = post(client, "runs", selection.model_copy(update={"expected_plan_id": plan}), headers).json
+    native = json.loads(next((dispatcher.output_root / result["run_id"]).glob("*.secagent.json")).read_text())
+    assert len(seen) == result["target_request_count"] == 1
+    assert result["response_captured"] is result["evidence_captured"] is True
+    assert result["response_complete"] is True and result["http_status"] == 200
+    assert native["evaluation"]["observation"]["response_text"] == answer
+    assert native["evaluation"]["observation"]["response_complete"] is True
+    assert result["historical_verdict"] == native["evaluation"]["final_verdict"] == verdict
+    assert not any(e["kind"] in {"tool_call", "command_execution"}
+                   for e in native["evaluation"]["observation"]["evidence"])
+
+
 def test_auth_stale_unauthorized_and_scope_reject_before_target(tmp_path):
     client, selection, headers, _, seen = environment(tmp_path)
     plan = post(client,"readiness/preview",selection,headers).json["plan_id"]

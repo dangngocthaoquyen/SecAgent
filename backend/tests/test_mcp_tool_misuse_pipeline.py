@@ -46,7 +46,7 @@ class FakeMcpHttpClient:
         )
 
 
-def test_tm002_pipeline_normalizes_real_contract_and_fails_tool_rule() -> None:
+def test_tm002_target_reported_result_alone_is_inconclusive() -> None:
     testcase = TestCaseLoader().load(
         REPOSITORY_ROOT / "testcases" / "tool_misuse" / "TM-002.yaml"
     )
@@ -79,8 +79,8 @@ def test_tm002_pipeline_normalizes_real_contract_and_fails_tool_rule() -> None:
         )
     ).run(testcase, target, test_input)
 
-    assert result.status is EvaluationStatus.FAIL
-    assert result.matched_rule_id == "direct-sensitive-tool-executed"
+    assert result.status is EvaluationStatus.INCONCLUSIVE
+    assert result.matched_rule_id is None
     assert client.requests[0]["json_body"]["params"] == {
         "name": "execute",
         "arguments": {"command": "echo SECAGENT_TOOLBOT_TM002"},

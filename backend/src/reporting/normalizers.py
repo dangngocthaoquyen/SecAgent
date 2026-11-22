@@ -8,15 +8,19 @@ from pydantic import ValidationError
 
 from reporting.models import (
     ArchivedAssessmentReport, Citation, Comparison, Completeness, Context, DeterministicResult,
-    ExecutionReport, ExecutionState, HistoricalIntegrityClaims, HistoricalResult, HistoricalSecurity, HumanReference,
-    Identity, Judge, Observation, ParentExecution, ReportedEvidence, SourceReport, TechnicalError, Verification,
+    ExecutionReport, ExecutionState, ExecutionAssessment, HistoricalIntegrityClaims, HistoricalResult, HistoricalSecurity, HumanReference,
+    Identity, Judge, Observation, ParentExecution, ReportedEvidence, SourceReport, TechnicalError, Verification, ImportedProvenance,
 )
 from reporting.redaction import Redactor
 
 MAX_BYTES = 10 * 1024 * 1024
 ASI = {"goal_hijacking": "ASI01", "tool_misuse": "ASI02", "identity_privilege_abuse": "ASI03", "unexpected_code_execution": "ASI05"}
 STATUSES = {"PASS", "FAIL", "INCONCLUSIVE", "ERROR"}
-DETAILS = {"scope", "completeness", "finish_reason", "declared_tool_call_count", "tool_calls_truncated",
+DETAILS = {"scope", "completeness", "finish_reason", "assistant_content_present", "declared_tool_call_count", "tool_calls_truncated",
+    "arguments_sha256", "reported_success", "execution_id", "invocation_id", "effect_sha256",
+    "testcase_id", "target_id", "attribution", "evidence_type", "execution_level",
+    "handler_status", "correlation_status", "trace_completeness", "observed_action_count",
+    "trace_sha256", "source_provenance", "synthetic_mock",
     "webFetchAttempted", "webFetchExecuted", "webFetchUrl", "webFetchSource", "error_present", "error_category",
     "httpPostAttempted", "httpPostExecuted", "injectionKind", "destination_id", "run_id", "result_ok", "result_status_code",
     "collector_id", "condition", "correlation_valid", "page_served", "receipt_count", "observation_complete",
@@ -157,6 +161,35 @@ def _observation(value, r):
             reported_value=complete, source_field_present="response_complete" in value, reported_scopes=scopes))
 
 
+def _execution_assessment(value, r):
+    if value is None:
+        return None
+    row = _object(value)
+    references = row.get("evidence_references", [])
+    limitations = row.get("unsupported_execution_claims", [])
+    if (not isinstance(references, list) or len(references) > 33
+            or not isinstance(limitations, list) or len(limitations) > 8):
+        raise NormalizationError("Invalid ASI05 execution assessment.")
+    return ExecutionAssessment(
+        evaluation_scope=row.get("evaluation_scope"),
+        testcase_id=r.identifier(row.get("testcase_id")),
+        target_id=r.identifier(row.get("target_id")),
+        execution_id=r.identifier(row.get("execution_id")),
+        policy_id=r.identifier(row.get("policy_id")),
+        policy_revision_sha256=row.get("policy_revision_sha256"),
+        verdict=_status(row.get("verdict")),
+        rationale=r.clean(row.get("rationale")),
+        evidence_level=row.get("evidence_level"),
+        provenance=r.clean(row.get("provenance")),
+        correlation_status=r.clean(row.get("correlation_status")),
+        trace_completeness=r.clean(row.get("trace_completeness")),
+        attribution=r.clean(row.get("attribution")),
+        policy_violation=_bool(row.get("policy_violation")),
+        evidence_references=[r.identifier(item) for item in references],
+        unsupported_execution_claims=[r.clean(item) for item in limitations],
+    )
+
+
 def _judge(value, r, *, archived=False, mode=None, deterministic=None, semantic_enabled=None):
     row = _optional_object(value)
     result = _optional_object(row.get("validated_response")) if archived else row
@@ -272,6 +305,7 @@ def _native(document, source, r):
         notes.append("Execution and observation completeness claims differ; neither was promoted or independently verified.")
     context = _context(e.get("evidence_limitations"), r)
     return ExecutionReport(report_id="execution:" + source.file_byte_sha256, source=source, identity=identity,
+        imported_provenance=ImportedProvenance.model_validate(document["imported_provenance"]) if document.get("imported_provenance") is not None else None,
         execution_id=execution_id, record_status="partial" if document.get("report_fault") is not None or partial or execution_id is None or e.get("execution") is None or e.get("observation") is None else "complete", execution=execution,
         reported_wrapper_execution_success=_bool(document.get("smoke_execution_succeeded")),
         original_execution_result=execution if e.get("execution") is not None else None,
@@ -281,6 +315,7 @@ def _native(document, source, r):
         original_final_result=final, security=_security(status, final.reason if final else None, partial=partial),
         observation=observation, judge=judge,
         comparison=_comparison(judge, deterministic.status if deterministic else None),
+        execution_evaluation=_execution_assessment(e.get("execution_evaluation"), r),
         human_reference=_human(document.get("human_reference"), r),
         technical_errors=errors, limitations=_limitations(e.get("evidence_limitations"), r), normalization_notes=notes)
 
@@ -354,7 +389,7 @@ def normalize_report_bytes(raw: bytes, *, redact_values=()):
             raise NormalizationError("Unsupported source format; filename suffix is not sufficient.")
         digest = hashlib.sha256(raw).hexdigest()
         provenance = document.get("source_provenance") if native else None
-        if provenance not in {None, "synthetic_mock"}:
+        if provenance not in {None, "synthetic_mock", "restricted_dvaa_lab", "target_observation"}:
             raise NormalizationError("Unsupported source provenance claim.")
         source = SourceReport(format=format_name, identity="sha256:" + digest,
             file_byte_sha256=digest, reported_provenance=provenance)

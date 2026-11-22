@@ -8,13 +8,13 @@ import os
 from pathlib import Path
 import re
 import secrets
-from threading import Lock
+from threading import RLock
 from time import perf_counter
 from uuid import uuid4
 
 import httpx
 
-from backend.scripts.run_native_smoke import run_smoke
+from testing.report_builder import run_native_report
 from reporting.redaction import Redactor
 from targets.adapters.http_adapter import HttpTargetAdapter
 from testing import Executor, RunnerEvaluationConfig
@@ -32,21 +32,32 @@ class DispatchRejected(ValueError):
 class OneRequestHttpClient:
     """Enforce the exact URL, method, one request, deadline and response cap."""
 
-    def __init__(self, endpoint: str, timeout: int, *, transport=None, max_bytes=65536):
+    def __init__(self, endpoint: str, timeout: int, *, transport=None, max_bytes=65536,
+                 stage_sink=None, before_request=None):
         self.endpoint, self.timeout = endpoint, timeout
         self.transport, self.max_bytes = transport, max_bytes
+        self.stage_sink = stage_sink
+        self.before_request = before_request
         self.used = 0
 
     def request(self, *, method, url, headers=None, json_body=None, timeout=None):
         if self.used or method != "POST" or url != self.endpoint or timeout != self.timeout:
             raise HttpClientError("Bounded target request rejected.")
-        self.used += 1  # Reserve before any transport activity; never retry.
+        if self.before_request is None:
+            self.used += 1  # Reserve before any transport activity; never retry.
         started = perf_counter()
         try:
             with httpx.Client(transport=self.transport, follow_redirects=False, trust_env=False) as client:
+                if self.stage_sink is not None:
+                    self.stage_sink("sending_target_request")
+                if self.before_request is not None:
+                    self.before_request()  # Last admission/cancellation gate, before transport.
+                    self.used += 1
                 with client.stream("POST", self.endpoint, headers=headers, json=json_body,
                         timeout=httpx.Timeout(connect=min(self.timeout, 3), read=self.timeout,
                                               write=min(self.timeout, 3), pool=min(self.timeout, 3))) as response:
+                    if self.stage_sink is not None:
+                        self.stage_sink("waiting_for_target_response")
                     if int(response.headers.get("content-length", "0")) > self.max_bytes:
                         raise HttpClientError("Target response exceeded size limit.")
                     chunks, size = [], 0
@@ -66,7 +77,7 @@ class OneRequestHttpClient:
                         pass
                     return HttpResponse(status_code=response.status_code,
                         headers={}, text=raw.decode("utf-8", errors="replace"), json_body=value,
-                        duration_ms=(perf_counter() - started) * 1000)
+                        duration_ms=(perf_counter() - started) * 1000, body_complete=True)
         except (httpx.RequestError, httpx.TimeoutException) as exc:
             raise HttpClientError("Target request failed or timed out.",
                 duration_ms=(perf_counter() - started) * 1000) from exc
@@ -122,7 +133,7 @@ class ControlledDispatcher:
         if fixture_runtime is not None and (transport is None or not isinstance(fixture_runtime, LocalMockFixtureRuntime)):
             raise ValueError("GH-WEB-001 fixture dispatch is limited to local synthetic mock transport.")
         self.fixture_runtime = fixture_runtime
-        self._lock = Lock()
+        self._lock = RLock()
         self._active = False
         self._claimed_keys = set()
 
@@ -213,7 +224,8 @@ class ControlledDispatcher:
 
         client = OneRequestHttpClient(preset.endpoint, selection.target.timeout_seconds,
                                       transport=self.transport)
-        adapter = HttpTargetAdapter(http_client=client)
+        adapter = HttpTargetAdapter(http_client=client,
+            response_only_completion=(case_id == "GH-C01"))
         credential_name = self.catalog._config.credential_aliases.get(preset.credential_alias)
         credential_value = os.environ.get(credential_name, '') if credential_name else ''
         redaction_values = tuple(value for value in (self.operator_secret, credential_value) if value)
@@ -223,19 +235,23 @@ class ControlledDispatcher:
             with fixture_context as fixture:
                 evaluation_config = (self.hybrid_config if selection.evaluation_mode == "hybrid"
                                      else RunnerEvaluationConfig())
-                report_path, summary = run_smoke(None, case_path, run_dir,
+                report_path, summary = run_native_report(None, case_path, run_dir,
                     target_profile=profile, executor=Executor({"generic_http": adapter}),
                     evaluation_config=evaluation_config,
                     judge_provider=self.judge_provider if selection.evaluation_mode == "hybrid" else None,
                     web_fixture_run=fixture.directory if fixture else None,
                     source_provenance="synthetic_mock" if fixture else None,
                     sanitize_summary=lambda row: sanitized(row, secrets_to_remove=redaction_values))
-            evidence_captured = False
+            observed = summary["evaluation"].get("observation") or {}
+            executed = summary["evaluation"].get("execution") or {}
+            response_captured = isinstance(observed.get("response_text"), str)
+            response_complete = observed.get("response_complete")
+            evidence_captured = response_captured or bool(observed.get("evidence"))
             if fixture:
                 manifest = fixture.directory / "manifest.json"
                 events = fixture.directory / "events.jsonl"
                 rows = fixture.rows()
-                evidence_captured = bool(rows)
+                evidence_captured = evidence_captured or bool(rows)
                 provenance = {"source": "synthetic_mock", "run_id": run_id,
                     "native_execution_id": summary["evaluation"].get("run_id"),
                     "fixture_correlation_sha256": sha256(fixture.config["run_id"].encode()).hexdigest(),
@@ -258,6 +274,9 @@ class ControlledDispatcher:
                 "historical_verdict": summary["evaluation"]["final_verdict"],
                 "evaluation_mode": summary["evaluation"].get("evaluation_mode"),
                 "evidence_captured": evidence_captured,
+                "response_captured": response_captured,
+                "response_complete": response_complete,
+                "http_status": executed.get("status_code"),
                 "artifact_provenance": "synthetic_mock" if fixture else "target_observation",
                 "report_persisted": True, "reporting_snapshot_contains_run": False,
                 "report_file": report_path.name,
@@ -275,6 +294,9 @@ class ControlledDispatcher:
                 "evaluation_mode": selection.evaluation_mode,
                 "target_id": profile.id, "target_request_count": client.used,
                 "evidence_captured": False,
+                "response_captured": False,
+                "response_complete": None,
+                "http_status": None,
                 "artifact_provenance": "synthetic_mock" if case_id == "GH-WEB-001" else "target_observation",
                 "report_persisted": False, "reporting_snapshot_contains_run": False,
                 "limitation": "Run failed; review local operator logs without retrying automatically."}

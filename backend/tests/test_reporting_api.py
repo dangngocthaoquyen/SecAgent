@@ -158,7 +158,8 @@ def test_selected_controlled_run_handoff_preserves_synthetic_report(tmp_path):
     selected["allowed_roots"]["controlled"] = "runs"
     selected["controlled_runs_root"] = "controlled"
     manifest_path.write_text(json.dumps(selected), encoding="utf-8")
-    api = create_app(load_dataset(manifest_path)).test_client()
+    index_path = tmp_path / 'history-index.json'
+    api = create_app(load_dataset(manifest_path), history_index_path=index_path).test_client()
     assert api.get("/api/reports/executions").get_json()["total"] == 0
     response = api.get("/api/reports/runs/" + run_id)
     assert response.status_code == 200
@@ -167,12 +168,73 @@ def test_selected_controlled_run_handoff_preserves_synthetic_report(tmp_path):
     assert result["execution"]["report_id"] == "execution:" + digest
     assert result["execution"]["security"]["verdict"] == row["evaluation"]["final_verdict"]
     assert len(result["execution"]["observation"]["evidence"]) == len(row["evaluation"]["observation"]["evidence"])
+    history = api.get('/api/reports/saved-runs?target_id=synthetic-target').get_json()
+    assert history['total'] == 1 and history['items'][0]['run_id'] == run_id
+    assert history['items'][0]['verdict'] == row['evaluation']['final_verdict']
+    assert history['items'][0]['started_at'] == row['timestamp']
+    assert api.get('/api/reports/saved-runs?date_from=2026-11-06&date_to=2026-11-06').get_json()['total'] == 1
+    assert history['index_persisted'] is True and index_path.is_file()
+    restarted = create_app(load_dataset(manifest_path), history_index_path=index_path).test_client()
+    assert restarted.get('/api/reports/saved-runs').get_json()['total'] == 1
+    assert api.get('/api/reports/saved-runs?target_id=other').get_json()['total'] == 0
+    assert api.get('/api/reports/saved-runs?target_id=../secret').status_code == 400
     assert api.get("/api/reports/runs/" + "b" * 32).status_code == 404
     assert api.get("/api/reports/runs/../../private").status_code in {400, 404}
     assert create_app(load_dataset(manifest(tmp_path))).test_client().get("/api/reports/runs/" + run_id).status_code == 404
     summary["report_file"] = "../synthetic.secagent.json"
     (run_dir / "run-summary.json").write_text(json.dumps(summary), encoding="utf-8")
-    assert api.get("/api/reports/runs/" + run_id).status_code == 404
+    invalid = api.get("/api/reports/runs/" + run_id)
+    assert invalid.status_code == 409
+    assert invalid.get_json()["error"]["code"] == "run_invalid"
+
+
+def test_controlled_runs_are_discovered_after_reporting_start_without_cross_run_confusion(tmp_path):
+    (tmp_path / "runs").mkdir()
+    manifest_path = manifest(tmp_path, [native(run="historical")])
+    selected = json.loads(manifest_path.read_text(encoding="utf-8"))
+    selected["allowed_roots"]["controlled"] = "runs"
+    selected["controlled_runs_root"] = "controlled"
+    manifest_path.write_text(json.dumps(selected), encoding="utf-8")
+    api = create_app(load_dataset(manifest_path)).test_client()
+    assert api.get("/api/reports/executions").get_json()["total"] == 1
+
+    def save(run_id, verdict):
+        folder = tmp_path / "runs" / run_id
+        folder.mkdir(parents=True)
+        row = native(verdict, run=f"execution-{run_id}", testcase="GH-WEB-001",
+                     target="dvaa-researchbot-web-lab")
+        row["source_provenance"] = "restricted_dvaa_lab"
+        raw = json.dumps(row).encode("utf-8")
+        filename = f"native-GH-WEB-001-{run_id}.secagent.json"
+        (folder / filename).write_bytes(raw)
+        summary = {"run_id": run_id, "report_persisted": True, "report_file": filename,
+                   "report_sha256": hashlib.sha256(raw).hexdigest(),
+                   "native_execution_id": f"execution-{run_id}",
+                   "testcase_id": "GH-WEB-001", "target_id": "dvaa-researchbot-web-lab",
+                   "target_request_count": 2}
+        (folder / "run-summary.json").write_text(json.dumps(summary), encoding="utf-8")
+        return folder, summary
+
+    first_id, second_id = "a" * 32, "b" * 32
+    assert api.get("/api/reports/runs/" + first_id).status_code == 404
+    first_folder, first_summary = save(first_id, "FAIL")
+    first = api.get("/api/reports/runs/" + first_id)
+    assert first.status_code == 200
+    assert first.get_json()["target_request_count"] == 2
+    assert first.get_json()["execution"]["source"]["reported_provenance"] == "restricted_dvaa_lab"
+    assert first.get_json()["execution"]["security"]["verdict"] == "FAIL"
+    save(second_id, "INCONCLUSIVE")
+    assert api.get("/api/reports/runs/" + first_id).get_json()["execution"]["security"]["verdict"] == "FAIL"
+    assert api.get("/api/reports/runs/" + second_id).get_json()["execution"]["security"]["verdict"] == "INCONCLUSIVE"
+    assert api.get("/api/reports/executions").get_json()["total"] == 1
+
+    report_path = first_folder / first_summary["report_file"]
+    report_path.write_bytes(report_path.read_bytes() + b" ")
+    tampered = api.get("/api/reports/runs/" + first_id)
+    assert tampered.status_code == 409
+    assert tampered.get_json()["error"]["code"] == "run_invalid"
+    assert api.get("/api/reports/runs/" + second_id).status_code == 200
+    assert create_app(load_dataset(manifest(tmp_path))).test_client().get("/api/reports/runs/" + second_id).status_code == 404
 
 
 @pytest.mark.parametrize("kind", ["disagreement", "missing_parent", "hash_mismatch", "timeout"])
@@ -361,3 +423,94 @@ def test_dataset_is_a_snapshot_until_explicit_restart(tmp_path):
     (tmp_path / "source-0.json").write_text("malformed", encoding="utf-8")
     assert c.get("/api/reports/overview").data == before
     with pytest.raises(DatasetError): load_dataset(p)
+
+
+def test_saved_runs_date_filtering_unknown_asi_error_mcp_and_corruption(tmp_path):
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+
+    def write_controlled(run_id, *, started_at, asi_category, verdict="PASS"):
+        d = runs_dir / run_id
+        d.mkdir()
+        row = native(verdict, run=f"exec-{run_id}", testcase=f"TC-{run_id[:4]}",
+                     target="target-1", category=asi_category)
+        row["evaluation"]["execution"]["started_at"] = started_at
+        raw = json.dumps(row).encode("utf-8")
+        fname = f"native-{run_id}.secagent.json"
+        (d / fname).write_bytes(raw)
+        (d / "run-summary.json").write_text(json.dumps({
+            "run_id": run_id, "report_persisted": True, "report_file": fname,
+            "report_sha256": hashlib.sha256(raw).hexdigest(),
+            "native_execution_id": f"exec-{run_id}",
+            "testcase_id": f"TC-{run_id[:4]}", "target_id": "target-1",
+            "target_request_count": 1,
+        }), encoding="utf-8")
+
+    def write_mcp_error(run_id, *, started_at, tamper=False):
+        d = runs_dir / f"mcp-action-{run_id}"
+        d.mkdir()
+        report = {
+            "run_id": f"exec-{run_id}",
+            "testcase_id": "ASI05-MCP-ERR",
+            "target_id": "dvaa-toolbot",
+            "timestamp": started_at,
+            "evaluation_scope": "execution_action",
+            "final_verdict": "ERROR",
+            "observation": {"response_text": None, "evidence": []},
+            "execution_evaluation": {"evidence_level": "tool_invocation"},
+        }
+        raw = json.dumps(report).encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+        (d / "native_report.json").write_bytes(raw + (b"x" if tamper else b""))
+        (d / "run-summary.json").write_text(json.dumps({
+            "run_id": run_id, "report_persisted": True, "report_kind": "mcp_action",
+            "report_file": "native_report.json", "report_sha256": digest,
+            "native_execution_id": f"exec-{run_id}",
+            "testcase_id": "ASI05-MCP-ERR", "target_id": "dvaa-toolbot",
+        }), encoding="utf-8")
+
+    write_controlled("1" * 32, started_at="2026-11-18T10:00:00+00:00", asi_category="custom_unclassified", verdict="PASS")
+    write_controlled("2" * 32, started_at="2026-11-19T12:00:00+00:00", asi_category="unexpected_code_execution", verdict="FAIL")
+    write_mcp_error("3" * 32, started_at="2026-11-20T09:00:00+00:00")
+    write_mcp_error("4" * 32, started_at="2026-11-20T10:00:00+00:00", tamper=True)
+
+    manifest_path = manifest(tmp_path)
+    change_manifest(manifest_path, lambda m: m.update(allowed_roots={"controlled": "runs"}, controlled_runs_root="controlled"))
+    api = create_app(load_dataset(manifest_path)).test_client()
+
+    all_rows = api.get("/api/reports/saved-runs").get_json()
+    assert all_rows["total"] == 3
+    assert all_rows["invalid_artifact_count"] == 1
+
+    # Tampered MCP report stays rejected on detail and export.
+    assert api.get("/api/reports/mcp-runs/" + "4" * 32).status_code == 409
+    assert api.get("/api/reports/mcp-runs/" + "4" * 32 + "/download").status_code == 409
+
+    # Valid ERROR MCP report renders, filters, opens detail and exports cleanly.
+    err_filter = api.get("/api/reports/saved-runs?verdict=ERROR").get_json()
+    assert err_filter["total"] == 1 and err_filter["items"][0]["run_id"] == "3" * 32
+    detail = api.get("/api/reports/mcp-runs/" + "3" * 32)
+    assert detail.status_code == 200 and detail.get_json()["native_report"]["final_verdict"] == "ERROR"
+    export = api.get("/api/reports/mcp-runs/" + "3" * 32 + "/download")
+    assert export.status_code == 200 and json.loads(export.data)["native_report"]["final_verdict"] == "ERROR"
+
+    # asi_category=unknown matches unclassified runs only.
+    unknown_asi = api.get("/api/reports/saved-runs?asi_category=unknown").get_json()
+    assert unknown_asi["total"] == 1 and unknown_asi["items"][0]["run_id"] == "1" * 32
+
+    # Valid date boundaries and pagination.
+    bounded = api.get("/api/reports/saved-runs?date_from=2026-11-18&date_to=2026-11-19&page=1&page_size=1").get_json()
+    assert bounded["total"] == 2 and len(bounded["items"]) == 1
+    assert bounded["items"][0]["run_id"] == "2" * 32
+    page2 = api.get("/api/reports/saved-runs?date_from=2026-11-18&date_to=2026-11-19&page=2&page_size=1").get_json()
+    assert page2["items"][0]["run_id"] == "1" * 32
+
+    # Invalid date format, non-existent calendar date, reversed range -> 400 invalid_filter.
+    for bad in ("date_from=bad", "date_from=2026-11-1", "date_from=2026-02-30", "date_to=2026-04-31",
+                "date_from=2026-11-20&date_to=2026-11-18"):
+        res = api.get("/api/reports/saved-runs?" + bad)
+        assert res.status_code == 400
+        assert res.get_json()["error"]["code"] == "invalid_filter"
+
+    # /api/reports/executions must continue rejecting date_from/date_to as before.
+    assert api.get("/api/reports/executions?date_from=2026-11-18").status_code == 400

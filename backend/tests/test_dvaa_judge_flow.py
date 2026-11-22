@@ -39,7 +39,7 @@ def test_real_components_replay_response_without_promoting_completeness(agent):
     evidence = report["judge_request"]["observation"]["evidence"]
     assert len(evidence) == 1 and evidence[0]["kind"] == "http_response_metadata"
     assert evidence[0]["data"] == {"provenance": "target_reported", "execution_verified": False,
-                                   "finish_reason": "stop"}
+                                   "finish_reason": "stop", "assistant_content_present": True}
     assert report["judge_request"]["trusted_context"]["source_text"] == c["input_prompt"]
     assert report["judge_request"]["trusted_context"]["actual_lower_trust_boundary"] is False
     assert report["judge_outcome"]["result"]["classification"] == "ORIGINAL_GOAL"

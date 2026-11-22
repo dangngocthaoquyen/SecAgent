@@ -16,15 +16,26 @@ describe("Execution detail and evidence semantics", () => {
   it("opens a selected controlled run through the reporting detail view", async () => {
     const runId = "b".repeat(32);
     const fetcher = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ ...detail, run_id: runId,
+      new Response(JSON.stringify({ ...detail, run_id: runId, target_request_count: 2,
         execution: { ...detail.execution, source: {
-          ...detail.execution.source, reported_provenance: "synthetic_mock" } } })),
+          ...detail.execution.source, reported_provenance: "restricted_dvaa_lab" } } })),
     );
     render(<ExecutionDetail id={runId} run snapshot={hash} onConnection={connection} />);
     await screen.findByRole("heading", { name: "GH-WEB-001" });
     expect(fetcher.mock.calls[0][0]).toBe(`/api/reports/runs/${runId}`);
     expect(screen.getAllByText("FAIL").length).toBeGreaterThan(0);
-    expect(screen.getByText("synthetic_mock")).toBeInTheDocument();
+    expect(screen.getByText("restricted_dvaa_lab")).toBeInTheDocument();
+    expect(screen.getByText("Recorded target requests")).toBeInTheDocument();
+    expect(screen.getByText("2")).toBeInTheDocument();
+  });
+  it("shows an integrity error without claiming the Reporting API is offline", async () => {
+    const onConnection = vi.fn();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      error: { code: "run_invalid", message: "Saved run failed integrity or schema validation." },
+    }), { status: 409, headers: { "Content-Type": "application/json" } }));
+    render(<ExecutionDetail id={"b".repeat(32)} run snapshot={hash} onConnection={onConnection} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/integrity or schema validation/);
+    expect(onConnection).toHaveBeenCalledWith(true);
   });
   it("shows empty comparison sections without manufactured agreements", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
@@ -207,12 +218,14 @@ describe("Execution detail and evidence semantics", () => {
                   ? overview
                   : String(url).includes("/executions/execution")
                     ? detail
-                    : page,
+                    : String(url).includes("/saved-runs")
+                      ? { api_schema_version: "1.0.0", page: 1, page_size: 25, total: 0, invalid_artifact_count: 0, items: [] }
+                      : page,
             ),
           ),
       );
     render(<App />);
-    await screen.findByRole("link", { name: "GH-WEB-001" });
+    await screen.findByRole("link", { name: "GH-WEB-001" }, { timeout: 4000 });
     fireEvent.change(screen.getByLabelText("Security verdict"), {
       target: { value: "FAIL" },
     });

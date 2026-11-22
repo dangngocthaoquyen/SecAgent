@@ -4,19 +4,25 @@ import { Notice } from "./components";
 import Overview from "./Overview";
 import Executions from "./Executions";
 import ExecutionDetail from "./ExecutionDetail";
+import McpRunDetail from './McpRunDetail';
 import Comparisons from "./Comparisons";
 import TargetConfiguration from './TargetConfiguration';
+import BatchProgress from './BatchProgress';
+import DatasetLibrary from './DatasetLibrary';
 function route() {
   const hash = location.hash.slice(1);
-  return hash === 'targets' || hash === "executions" ||
+  return hash === 'targets' || hash === 'datasets' || hash === "executions" ||
     hash === "comparisons" ||
-    hash.startsWith("execution/") || hash.startsWith("run/")
+    hash.startsWith("execution/") || hash.startsWith("run/") || hash.startsWith("mcp-run/") || hash.startsWith("batch/")
     ? hash
     : "overview";
 }
 export default function App() {
   const [view, setView] = useState(route());
+  const [selectedTargetId,setSelectedTargetId]=useState('');
   const targetsView = view === 'targets';
+  const datasetsView = view === 'datasets';
+  const batchView = view.startsWith('batch/');
   const [summary, setSummary] = useState<Summary | null>(null),
     [error, setError] = useState(""),
     [loading, setLoading] = useState(true),
@@ -30,7 +36,7 @@ export default function App() {
     return () => window.removeEventListener("hashchange", listener);
   }, []);
   useEffect(() => {
-    if (targetsView) return;
+    if (targetsView || batchView || datasetsView) return;
     const controller = new AbortController();
     setLoading(true);
     setSummary(null);
@@ -61,7 +67,7 @@ export default function App() {
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [revision, targetsView]);
+  }, [revision, targetsView, batchView, datasetsView]);
   const connection = useCallback((ok: boolean) => setConnected(ok), []);
   function navigate(next: string) {
     location.hash = next;
@@ -86,7 +92,10 @@ export default function App() {
           </span>
         </a>
         <div className="nav-label">SECURITY TESTING</div>
-        <nav aria-label="Security testing navigation"><a href="#targets" aria-current={targetsView?'page':undefined} onClick={()=>navigate('targets')}>Targets</a></nav>
+        <nav aria-label="Security testing navigation">
+          <a href="#targets" aria-current={targetsView?'page':undefined} onClick={()=>navigate('targets')}>Targets</a>
+          <a href="#datasets" aria-current={datasetsView?'page':undefined} onClick={()=>navigate('datasets')}>Datasets</a>
+        </nav>
         <div className="nav-label">EVALUATION REPORTS</div>
         <nav aria-label="Main navigation">
           <a
@@ -99,7 +108,7 @@ export default function App() {
           <a
             href="#executions"
             aria-current={
-              view === "executions" || view.startsWith("execution/") || view.startsWith("run/")
+              view === "executions" || view.startsWith("execution/") || view.startsWith("run/") || view.startsWith("mcp-run/")
                 ? "page"
                 : undefined
             }
@@ -127,34 +136,34 @@ export default function App() {
       <div className="workspace">
         <header>
           <div className="breadcrumb">
-            {targetsView?'Security Testing':'Evaluation'} <span>/</span>{" "}
+            {targetsView||batchView||datasetsView?'Security Testing':'Evaluation'} <span>/</span>{" "}
             <b>
-              {targetsView ? 'Targets' : view === "overview"
+              {targetsView ? 'Targets' : datasetsView ? 'Dataset Library' : batchView ? 'Batch Progress' : view === "overview"
                 ? "Overview"
                 : view === "comparisons"
                   ? "Rule / Pi comparison"
-                  : view.startsWith("execution/") || view.startsWith("run/")
+                  : view.startsWith("execution/") || view.startsWith("run/") || view.startsWith("mcp-run/")
                     ? "Execution Detail"
                     : "Execution Results"}
             </b>
           </div>
           <div className="header-actions">
             <span
-              className={`connection ${connected && !targetsView ? "online" : ""}`}
+              className={`connection ${connected && !targetsView && !datasetsView ? "online" : ""}`}
               role="status"
             >
               <span className="dot" />
-              {targetsView ? 'Offline configuration service' : loading
+              {targetsView||batchView||datasetsView ? 'Target workflow service' : loading
                 ? "Connecting to API"
                 : connected
                   ? "Reporting API connected"
                   : "Reporting API unavailable"}
             </span>
-            <span className="readonly">{targetsView?'No target requests':'Read-only'}</span>
+            <span className="readonly">{targetsView||batchView||datasetsView?'Operator controlled':'Read-only'}</span>
           </div>
         </header>
         <main id="main" tabIndex={-1}>
-          {targetsView ? <TargetConfiguration/> : <>
+          {targetsView ? <TargetConfiguration initialTargetId={selectedTargetId} onSelectDataset={setSelectedTargetId}/> : datasetsView ? <DatasetLibrary initialTargetId={selectedTargetId}/> : batchView ? <BatchProgress id={view.slice('batch/'.length)}/> : <>
           <div className="dataset-line">
             <span>
               Selected reporting dataset{" "}
@@ -202,6 +211,7 @@ export default function App() {
                     run={view.startsWith("run/")}
                   />
                 )}
+                {view.startsWith('mcp-run/')&&<McpRunDetail id={view.slice('mcp-run/'.length)}/>}
                 {view === "comparisons" && (
                   <Comparisons
                     snapshot={summary.snapshot_sha256}
@@ -215,7 +225,7 @@ export default function App() {
           <footer>
             SecAgent · Evaluation & Reporting{" "}
             <span>
-              Historical records. Explicit evidence. No target execution.
+              Historical records. Explicit evidence. Bounded operator authorization.
             </span>
           </footer>
         </main>

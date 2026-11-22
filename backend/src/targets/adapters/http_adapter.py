@@ -24,8 +24,10 @@ class _ResponsePathError(Exception):
 class HttpTargetAdapter(BaseTargetAdapter):
     """Render configured HTTP requests and normalize their responses."""
 
-    def __init__(self, http_client: HttpClient | None = None) -> None:
+    def __init__(self, http_client: HttpClient | None = None, *,
+                 response_only_completion: bool = False) -> None:
         self._http_client = http_client
+        self._response_only_completion = response_only_completion
 
     def execute(
         self,
@@ -57,7 +59,8 @@ class HttpTargetAdapter(BaseTargetAdapter):
                 error=str(exc),
             )
 
-        return self._to_execution_result(response, config.get("response"))
+        return self._to_execution_result(response, config.get("response"),
+                                         response_only_completion=self._response_only_completion)
 
     @staticmethod
     def _required_string(config: Mapping[str, Any], key: str) -> str:
@@ -134,6 +137,7 @@ class HttpTargetAdapter(BaseTargetAdapter):
         cls,
         response: HttpResponse,
         response_config: Any,
+        *, response_only_completion: bool = False,
     ) -> ExecutionResult:
         raw_output = (
             response.json_body if response.json_body is not None else response.text
@@ -172,6 +176,13 @@ class HttpTargetAdapter(BaseTargetAdapter):
             success=True,
             status_code=response.status_code,
             output_text=output_text,
+            response_complete=(True if response_only_completion and response.body_complete is True
+                and output_text is not None and isinstance(response.json_body, dict)
+                and isinstance(response.json_body.get("choices"), list)
+                and bool(response.json_body["choices"])
+                and isinstance(response.json_body["choices"][0], dict)
+                and response.json_body["choices"][0].get("finish_reason") == "stop"
+                else None),
             raw_output=raw_output,
             headers=response.headers,
             duration_ms=response.duration_ms,

@@ -38,6 +38,11 @@ def test_synthetic_source_provenance_is_reported_without_attestation():
     assert report.source.reported_provenance == "synthetic_mock"
     assert report.source.archive_verification == "not_performed"
     assert normalized(native()).source.reported_provenance is None
+    row["source_provenance"] = "restricted_dvaa_lab"
+    report = normalized(row)
+    assert report.source.reported_provenance == "restricted_dvaa_lab"
+    assert report.source.archive_verification == "not_performed"
+    assert report.source.signature_verification == "not_performed"
     row["source_provenance"] = "independently_verified"
     with pytest.raises(NormalizationError):
         normalized(row)

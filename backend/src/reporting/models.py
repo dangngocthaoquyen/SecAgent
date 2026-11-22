@@ -26,7 +26,7 @@ class SourceReport(Model):
     format: Literal["native_legacy", "native_partial", "archived_crosscheck_v1"]
     identity: Identifier
     file_byte_sha256: SHA256
-    reported_provenance: Literal["synthetic_mock"] | None = None
+    reported_provenance: Literal["synthetic_mock", "restricted_dvaa_lab", "target_observation"] | None = None
     normalizer_version: Literal["2B.1.0"] = "2B.1.0"
     byte_hash_computed: Literal[True] = True
     archive_verification: Literal["not_performed"] = "not_performed"
@@ -289,6 +289,67 @@ class BaseReport(Model):
     normalization_notes: list[Text] = Field(default_factory=list)
 
 
+class ImportedProvenance(Model):
+    dataset_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")]
+    dataset_revision_sha256: SHA256
+    content_sha256: SHA256
+    source_testcase_id: Annotated[str, StringConstraints(min_length=1, max_length=4096)]
+    internal_testcase_id: Annotated[str, StringConstraints(pattern=r"^import-[a-f0-9]{24}$")]
+    prompt_sha256: SHA256
+    source_case_sha256: SHA256
+    source_taxonomy_basis: Literal["untrusted_source_claim"]
+    source_plugin_id: str | None = None
+    target_profile_id: Identifier
+    target_profile_revision_sha256: SHA256
+    binding_id: Literal["GENERIC-DIRECT-CHAT", "GH-C01", "GH-001", "GH-002"]
+    adapter: Literal["generic_http"]
+    delivery_surface: Literal["direct_chat"]
+    evaluation_readiness: Literal["unavailable", "reviewed_native_rules", "reviewed_asi03_response_semantic", "reviewed_asi05_response_semantic"]
+    evaluation_mode: Literal["rule_only", "hybrid"]
+    evidence_contract: Literal["response_only_inconclusive", "complete_response_text"]
+    native_testcase_sha256: SHA256 | None = None
+    evaluation_sha256: SHA256 | None = None
+    submission_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")]
+    plan_id: SHA256
+    batch_run_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")]
+    batch_execution_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")]
+    authorization_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")]
+    target_request_count: Annotated[int, Field(ge=0, le=1)]
+    evidence_provenance: Literal["synthetic_mock", "target_observation"]
+    execution_mode: Literal["offline_mock", "live_local_http"] | None = None
+    connection_probe_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")] | None = None
+    target_endpoint: Text | None = None
+    target_model: Text | None = None
+    evaluation_scope: Literal["identity_claim_response", "response_command_artifact"] | None = None
+    asi03_contract_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")] | None = None
+    asi03_contract_revision_sha256: SHA256 | None = None
+    asi03_policy_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")] | None = None
+    asi03_policy_revision_sha256: SHA256 | None = None
+    asi05_policy_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")] | None = None
+    asi05_policy_revision_sha256: SHA256 | None = None
+
+
+class ExecutionAssessment(Model):
+    """Safe historical projection of one ASI05 execution-scope decision."""
+    evaluation_scope: Literal["execution_action"]
+    testcase_id: Identifier
+    target_id: Identifier
+    execution_id: Identifier | None = None
+    policy_id: Identifier | None = None
+    policy_revision_sha256: SHA256 | None = None
+    verdict: HistoricalStatus
+    rationale: Text
+    evidence_level: Literal["response_artifact", "tool_invocation", "simulated_execution",
+                            "sandbox_effect", "missing_evidence", "uncorrelated_evidence"]
+    provenance: Text | None = None
+    correlation_status: Text
+    trace_completeness: Text
+    attribution: Text | None = None
+    policy_violation: bool | None = None
+    evidence_references: list[Identifier] = Field(default_factory=list)
+    unsupported_execution_claims: list[Text] = Field(default_factory=list)
+
+
 class ExecutionReport(BaseReport):
     report_kind: Literal["execution"] = "execution"
     execution_id: Identifier | None = None
@@ -301,6 +362,8 @@ class ExecutionReport(BaseReport):
     security: HistoricalSecurity
     judge: Judge
     comparison: Comparison
+    imported_provenance: ImportedProvenance | None = None
+    execution_evaluation: ExecutionAssessment | None = None
 
 
 class ParentExecution(Model):

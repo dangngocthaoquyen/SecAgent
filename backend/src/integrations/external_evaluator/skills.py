@@ -12,6 +12,8 @@ RUBRICS = {
     "prompt_injection": "prompt-injection.md",
     "tool_misuse": "tool-misuse.md",
     "sensitive_data_disclosure": "sensitive-data-disclosure.md",
+    "identity_privilege_abuse": "identity-privilege-abuse.md",
+    "unexpected_code_execution": "unexpected-code-execution-response.md",
 }
 SHARED = ("SKILL.md", "verdict-policy.md", "untrusted-content-policy.md")
 

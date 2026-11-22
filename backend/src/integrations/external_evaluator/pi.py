@@ -1,6 +1,7 @@
 """Stateless Pi CLI connector. No target verdict is produced on process failure."""
 
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -15,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from integrations.external_evaluator.base import ExternalEvaluatorProvider
 from integrations.external_evaluator.models import (
     EvaluationRequest, ExternalEvaluationOutcome, ProviderFault, ProviderFaultCode,
-    SkillIdentity,
+    ProcessDiagnosticCode, SkillIdentity,
 )
 from integrations.external_evaluator.skills import SkillBundleError, SkillBundleLoader
 from integrations.external_evaluator.validation import JudgeOutputError, parse_judge_response
@@ -50,6 +51,24 @@ class ProcessRunner(Protocol):
 
 class PiExecutableMissing(FileNotFoundError):
     """The configured process runner could not find Pi."""
+
+
+def _classify_nonzero_stderr(stderr: bytes, provider: str, model: str) -> ProcessDiagnosticCode:
+    """Classify only a known first error line; never return process text."""
+    first = next((line.strip() for line in stderr[:2048].decode("utf-8", errors="replace").splitlines()
+                  if line.strip()), "")
+    first = re.sub(r"\x1b\[[0-9;]*m", "", first).strip()
+    if first == f"No API key found for {provider}.":
+        return ProcessDiagnosticCode.CREDENTIAL_MISSING
+    if re.match(r"^(?:API Error: (?:HTTP )?|Error: HTTP |HTTP )(?:401|403)\b", first):
+        return ProcessDiagnosticCode.AUTH_REJECTED
+    if first == f'Model "{provider}/{model}" not found. Use --list-models to see available models.':
+        return ProcessDiagnosticCode.MODEL_REJECTED
+    if re.match(r"^(?:Error: )?(?:fetch failed|connect E(?:CONNREFUSED|CONNRESET|HOSTUNREACH|NETUNREACH)\b|getaddrinfo E(?:NOTFOUND|AI_AGAIN)\b|network error\b)", first, re.IGNORECASE):
+        return ProcessDiagnosticCode.NETWORK_ERROR
+    if re.match(r"^(?:Error: )?(?:Cannot find module\b|Unknown option:\s|SyntaxError:\s|\[ERR_MODULE_NOT_FOUND\])", first):
+        return ProcessDiagnosticCode.STARTUP_ERROR
+    return ProcessDiagnosticCode.UNKNOWN
 
 
 class BoundedSubprocessRunner:
@@ -151,10 +170,11 @@ class PiEvaluatorProvider(ExternalEvaluatorProvider):
         request_hash = request.sha256
         loaded_skill: SkillIdentity | None = None
 
-        def fault(code: ProviderFaultCode, message: str, exit_code: int | None = None):
+        def fault(code: ProviderFaultCode, message: str, exit_code: int | None = None,
+                  diagnostic_code: ProcessDiagnosticCode | None = None):
             return ExternalEvaluationOutcome(
                 request_sha256=request_hash, skill=loaded_skill,
-                fault=ProviderFault(code=code, message=message),
+                fault=ProviderFault(code=code, message=message, diagnostic_code=diagnostic_code),
                 duration_ms=(time.monotonic() - started) * 1000,
                 exit_code=exit_code,
             )
@@ -180,7 +200,9 @@ class PiEvaluatorProvider(ExternalEvaluatorProvider):
         if process.output_exceeded or len(process.stdout) > self._config.max_output_bytes or len(process.stderr) > self._config.max_output_bytes:
             return fault(ProviderFaultCode.OUTPUT_LIMIT, "Pi process output exceeded the limit.", process.exit_code)
         if process.exit_code != 0:
-            return fault(ProviderFaultCode.NONZERO_EXIT, "Pi process exited unsuccessfully.", process.exit_code)
+            return fault(ProviderFaultCode.NONZERO_EXIT, "Pi process exited unsuccessfully.",
+                process.exit_code, _classify_nonzero_stderr(
+                    process.stderr, self._config.provider, self._config.model))
         try:
             result = parse_judge_response(process.stdout.decode("utf-8"), request)
         except (UnicodeDecodeError, JudgeOutputError):

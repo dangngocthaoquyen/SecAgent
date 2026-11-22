@@ -1,0 +1,21 @@
+{
+  "dataset_schema_version": "1.0.0",
+  "allowed_roots": {
+    "research": "../../results/judge-validation"
+  },
+  "reports": [
+    {
+      "root": "research",
+      "path": "asi01-compose/control-20261106T0742519269397Z/reports/native-20261106T080745537588Z-GH-WEB-C01-dvaa-researchbot-lab.secagent.json",
+      "kind": "execution"
+    }
+  ],
+  "verification_jobs": [
+    {
+      "root": "research",
+      "inventory": "asi01-compose/attack-20261106T0813087606067Z/evidence-sha256.csv",
+      "execution": "asi01-compose/attack-20261106T0813087606067Z/reports/native-20261106T082008213826Z-GH-WEB-001-dvaa-researchbot-lab.secagent.json",
+      "assessment": "hybrid-cross-check/gh-web-001-pi-20261107_092815-cfd6f7c8.json"
+    }
+  ]
+}

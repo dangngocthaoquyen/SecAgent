@@ -25,3 +25,23 @@ it('blocks unsupported cases while permitting provisional unknown selection',asy
 it('rejects an executable response instead of showing readiness',async()=>{
  mount({...planPreview,executable:true});await screen.findByText('Agent Goal Hijacking');fireEvent.click(screen.getByText('Select All'));fireEvent.click(screen.getByText('Review testcases'));await screen.findByRole('alert');expect(screen.queryByText('Preview Test Plan')).not.toBeInTheDocument();
 });
+
+it.each([false,true])('uses backend text-target contract for SecureBot eligibility (matching=%s)',async matching=>{
+ const target={...draftFor(preset,'securebot',30),target_id:'dvaa-securebot',
+  endpoint:`http://127.0.0.1:${matching?'7001':'7015'}/v1/chat/completions`};
+ const data={...planPreview,items:['GH-C01','GH-001','GH-002'].map(id=>({
+  ...planPreview.items[0],id,name:id,asi_category:'ASI01'}))};
+ vi.spyOn(globalThis,'fetch').mockImplementation(async url=>new Response(JSON.stringify(
+  String(url).endsWith('categories')?categories:data)));
+ render(<PlanWizard target={target} nonce={'n'.repeat(43)} onBack={()=>{}}
+  asi01BatchEnabled asi01TextTargets={[{target_id:'dvaa-securebot',
+   endpoint:'http://127.0.0.1:7001/v1/chat/completions',model:'securebot'}]}/>);
+ await screen.findByText('Agent Goal Hijacking');
+ fireEvent.click(screen.getByText('Agent Goal Hijacking'));
+ fireEvent.click(screen.getByText('Review testcases'));
+ const control=(await screen.findByLabelText('Select GH-C01')).closest('tr');
+ expect(control).toHaveTextContent(matching?'Ready':'Blocked');
+ expect(screen.getByLabelText('Select GH-001').closest('tr')).toHaveTextContent(matching?'Conditional':'Blocked');
+ if(matching)expect(screen.getByRole('button',{name:'Select All Compatible'})).toBeEnabled();
+ else expect(screen.getByRole('button',{name:'Select All Compatible'})).toBeDisabled();
+});

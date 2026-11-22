@@ -10,6 +10,7 @@ test('offline Targets selection and validation on desktop and mobile; reporting 
  await page.route('**/api/reports/**',async route=>{const path=new URL(route.request().url()).pathname;await route.fulfill({json:path.endsWith('/health')?health:path.endsWith('/overview')?overview:rows});});
  await page.goto('/#targets');
  await expect(page.getByRole('heading',{name:'Reviewed lab'})).toBeVisible();
+ await page.getByText('Advanced Settings',{exact:true}).click();
  await page.getByRole('button',{name:'Validate Configuration'}).click();
  await expect(page.getByText('Configuration valid',{exact:true})).toBeVisible();
  await page.getByRole('button',{name:'Continue',exact:true}).click();
@@ -29,7 +30,7 @@ test('offline Targets selection and validation on desktop and mobile; reporting 
  await page.getByRole('button',{name:'Back to Target'}).click();
  await expect(page.getByRole('button',{name:/Test Connection/})).toBeDisabled();
  await page.getByLabel('Target',{exact:true}).selectOption('lab-two');
- await expect(page.getByText('Requires approval',{exact:true})).toBeVisible();
+ await expect(page.getByText('Review required',{exact:true})).toBeVisible();
  await page.setViewportSize({width:390,height:844});
  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
  await page.getByRole('link',{name:'Evaluation Overview'}).click();
@@ -48,7 +49,8 @@ test('groups synthetic agents by platform without implying connection or executi
  await page.goto('/#targets');
  await page.getByLabel('Platform').selectOption('other-platform');
  await expect(page.getByRole('heading',{name:'Other platform agent'})).toBeVisible();
- await expect(page.getByLabel('Target').locator('option')).toHaveCount(1);
+ await expect(page.getByLabel('Target',{exact:true}).locator('option')).toHaveCount(1);
+ await page.getByText('Advanced Settings',{exact:true}).click();
  await expect(page.getByLabel('Model')).toHaveValue('other-model');
  await expect(page.getByLabel('Timeout (seconds)')).toHaveValue('12');
  await expect(page.getByText('Configuration not validated')).toBeVisible();
@@ -73,6 +75,7 @@ test('shows backend-authorized Judge choice while keeping the synthetic plan blo
  await page.route('**/api/reports/**',async route=>{const path=new URL(route.request().url()).pathname;
   await route.fulfill({json:path.endsWith('/health')?health:path.endsWith('/overview')?overview:rows});});
  await page.goto('/#targets');
+ await page.getByText('Advanced Settings',{exact:true}).click();
  await page.getByRole('button',{name:'Validate Configuration'}).click();
  await page.getByRole('button',{name:'Continue',exact:true}).click();
  await page.getByText('Agent Goal Hijacking',{exact:true}).click();

@@ -105,6 +105,8 @@ class SyntheticAgentAdapter(BaseTargetAdapter):
                     "data": {
                         "scope": "agent_run",
                         "verified_fixture": True,
+                        "provenance": "independent_observer",
+                        "execution_verified": True,
                         "run_id": test_input.id,
                     },
                     "reference": f"synthetic_agent_audit/{test_input.id}",
