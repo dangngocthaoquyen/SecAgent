@@ -13,7 +13,10 @@ from threading import RLock
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from core.models.evaluation import EvaluationRule
+from evaluators.contract import validate_evaluation_rules
 
 
 PolicyCategory = Literal[
@@ -84,6 +87,28 @@ class ResponsePolicyDraft(BaseModel):
     expected_response_boundary: str = Field(min_length=1, max_length=4000)
     delivery_surface: str = Field(default="direct_chat", min_length=1, max_length=256)
     extra_rules: dict[str, Any] = Field(default_factory=dict)
+    evaluation_rules: list[EvaluationRule] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_evaluation_rules(self) -> "ResponsePolicyDraft":
+        if not self.evaluation_rules:
+            return self
+        _, diagnostics = validate_evaluation_rules(
+            self.evaluation_rules,
+            evaluation_scope=self.evaluation_scope,
+        )
+        if diagnostics:
+            summary = "; ".join(f"{d.code}: {d.message}" for d in diagnostics)
+            raise ValueError(f"Invalid policy evaluation_rules: {summary}")
+        return self
+
+
+def _policy_draft_hash_payload(draft: ResponsePolicyDraft) -> dict[str, Any]:
+    """Build hash payload preserving exact SHA-256 compatibility when evaluation_rules is empty."""
+    data = draft.model_dump(mode="json")
+    if not data.get("evaluation_rules"):
+        data.pop("evaluation_rules", None)
+    return data
 
 
 class ReviewedResponsePolicy(BaseModel):
@@ -138,7 +163,7 @@ class ResponsePolicyStore:
         model = draft if isinstance(draft, ResponsePolicyDraft) else ResponsePolicyDraft.model_validate(draft)
         now = datetime.now(timezone.utc).isoformat()
         policy_id = f"pol-{model.category[:8]}-{uuid4().hex[:12]}"
-        revision = canonical_policy_hash(model.model_dump(mode="json"))
+        revision = canonical_policy_hash(_policy_draft_hash_payload(model))
         record = ReviewedResponsePolicy(
             policy_id=policy_id,
             target_id=model.target_id,
@@ -160,7 +185,7 @@ class ResponsePolicyStore:
             raise ValueError("Reviewer identity must not be blank.")
         with self._lock:
             record = self.get(policy_id)
-            computed = canonical_policy_hash(record.draft.model_dump(mode="json"))
+            computed = canonical_policy_hash(_policy_draft_hash_payload(record.draft))
             if computed != record.revision_sha256 or computed != expected_revision_sha256:
                 raise ValueError("Policy revision mismatch; review rejected.")
             updated = record.model_copy(
@@ -187,7 +212,7 @@ class ResponsePolicyStore:
         record = self.get(policy_id)
         if record.review_status != "reviewed":
             raise ValueError(f"Policy '{policy_id}' has not been reviewed.")
-        computed = canonical_policy_hash(record.draft.model_dump(mode="json"))
+        computed = canonical_policy_hash(_policy_draft_hash_payload(record.draft))
         if computed != record.revision_sha256:
             raise ValueError(f"Policy '{policy_id}' revision integrity check failed.")
         if target_id is not None and record.target_id != target_id:
@@ -240,6 +265,20 @@ class ResponsePolicyStore:
             context["prohibited_command_behavior"] = verified.draft.prohibited_behavior
             context["asi05_policy_id"] = verified.policy_id
         return context
+
+    def reviewed_rules(self, policy: ReviewedResponsePolicy) -> list[EvaluationRule]:
+        """Return validated executable EvaluationRules from a cryptographically reviewed policy."""
+        verified = self.require_reviewed(policy.policy_id, target_id=policy.target_id)
+        if not verified.draft.evaluation_rules:
+            return []
+        validated, diagnostics = validate_evaluation_rules(
+            verified.draft.evaluation_rules,
+            evaluation_scope=verified.draft.evaluation_scope,
+        )
+        if diagnostics:
+            summary = "; ".join(f"{d.code}: {d.message}" for d in diagnostics)
+            raise ValueError(f"Reviewed policy '{verified.policy_id}' contains invalid rules: {summary}")
+        return validated
 
 
 def main(argv: list[str] | None = None) -> int:

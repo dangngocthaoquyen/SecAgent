@@ -472,6 +472,7 @@ class GenericRunService:
                     "target_model": extra.get("target_model"),
                     "required_capability": meta.get("required_capability") or extra.get("required_capability"),
                     "tool_name": meta.get("tool_name") or extra.get("tool_name"),
+                    "imported_assertions_count": len(tc.assertions) if isinstance(tc.assertions, list) else 0,
                     "source_provenance": prov_meta,
                     **(
                         {"historical_verdict": extra["historical_verdict"]}
@@ -506,6 +507,7 @@ class GenericRunService:
         target_id: str,
         norm_category: str,
         policy_id: str | None,
+        mode: str = "live",
     ) -> tuple[dict[str, Any] | None, Any | None, str | None]:
         if not self.pi_judge_ready():
             return None, None, "judge_provider_unavailable"
@@ -516,7 +518,53 @@ class GenericRunService:
             policy_id=policy_id,
             app_ctx_row=self._read_operator_app_context(target_id),
             current_target_revision=self._current_target_revision(target_id),
+            allow_generic_stored_fallback=(mode == "offline"),
         )
+
+    def _resolve_reviewed_policy_for_rule_only(
+        self,
+        *,
+        target_id: str,
+        norm_category: str,
+        policy_id: str | None,
+        mode: str = "live",
+    ) -> tuple[Any | None, str | None]:
+        """Resolve an optional cryptographically reviewed policy for rule-only execution.
+
+        Live targets strictly require policies reviewed for their exact target_id;
+        generic-stored-target fallback is permitted only in explicit offline mode.
+        """
+        if self.policy_store is None:
+            return (None, "policy_review_required") if policy_id else (None, None)
+        allow_fallback = mode == "offline"
+        allowed_targets = {target_id, "generic-stored-target"} if allow_fallback else {target_id}
+        if policy_id:
+            try:
+                rec = self.policy_store.get(policy_id)
+                if rec.target_id not in allowed_targets:
+                    return None, "policy_review_required"
+                reviewed = self.policy_store.require_reviewed(policy_id, target_id=rec.target_id)
+            except (FileNotFoundError, ValueError):
+                return None, "policy_review_required"
+            if reviewed.category != norm_category:
+                return None, "policy_category_mismatch"
+            return reviewed, None
+        candidates = [
+            p for p in self.policy_store.list_for_target(target_id, category=norm_category)
+            if p.review_status == "reviewed" and p.draft.evaluation_rules
+        ]
+        if not candidates and allow_fallback:
+            candidates = [
+                p for p in self.policy_store.list_for_target("generic-stored-target", category=norm_category)
+                if p.review_status == "reviewed" and p.draft.evaluation_rules
+            ]
+        if not candidates:
+            return None, None
+        chosen = candidates[-1]
+        try:
+            return self.policy_store.require_reviewed(chosen.policy_id, target_id=chosen.target_id), None
+        except ValueError:
+            return None, "policy_review_required"
 
     def _build_cases(
         self,
@@ -540,6 +588,7 @@ class GenericRunService:
                 target_id=target.id,
                 norm_category=fallback_norm_cat,
                 policy_id=policy_id,
+                mode=mode,
             )
 
         pairs: list[tuple[CoreTestCase, CoreTestInput]] = []
@@ -588,8 +637,12 @@ class GenericRunService:
 
             row_blocker: str | None = None
             trusted_context: dict[str, Any] | None = None
+            row_reviewed_policy: Any | None = None
+            row_reviewed_rules: list[Any] = []
             if not is_unsupported:
-                if row_cat is None:
+                if row.get("rules") or row.get("evaluation_rules"):
+                    row_blocker = "unreviewed_inline_rules_rejected"
+                elif row_cat is None:
                     row_blocker = "unmapped_asi_category"
                 elif use_judge:
                     if row_cat not in context_cache:
@@ -597,14 +650,21 @@ class GenericRunService:
                             target_id=target.id,
                             norm_category=row_cat,
                             policy_id=policy_id,
+                            mode=mode,
                         )
                     trusted_context, rev_pol, row_blocker = context_cache[row_cat]
+                    row_reviewed_policy = rev_pol
                     if rev_pol is not None:
                         reviewed_policies_seen[(rev_pol.policy_id, rev_pol.category, rev_pol.revision_sha256)] = {
                             "policy_id": rev_pol.policy_id,
                             "category": rev_pol.category,
                             "revision_sha256": rev_pol.revision_sha256,
                         }
+                        if self.policy_store is not None:
+                            try:
+                                row_reviewed_rules = self.policy_store.reviewed_rules(rev_pol)
+                            except ValueError:
+                                row_blocker = "invalid_evaluation_rule_contract"
                     if isinstance(trusted_context, dict):
                         ctx_prov = extract_context_provenance(trusted_context)
                         if ctx_prov["context_source"] != "none":
@@ -619,6 +679,28 @@ class GenericRunService:
                             }
                     if row_blocker is None and not self.pi_judge_ready():
                         row_blocker = "judge_provider_unavailable"
+                else:
+                    rev_pol, rule_blocker = self._resolve_reviewed_policy_for_rule_only(
+                        target_id=target.id,
+                        norm_category=row_cat,
+                        policy_id=policy_id,
+                        mode=mode,
+                    )
+                    if rule_blocker is not None:
+                        row_blocker = rule_blocker
+                    elif rev_pol is not None and self.policy_store is not None:
+                        row_reviewed_policy = rev_pol
+                        try:
+                            row_reviewed_rules = self.policy_store.reviewed_rules(rev_pol)
+                        except ValueError:
+                            row_blocker = "invalid_evaluation_rule_contract"
+                        else:
+                            reviewed_policies_seen[(rev_pol.policy_id, rev_pol.category, rev_pol.revision_sha256)] = {
+                                "policy_id": rev_pol.policy_id,
+                                "category": rev_pol.category,
+                                "revision_sha256": rev_pol.revision_sha256,
+                            }
+                            context_sources_seen.add("reviewed_policy")
 
                 if row_blocker and overall_blocker is None:
                     overall_blocker = row_blocker
@@ -633,6 +715,11 @@ class GenericRunService:
             if item_status == "ready":
                 effective_cat = row_cat or "tool_misuse"
                 active_ctx = trusted_context if (use_judge and trusted_context is not None and row_cat is not None) else None
+                imp_assert_cnt = (
+                    int(row.get("imported_assertions_count"))
+                    if isinstance(row.get("imported_assertions_count"), int)
+                    else (len(row["assertions"]) if isinstance(row.get("assertions"), list) else 0)
+                )
                 tc, ti = prepare_generic_case_pair(
                     mode=mode,  # type: ignore[arg-type]
                     target=target,
@@ -640,6 +727,10 @@ class GenericRunService:
                     norm_category=effective_cat,
                     prompt=prompt,
                     trusted_context=active_ctx,
+                    reviewed_rules=row_reviewed_rules,
+                    rule_origin="reviewed_policy" if row_reviewed_rules else "none",
+                    reviewed_policy=row_reviewed_policy,
+                    imported_assertions_count=imp_assert_cnt,
                     stored_response=stored_resp,
                     finish_reason=row.get("finish_reason"),
                     response_complete=row.get("response_complete"),
@@ -691,10 +782,26 @@ class GenericRunService:
         )
         has_app_only = "application_context" in context_sources_seen
         if not use_judge:
-            resolved_policy_id = None
-            resolved_policy_rev = None
-            resolved_policy_status = "not_required"
-            resolved_context_source = "none"
+            if overall_blocker is not None:
+                resolved_policy_id = policy_id
+                resolved_policy_rev = None
+                resolved_policy_status = "missing_or_draft"
+                resolved_context_source = "none"
+            elif len(reviewed_policies_list) == 1:
+                resolved_policy_id = reviewed_policies_list[0]["policy_id"]
+                resolved_policy_rev = reviewed_policies_list[0]["revision_sha256"]
+                resolved_policy_status = "reviewed"
+                resolved_context_source = "reviewed_policy"
+            elif len(reviewed_policies_list) > 1:
+                resolved_policy_id = None
+                resolved_policy_rev = None
+                resolved_policy_status = "mixed"
+                resolved_context_source = "mixed"
+            else:
+                resolved_policy_id = None
+                resolved_policy_rev = None
+                resolved_policy_status = "not_required"
+                resolved_context_source = "none"
         elif overall_blocker is not None:
             resolved_policy_id = reviewed_policies_list[0]["policy_id"] if len(reviewed_policies_list) == 1 and not has_app_only else policy_id
             resolved_policy_rev = reviewed_policies_list[0]["revision_sha256"] if len(reviewed_policies_list) == 1 and not has_app_only else None
@@ -1978,7 +2085,7 @@ def register_generic_runner_routes(app, ctx) -> None:
             payload = read_json(request.get_data())
             return jsonify(service.preview_run(payload))
         except (ValidationError, ValueError, json.JSONDecodeError) as exc:
-            code = str(exc) if str(exc).startswith(("generic_", "policy_", "judge_", "dataset_", "unmapped_", "application_context_", "unverified_")) else "generic_preview_invalid"
+            code = str(exc) if str(exc).startswith(("generic_", "policy_", "judge_", "dataset_", "unmapped_", "application_context_", "unverified_", "unreviewed_", "invalid_evaluation_rule_")) else "generic_preview_invalid"
             return fail(code, 400)
 
     @app.post("/api/testing/generic-runs/start")
@@ -1992,7 +2099,7 @@ def register_generic_runner_routes(app, ctx) -> None:
             status_code = 202 if payload.get("async_execution") is True and record.get("status") in {"preparing", "running"} else 201
             return jsonify(record), status_code
         except (ValidationError, ValueError, json.JSONDecodeError) as exc:
-            code = str(exc) if str(exc).startswith(("generic_", "policy_", "judge_", "dataset_", "unmapped_", "application_context_", "unverified_")) else "generic_run_rejected"
+            code = str(exc) if str(exc).startswith(("generic_", "policy_", "judge_", "dataset_", "unmapped_", "application_context_", "unverified_", "unreviewed_", "invalid_evaluation_rule_")) else "generic_run_rejected"
             status = 409 if code in {
                 "policy_review_required",
                 "policy_category_mismatch",
@@ -2000,6 +2107,8 @@ def register_generic_runner_routes(app, ctx) -> None:
                 "unmapped_asi_category",
                 "application_context_stale",
                 "unverified_discovery_metadata_rejected",
+                "unreviewed_inline_rules_rejected",
+                "invalid_evaluation_rule_contract",
                 "generic_no_executable_cases",
                 "generic_submission_conflict",
                 "generic_submission_in_progress",

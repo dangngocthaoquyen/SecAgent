@@ -23,12 +23,13 @@ from uuid import uuid4
 import yaml
 
 from attack_modules import BaseAttackModule, build_default_attack_module_registry
-from core.models import TargetProfile, TestCase, TestInput
+from core.models import EvaluationConfig, EvaluationRule, TargetProfile, TestCase, TestInput
 from core.models.execution import resolve_response_completeness
 from core.models.provenance import (
     build_case_research_provenance,
     summarize_run_research_provenance,
 )
+from evaluators.contract import RuleOrigin, validate_evaluation_rules
 from observers import EvidenceCollector
 from targets.adapters import (
     HttpTargetAdapter,
@@ -79,6 +80,7 @@ def build_blind_record_testcase(
     category_override: str | None = None,
     policy_store: ResponsePolicyStore | None = None,
     policy_id: str | None = None,
+    use_semantic: bool = True,
 ) -> tuple[TestCase, TestInput]:
     """Convert a Phase 1A BlindEvaluationRecord into a canonical TestCase + TestInput."""
     raw_cat = category_override or record.category
@@ -86,6 +88,7 @@ def build_blind_record_testcase(
         raise ValueError(f"Case '{record.case_id}' has no ASI category; specify category_override.")
     category = normalize_policy_category(raw_cat)
 
+    rule_prov_meta: dict[str, Any] = {"rule_origin": "none"}
     if policy_store is not None and policy_id is not None:
         expected_target = record.provenance.target_id
         reviewed = policy_store.require_reviewed(policy_id, target_id=expected_target)
@@ -93,19 +96,35 @@ def build_blind_record_testcase(
             raise ValueError(
                 f"Reviewed policy '{policy_id}' is for '{reviewed.category}', not '{category}'."
             )
-        context = policy_store.to_trusted_context(reviewed)
-        if category == "goal_hijacking":
-            context.setdefault("source_text", record.prompt)
-        evaluation_cfg: dict[str, Any] = {
-            "strategy": "semantic",
-            "rules": [],
-            "semantic": {
-                "enabled": True,
-                "skill": category,
-                "trusted_context": context,
-                "expected_labels": _SEMANTIC_LABELS_BY_CATEGORY[category],
-            },
+        reviewed_rules = policy_store.reviewed_rules(reviewed)
+        rule_prov_meta = {
+            "rule_origin": "reviewed_policy" if reviewed_rules else "none",
+            "reviewed_policy_id": reviewed.policy_id,
+            "reviewed_policy_revision_sha256": reviewed.revision_sha256,
+            "reviewed_policy_status": reviewed.review_status,
+            "evaluation_scope": reviewed.draft.evaluation_scope,
         }
+        if use_semantic:
+            context = policy_store.to_trusted_context(reviewed)
+            if category == "goal_hijacking":
+                context.setdefault("source_text", record.prompt)
+            evaluation_cfg: dict[str, Any] = {
+                "strategy": "hybrid" if reviewed_rules else "semantic",
+                "rules": [r.model_dump(mode="json") for r in reviewed_rules],
+                "semantic": {
+                    "enabled": True,
+                    "skill": category,
+                    "trusted_context": context,
+                    "expected_labels": _SEMANTIC_LABELS_BY_CATEGORY[category],
+                },
+            }
+        elif reviewed_rules:
+            evaluation_cfg = {
+                "strategy": "deterministic",
+                "rules": [r.model_dump(mode="json") for r in reviewed_rules],
+            }
+        else:
+            evaluation_cfg = {"strategy": "unavailable", "rules": []}
     else:
         evaluation_cfg = {"strategy": "unavailable", "rules": []}
 
@@ -126,6 +145,7 @@ def build_blind_record_testcase(
             "stored_record": record.model_dump(mode="json"),
             "request_id": record.response_id or record.case_id,
         },
+        metadata={"evaluation_rule_provenance": rule_prov_meta},
     )
     return tc, ti
 
@@ -414,14 +434,26 @@ def resolve_trusted_context_for_target_category(
     policy_id: str | None = None,
     app_ctx_row: dict[str, Any] | None = None,
     current_target_revision: str | None = None,
+    allow_generic_stored_fallback: bool = False,
 ) -> tuple[dict[str, Any] | None, Any | None, str | None]:
-    """Shared Web + CLI resolver for reviewed ResponsePolicyStore or operator-confirmed ApplicationContext."""
+    """Shared Web + CLI resolver for reviewed ResponsePolicyStore or operator-confirmed ApplicationContext.
+
+    Target boundary:
+    - By default (allow_generic_stored_fallback=False, required for all live targets),
+      a target may ONLY receive policies explicitly reviewed for its exact target_id.
+    - Explicit offline stored-response compatibility (allow_generic_stored_fallback=True)
+      permits falling back to policies reviewed for 'generic-stored-target' only.
+      Policies reviewed for any other named target are always rejected.
+    """
+    allowed_policy_targets = (
+        {target_id, "generic-stored-target"} if allow_generic_stored_fallback else {target_id}
+    )
     reviewed_policy = None
     if policy_store is not None:
         if policy_id:
             try:
                 rec = policy_store.get(policy_id)
-                if rec.target_id not in {target_id, "generic-stored-target"}:
+                if rec.target_id not in allowed_policy_targets:
                     return None, None, "policy_review_required"
                 reviewed_policy = policy_store.require_reviewed(policy_id, target_id=rec.target_id)
             except (FileNotFoundError, ValueError):
@@ -433,7 +465,7 @@ def resolve_trusted_context_for_target_category(
                 p for p in policy_store.list_for_target(target_id, category=norm_category)
                 if p.review_status == "reviewed"
             ]
-            if not candidates:
+            if not candidates and allow_generic_stored_fallback:
                 candidates = [
                     p for p in policy_store.list_for_target("generic-stored-target", category=norm_category)
                     if p.review_status == "reviewed"
@@ -577,6 +609,11 @@ def prepare_generic_case_pair(
     norm_category: str,
     prompt: str,
     trusted_context: dict[str, Any] | None = None,
+    reviewed_rules: Sequence[EvaluationRule | dict[str, Any]] | None = None,
+    rule_origin: RuleOrigin | None = None,
+    reviewed_policy: Any | None = None,
+    evaluation_strategy: Literal["deterministic", "action", "semantic", "hybrid", "unavailable"] | None = None,
+    imported_assertions_count: int = 0,
     stored_response: str | None = None,
     finish_reason: str | None = None,
     response_complete: bool | None = None,
@@ -590,13 +627,30 @@ def prepare_generic_case_pair(
     repository_root: Path = ROOT,
 ) -> tuple[TestCase, TestInput]:
     """Unified TestCase + TestInput builder shared by Web GenericRunService and CLI generic_runner."""
+    eval_scope: str | None = None
+    if isinstance(trusted_context, dict) and isinstance(trusted_context.get("evaluation_scope"), str):
+        eval_scope = trusted_context["evaluation_scope"]
+    elif reviewed_policy is not None and hasattr(reviewed_policy, "draft"):
+        eval_scope = getattr(reviewed_policy.draft, "evaluation_scope", None)
+
+    validated_rules: list[EvaluationRule] = []
+    if reviewed_rules:
+        validated_rules, diagnostics = validate_evaluation_rules(
+            reviewed_rules,
+            evaluation_scope=eval_scope,
+        )
+        if diagnostics:
+            summary = "; ".join(f"{d.code}: {d.message}" for d in diagnostics)
+            raise ValueError(f"invalid_evaluation_rule_contract: {summary}")
+
+    serialized_rules = [r.model_dump(mode="json") for r in validated_rules]
     if trusted_context is not None:
         ctx = {**trusted_context}
         if norm_category == "goal_hijacking":
             ctx.setdefault("source_text", prompt)
         eval_cfg: dict[str, Any] = {
-            "strategy": "semantic",
-            "rules": [],
+            "strategy": evaluation_strategy or ("hybrid" if serialized_rules else "semantic"),
+            "rules": serialized_rules,
             "semantic": {
                 "enabled": True,
                 "skill": norm_category,
@@ -604,8 +658,29 @@ def prepare_generic_case_pair(
                 "expected_labels": _SEMANTIC_LABELS_BY_CATEGORY[norm_category],
             },
         }
+    elif serialized_rules:
+        eval_cfg = {
+            "strategy": evaluation_strategy or "deterministic",
+            "rules": serialized_rules,
+        }
     else:
         eval_cfg = {"strategy": "unavailable", "rules": []}
+
+    effective_origin: RuleOrigin = (
+        rule_origin
+        if rule_origin is not None
+        else ("reviewed_policy" if (serialized_rules and reviewed_policy is not None) else ("native_testcase" if serialized_rules else "none"))
+    )
+    rule_prov_meta: dict[str, Any] = {
+        "rule_origin": effective_origin,
+        "imported_assertions_non_executable_count": max(0, int(imported_assertions_count or 0)),
+    }
+    if reviewed_policy is not None:
+        rule_prov_meta["reviewed_policy_id"] = getattr(reviewed_policy, "policy_id", None)
+        rule_prov_meta["reviewed_policy_revision_sha256"] = getattr(reviewed_policy, "revision_sha256", None)
+        rule_prov_meta["reviewed_policy_status"] = getattr(reviewed_policy, "review_status", None)
+        if eval_scope is not None:
+            rule_prov_meta["evaluation_scope"] = eval_scope
 
     if mode == "live":
         variables: dict[str, Any] = {"untrusted_source_prompt": prompt}
@@ -630,7 +705,8 @@ def prepare_generic_case_pair(
         params = {**ti.parameters, "request_id": response_id or case_id}
         if isinstance(required_capability, str) and required_capability.strip():
             params["required_capability"] = required_capability.strip()
-        ti = ti.model_copy(update={"parameters": params})
+        meta = {**ti.metadata, "evaluation_rule_provenance": rule_prov_meta}
+        ti = ti.model_copy(update={"parameters": params, "metadata": meta})
         return bound_tc, ti
 
     if not isinstance(stored_response, str):
@@ -684,7 +760,12 @@ def prepare_generic_case_pair(
     }
     if isinstance(required_capability, str) and required_capability.strip():
         params["required_capability"] = required_capability.strip()
-    ti = TestInput(id=f"offline-{case_id}-{uuid4().hex[:8]}", prompt=prompt, parameters=params)
+    ti = TestInput(
+        id=f"offline-{case_id}-{uuid4().hex[:8]}",
+        prompt=prompt,
+        parameters=params,
+        metadata={"evaluation_rule_provenance": rule_prov_meta},
+    )
     return tc, ti
 
 
@@ -764,18 +845,30 @@ def build_live_case_and_input(
         trusted_ctx = policy_store.to_trusted_context(reviewed)
         if norm_cat == "goal_hijacking":
             trusted_ctx.setdefault("source_text", test_input.prompt or "")
+        policy_rules = policy_store.reviewed_rules(reviewed)
+        combined_rules = list(bound_tc.evaluation.rules) + list(policy_rules)
+        if combined_rules:
+            validated_combined, diags = validate_evaluation_rules(
+                combined_rules,
+                evaluation_scope=reviewed.draft.evaluation_scope,
+            )
+            if diags:
+                summary = "; ".join(f"{d.code}: {d.message}" for d in diags)
+                raise ValueError(f"invalid_evaluation_rule_contract: {summary}")
+        else:
+            validated_combined = []
         updates: dict[str, Any] = {
             "category": norm_cat,
-            "evaluation": {
-                "strategy": "semantic",
-                "rules": [],
+            "evaluation": EvaluationConfig.model_validate({
+                "strategy": "hybrid" if validated_combined else "semantic",
+                "rules": [r.model_dump(mode="json") for r in validated_combined],
                 "semantic": {
                     "enabled": True,
                     "skill": norm_cat,
                     "trusted_context": trusted_ctx,
                     "expected_labels": _SEMANTIC_LABELS_BY_CATEGORY[norm_cat],
                 },
-            },
+            }),
         }
         # Allow response-only live runs for ASI03/ASI05 when operator explicitly uses a response-first policy without action env.
         if (
@@ -965,15 +1058,22 @@ def main(argv: list[str] | None = None) -> int:
                     if not raw_cat:
                         raise ValueError(f"Case '{rec.case_id}' has no ASI category; specify --category.")
                     norm_cat = normalize_policy_category(raw_cat)
-                    trusted_ctx, _, blocker = resolve_trusted_context_for_target_category(
+                    trusted_ctx, rev_pol, blocker = resolve_trusted_context_for_target_category(
                         target_id=target.id,
                         norm_category=norm_cat,
                         policy_store=policy_store,
                         policy_id=args.policy_id,
                         app_ctx_row=app_ctx_row,
+                        allow_generic_stored_fallback=True,
                     )
                     if blocker:
                         raise ValueError(blocker)
+                    rev_rules = (
+                        policy_store.reviewed_rules(rev_pol)
+                        if (policy_store is not None and rev_pol is not None)
+                        else []
+                    )
+                    effective_ctx = trusted_ctx if args.use_judge else None
                     cases.append(
                         prepare_generic_case_pair(
                             mode="offline",
@@ -981,7 +1081,10 @@ def main(argv: list[str] | None = None) -> int:
                             case_id=rec.case_id,
                             norm_category=norm_cat,
                             prompt=rec.prompt,
-                            trusted_context=trusted_ctx,
+                            trusted_context=effective_ctx,
+                            reviewed_rules=rev_rules,
+                            rule_origin="reviewed_policy" if rev_rules else "none",
+                            reviewed_policy=rev_pol,
                             stored_response=rec.stored_response,
                             finish_reason=rec.finish_reason,
                             response_complete=rec.response_complete,
@@ -1044,23 +1147,33 @@ def main(argv: list[str] | None = None) -> int:
                     raise ValueError(f"Case '{item.testcase_id}' has unmapped ASI category; pass --category or metadata.asi_category.")
                 norm_cat = normalize_policy_category(eff_cat_raw)
                 trusted_ctx = None
+                rev_pol = None
+                rev_rules: list[EvaluationRule] = []
                 if policy_store is not None or app_ctx_row is not None:
-                    trusted_ctx, _, blocker = resolve_trusted_context_for_target_category(
+                    trusted_ctx, rev_pol, blocker = resolve_trusted_context_for_target_category(
                         target_id=target.id,
                         norm_category=norm_cat,
                         policy_store=policy_store,
                         policy_id=args.policy_id,
                         app_ctx_row=app_ctx_row,
+                        allow_generic_stored_fallback=False,
                     )
                     if blocker and (args.use_judge or args.policy_id or app_ctx_row is not None):
                         raise ValueError(blocker)
+                    if policy_store is not None and rev_pol is not None:
+                        rev_rules = policy_store.reviewed_rules(rev_pol)
+                effective_ctx = trusted_ctx if args.use_judge else None
                 b_tc, b_ti = prepare_generic_case_pair(
                     mode="live",
                     target=target,
                     case_id=item.testcase_id,
                     norm_category=norm_cat,
                     prompt=item.prompt,
-                    trusted_context=trusted_ctx,
+                    trusted_context=effective_ctx,
+                    reviewed_rules=rev_rules,
+                    rule_origin="reviewed_policy" if rev_rules else "none",
+                    reviewed_policy=rev_pol,
+                    imported_assertions_count=len(item.assertions) if isinstance(item.assertions, list) else 0,
                     environment=env_ctx,
                     repository_root=repo_root,
                 )

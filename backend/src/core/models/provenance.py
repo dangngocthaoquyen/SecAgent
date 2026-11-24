@@ -331,12 +331,16 @@ def build_case_research_provenance(
     target_revision_sha256: str | None = None,
     dataset_metadata: Mapping[str, Any] | None = None,
     sent_payload_sha256: str | None = None,
+    deterministic_result: Mapping[str, Any] | None = None,
+    final_result: Any = None,
 ) -> dict[str, Any]:
     """Build sanitized, per-case research provenance metadata for a Native Report."""
+    from evaluators.contract import is_rule_applicable_to_scope
+
     ctx_prov = extract_context_provenance(trusted_context)
     adapter = _safe_str(getattr(getattr(target, "interface", None), "adapter", None))
 
-    # Gather dataset provenance from test_input parameters/metadata + optional explicit override.
+    # Gather dataset & rule provenance from test_input parameters/metadata + optional explicit override.
     ds_meta: dict[str, Any] = {}
     ti_params = getattr(test_input, "parameters", None)
     if isinstance(ti_params, Mapping):
@@ -344,10 +348,80 @@ def build_case_research_provenance(
         if isinstance(stored_rec, Mapping) and isinstance(stored_rec.get("provenance"), Mapping):
             ds_meta.update(stored_rec["provenance"])
     ti_meta = getattr(test_input, "metadata", None)
+    rule_prov_meta = (
+        ti_meta.get("evaluation_rule_provenance")
+        if isinstance(ti_meta, Mapping) and isinstance(ti_meta.get("evaluation_rule_provenance"), Mapping)
+        else {}
+    )
     if isinstance(ti_meta, Mapping) and isinstance(ti_meta.get("research_dataset_provenance"), Mapping):
         ds_meta.update(ti_meta["research_dataset_provenance"])
     if isinstance(dataset_metadata, Mapping):
         ds_meta.update(dataset_metadata)
+
+    # Preserve reviewed-policy provenance even in rule-only mode (where trusted_context is empty).
+    if ctx_prov["context_source"] == "none" and rule_prov_meta.get("reviewed_policy_id"):
+        ctx_prov["context_source"] = "reviewed_policy"
+        ctx_prov["reviewed_policy_id"] = _safe_str(rule_prov_meta.get("reviewed_policy_id"))
+        ctx_prov["reviewed_policy_revision_sha256"] = _safe_sha256(
+            rule_prov_meta.get("reviewed_policy_revision_sha256")
+        )
+        ctx_prov["reviewed_policy_status"] = _safe_str(rule_prov_meta.get("reviewed_policy_status")) or "reviewed"
+        if ctx_prov["evaluation_scope"] is None:
+            ctx_prov["evaluation_scope"] = _safe_str(rule_prov_meta.get("evaluation_scope"))
+
+    # Configured, applicable, and matched rule provenance (distinct from Judge invocation).
+    tc_eval = getattr(testcase, "evaluation", None)
+    raw_rules = list(getattr(tc_eval, "rules", None) or [])
+    configured_rules: list[dict[str, Any]] = []
+    applicable_rule_ids: list[str] = []
+    eval_scope = ctx_prov.get("evaluation_scope")
+    for rule in raw_rules:
+        r_id = _safe_str(getattr(rule, "id", None))
+        r_type = _safe_str(getattr(rule, "type", None))
+        raw_verdict = getattr(rule, "verdict", None)
+        r_verdict = getattr(raw_verdict, "value", raw_verdict)
+        if r_id and r_type:
+            configured_rules.append({
+                "id": r_id,
+                "type": r_type,
+                "verdict": _safe_str(r_verdict),
+            })
+            if is_rule_applicable_to_scope(r_type, eval_scope):
+                applicable_rule_ids.append(r_id)
+
+    explicit_origin = _safe_str(rule_prov_meta.get("rule_origin"))
+    if explicit_origin in {"native_testcase", "reviewed_policy", "none"}:
+        rule_origin = explicit_origin
+    elif configured_rules:
+        rule_origin = "reviewed_policy" if ctx_prov.get("reviewed_policy_id") else "native_testcase"
+    else:
+        rule_origin = "none"
+
+    det_verdict: str | None = None
+    det_matched_id: str | None = None
+    det_matched_type: str | None = None
+    if isinstance(deterministic_result, Mapping):
+        det_verdict = _safe_str(deterministic_result.get("status"))
+        det_matched_id = _safe_str(deterministic_result.get("matched_rule_id"))
+        det_matched_type = _safe_str(deterministic_result.get("matched_rule_type"))
+
+    eff_verdict: str | None = None
+    final_matched_id: str | None = None
+    final_matched_type: str | None = None
+    if final_result is not None:
+        raw_status = getattr(final_result, "status", None)
+        eff_verdict = _safe_str(getattr(raw_status, "value", raw_status))
+        final_matched_id = _safe_str(getattr(final_result, "matched_rule_id", None))
+        final_matched_type = _safe_str(getattr(final_result, "matched_rule_type", None))
+
+    matched_rule_id = final_matched_id or det_matched_id
+    matched_rule_type = final_matched_type or det_matched_type
+    imported_assertions_count = (
+        int(rule_prov_meta["imported_assertions_non_executable_count"])
+        if isinstance(rule_prov_meta.get("imported_assertions_non_executable_count"), int)
+        and rule_prov_meta["imported_assertions_non_executable_count"] >= 0
+        else 0
+    )
 
     # Actual Judge metadata ONLY when Judge was actually invoked for this case.
     semantic_invoked = bool(diagnostic.get("semantic_invoked")) if isinstance(diagnostic, Mapping) else False
@@ -396,6 +470,14 @@ def build_case_research_provenance(
             "evaluation_strategy": _safe_str(evaluation_strategy),
             "semantic_enabled": bool(semantic_enabled),
             **ctx_prov,
+            "rule_origin": rule_origin,
+            "configured_rules": configured_rules,
+            "applicable_rule_ids": applicable_rule_ids,
+            "matched_rule_id": matched_rule_id,
+            "matched_rule_type": matched_rule_type,
+            "deterministic_verdict": det_verdict,
+            "effective_verdict": eff_verdict,
+            "imported_assertions_non_executable_count": imported_assertions_count,
         },
         "judge": judge_block,
         "normalization": {

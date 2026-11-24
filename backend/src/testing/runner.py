@@ -321,6 +321,9 @@ class Runner:
                         diagnostic[key]["evidence"] = None
         semantic = testcase.evaluation.semantic
         context = semantic.trusted_context if semantic else {}
+        deterministic_snapshot = diagnostic["deterministic_result"] if diagnostic else (
+            final if not self._custom_evaluator and observed is not None
+            and self._evaluation_config.mode == "rule_only" else None)
         report = {
             "run_id": self._current_run_id or uuid4().hex, "timestamp": datetime.now(timezone.utc).isoformat(),
             "target_id": getattr(target, "id", None), "target_name": getattr(target, "name", None), "testcase_id": testcase.id,
@@ -346,9 +349,7 @@ class Runner:
                     "success": item.success, "reference": item.reference,
                     "data": public_evidence_data(item)} for item in observed.evidence]},
             "collector_diagnostics": [asdict(item) for item in self._collector_diagnostics],
-            "deterministic_result": diagnostic["deterministic_result"] if diagnostic else (
-                final if not self._custom_evaluator and observed is not None
-                and self._evaluation_config.mode == "rule_only" else None),
+            "deterministic_result": deterministic_snapshot,
             "judge": diagnostic,
             "final_result": final, "final_verdict": result.status.value,
             "evidence_classification": None if observed is None else classify_observation_evidence(
@@ -366,6 +367,8 @@ class Runner:
                 evidence=observed.evidence if observed is not None else None,
                 judge_provider_name=self._judge_provider_name,
                 judge_model_name=self._judge_model_name,
+                deterministic_result=deterministic_snapshot,
+                final_result=result,
             ),
             "downgrade_reason": diagnostic["downgrade_reason"] if diagnostic else None,
             "judge_budget": None if self._budget is None else {
