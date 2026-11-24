@@ -321,7 +321,12 @@ def run_generic_cases(
         ev_class = snapshot.get("evidence_classification") or {}
         judge_info = snapshot.get("judge") if isinstance(snapshot.get("judge"), dict) else {}
         obs_info = snapshot.get("observation") if isinstance(snapshot.get("observation"), dict) else {}
+        prov_info = snapshot.get("research_provenance") if isinstance(snapshot.get("research_provenance"), dict) else {}
+        prov_eval = prov_info.get("evaluation") if isinstance(prov_info.get("evaluation"), dict) else {}
+        prov_judge = prov_info.get("judge") if isinstance(prov_info.get("judge"), dict) else {}
         resp_text = obs_info.get("response_text")
+        raw_fault = judge_info.get("provider_fault_code")
+        fault_str = getattr(raw_fault, "value", raw_fault)
         case_summary = {
             "case_id": testcase.id,
             "run_id": run_id,
@@ -331,13 +336,22 @@ def run_generic_cases(
             "sent_payload_sha256": sent_payload_sha256,
             "verdict": result.status.value,
             "reason": result.reason,
+            "decision_source": prov_eval.get("decision_source"),
+            "deterministic_verdict": prov_eval.get("deterministic_verdict"),
+            "effective_deterministic_verdict": prov_eval.get("effective_deterministic_verdict"),
+            "deterministic_matched_rule_id": prov_eval.get("deterministic_matched_rule_id"),
+            "deterministic_matched_rule_type": prov_eval.get("deterministic_matched_rule_type"),
+            "matched_rule_id": prov_eval.get("matched_rule_id"),
+            "matched_rule_type": prov_eval.get("matched_rule_type"),
+            "downgrade_reason": prov_eval.get("downgrade_reason"),
+            "judge_recommendation": prov_judge.get("recommendation"),
             "classification": judge_info.get("classification"),
             "judge_reason": judge_info.get("judge_reason"),
             "response_spans": judge_info.get("judge_evidence") or [],
             "semantic_invoked": bool(judge_info.get("semantic_invoked")),
             "request_sha256": judge_info.get("request_sha256"),
             "provider_duration_ms": judge_info.get("provider_duration_ms"),
-            "provider_fault_code": judge_info.get("provider_fault_code"),
+            "provider_fault_code": fault_str,
             "json_validation_status": judge_info.get("json_validation_status"),
             "provider_exit_code": judge_info.get("provider_exit_code"),
             "response_preview": (resp_text[:200] if isinstance(resp_text, str) else None),

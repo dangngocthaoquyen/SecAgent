@@ -1058,10 +1058,12 @@ class GenericRunService:
             if not isinstance(c, dict):
                 continue
             invoked = c.get("semantic_invoked")
-            fault = c.get("provider_fault_code")
+            raw_fault = c.get("provider_fault_code")
+            fault = getattr(raw_fault, "value", raw_fault)
             val_status = c.get("json_validation_status")
             has_judge_output = bool(c.get("judge_classification") or c.get("judge_reason"))
-            if invoked is True or bool(fault):
+            blocked_fault = fault in {"budget_exhausted", "judge_disabled", "skill_unavailable", "skill_mismatch"}
+            if invoked is True or (bool(fault) and not blocked_fault):
                 attempted += 1
                 if fault or val_status == "provider_fault":
                     failed += 1
@@ -1071,6 +1073,8 @@ class GenericRunService:
                 else:
                     failed += 1
                     errors.add(str(val_status or "invalid_judge_output"))
+            elif blocked_fault:
+                errors.add(str(fault))
             elif has_judge_output:
                 unverified_output_count += 1
         if run_status in {"preparing", "running"} and attempted == 0:
@@ -1572,6 +1576,9 @@ class GenericRunService:
                     hist_verdict = pair_ti.metadata.get("isolated_historical_verdict") if pair_ti is not None else None
                     exec_status = "succeeded" if exec_block.get("success") else "failed" if exec_block else "skipped"
                     ev_level = item.get("evidence_level")
+                    prov_block = ev_block.get("research_provenance") if isinstance(ev_block.get("research_provenance"), dict) else {}
+                    prov_eval = prov_block.get("evaluation") if isinstance(prov_block.get("evaluation"), dict) else {}
+                    prov_judge = prov_block.get("judge") if isinstance(prov_block.get("judge"), dict) else {}
                     enriched_case = _sanitize_for_api({
                         "case_id": item["case_id"],
                         "run_id": item["run_id"],
@@ -1581,10 +1588,23 @@ class GenericRunService:
                         "response_complete": obs_block.get("response_complete"),
                         "verdict": item["verdict"],
                         "reason": item["reason"],
+                        "decision_source": prov_eval.get("decision_source"),
+                        "deterministic_verdict": prov_eval.get("deterministic_verdict"),
+                        "effective_deterministic_verdict": prov_eval.get("effective_deterministic_verdict"),
+                        "deterministic_matched_rule_id": prov_eval.get("deterministic_matched_rule_id"),
+                        "deterministic_matched_rule_type": prov_eval.get("deterministic_matched_rule_type"),
+                        "matched_rule_id": prov_eval.get("matched_rule_id"),
+                        "matched_rule_type": prov_eval.get("matched_rule_type"),
+                        "downgrade_reason": prov_eval.get("downgrade_reason"),
+                        "judge_recommendation": prov_judge.get("recommendation"),
                         "judge_reason": judge_block.get("judge_reason"),
                         "judge_classification": judge_block.get("classification"),
                         "semantic_invoked": bool(judge_block.get("semantic_invoked")),
-                        "provider_fault_code": judge_block.get("provider_fault_code"),
+                        "provider_fault_code": getattr(
+                            judge_block.get("provider_fault_code"),
+                            "value",
+                            judge_block.get("provider_fault_code"),
+                        ),
                         "json_validation_status": judge_block.get("json_validation_status"),
                         "provider_duration_ms": judge_block.get("provider_duration_ms"),
                         "evidence_level": ev_level,

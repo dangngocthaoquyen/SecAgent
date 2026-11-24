@@ -21,6 +21,7 @@ from core.models import (
     TestInput,
 )
 from evaluators import BaseEvaluator
+from evaluators.hybrid_evaluator import apply_heuristic_sufficiency
 from core.models.evidence import classify_observation_evidence, public_evidence_data
 from core.models.provenance import build_case_research_provenance
 from observers import (
@@ -94,6 +95,8 @@ class Runner:
         self._started_at: str | None = None
         self._ended_at: str | None = None
         self._submitted_prompt: str | None = None
+        self._raw_deterministic_result: EvaluationResult | None = None
+        self._effective_deterministic_result: EvaluationResult | None = None
         self.last_report = None
         self._attack_module_registry = (
             attack_module_registry
@@ -111,6 +114,7 @@ class Runner:
         self._diagnostics.clear()
         self._collector_diagnostics.clear()
         self._execution_result = self._observation = None
+        self._raw_deterministic_result = self._effective_deterministic_result = None
         self._current_run_id = uuid4().hex
         self._started_at = datetime.now(timezone.utc).isoformat()
         self._ended_at = None
@@ -222,6 +226,13 @@ class Runner:
             )
 
         try:
+            rule_prov = (
+                test_input.metadata.get("evaluation_rule_provenance")
+                if isinstance(test_input.metadata, dict)
+                and isinstance(test_input.metadata.get("evaluation_rule_provenance"), dict)
+                else {}
+            )
+            is_reviewed_policy_rules = rule_prov.get("rule_origin") == "reviewed_policy"
             if self._progress_sink is not None and not self._custom_evaluator and self._evaluation_config.mode == "rule_only":
                 self._progress_sink("running_rule_evaluator")
             if not self._custom_evaluator and self._evaluation_config.mode == "hybrid":
@@ -229,29 +240,56 @@ class Runner:
                     prepared_prompt=(prepared_prompt if self._reviewed_judge_input_sha256 else None),
                     reviewed_input_sha256=self._reviewed_judge_input_sha256,
                     sensitive_values=self._judge_sensitive_values(target))
+                if is_reviewed_policy_rules and not (testcase.evaluation.semantic and testcase.evaluation.semantic.enabled):
+                    evaluated = apply_heuristic_sufficiency(testcase, evaluated)
             else:
-                evaluated = self._evaluator.evaluate(testcase, observation)
+                raw_evaluated = self._evaluator.evaluate(testcase, observation)
+                if not self._custom_evaluator and self._evaluation_config.mode == "rule_only":
+                    self._raw_deterministic_result = raw_evaluated
+                evaluated = (
+                    apply_heuristic_sufficiency(testcase, raw_evaluated)
+                    if (
+                        not self._custom_evaluator
+                        and self._evaluation_config.mode == "rule_only"
+                        and is_reviewed_policy_rules
+                    )
+                    else raw_evaluated
+                )
+            final_evaluated = evaluated
             if (self._require_complete_response_for_pass
-                    and evaluated.status is EvaluationStatus.PASS
+                    and final_evaluated.status is EvaluationStatus.PASS
                     and observation.metadata.get("response_complete") is not True):
-                return EvaluationResult(status=EvaluationStatus.INCONCLUSIVE,
-                    reason="Response-only PASS requires a complete observed response.")
+                verified_exec_pass = (
+                    final_evaluated.matched_rule_type == "asi05_execution"
+                    or (
+                        final_evaluated.matched_rule_type == "tool_call"
+                        and observation.metadata.get("response_complete") is not False
+                        and classify_observation_evidence(
+                            observation.evidence, observation.response_text
+                        ).get("verified_execution_present") is True
+                    )
+                )
+                if not verified_exec_pass:
+                    final_evaluated = EvaluationResult(status=EvaluationStatus.INCONCLUSIVE,
+                        reason="Response-only PASS requires a complete observed response.")
             if (self._require_complete_response_for_fail
-                    and evaluated.status is EvaluationStatus.FAIL
+                    and final_evaluated.status is EvaluationStatus.FAIL
                     and observation.metadata.get("response_complete") is not True):
                 verified_exec_fail = (
-                    evaluated.matched_rule_type in {"collector_receipt", "asi05_execution"}
+                    final_evaluated.matched_rule_type in {"collector_receipt", "asi05_execution"}
                     or (
-                        evaluated.matched_rule_type == "tool_call"
+                        final_evaluated.matched_rule_type == "tool_call"
                         and classify_observation_evidence(
                             observation.evidence, observation.response_text
                         ).get("verified_execution_present") is True
                     )
                 )
                 if not verified_exec_fail:
-                    return EvaluationResult(status=EvaluationStatus.INCONCLUSIVE,
+                    final_evaluated = EvaluationResult(status=EvaluationStatus.INCONCLUSIVE,
                         reason="Response-only FAIL requires a complete observed response.")
-            return evaluated
+            if not self._custom_evaluator and self._evaluation_config.mode == "rule_only":
+                self._effective_deterministic_result = final_evaluated
+            return final_evaluated
         except Exception:
             return EvaluationResult(
                 status=EvaluationStatus.ERROR,
@@ -321,9 +359,54 @@ class Runner:
                         diagnostic[key]["evidence"] = None
         semantic = testcase.evaluation.semantic
         context = semantic.trusted_context if semantic else {}
-        deterministic_snapshot = diagnostic["deterministic_result"] if diagnostic else (
-            final if not self._custom_evaluator and observed is not None
-            and self._evaluation_config.mode == "rule_only" else None)
+        if diagnostic is not None:
+            deterministic_snapshot = diagnostic["deterministic_result"]
+            effective_deterministic_snapshot = diagnostic.get("effective_deterministic_result")
+            if (
+                not diagnostic.get("semantic_invoked")
+                and isinstance(effective_deterministic_snapshot, dict)
+                and effective_deterministic_snapshot.get("status") in {"PASS", "FAIL"}
+                and final.get("status") == "INCONCLUSIVE"
+            ):
+                effective_deterministic_snapshot = final
+        elif (
+            not self._custom_evaluator
+            and observed is not None
+            and self._evaluation_config.mode == "rule_only"
+        ):
+            raw_det = self._raw_deterministic_result
+            eff_det = self._effective_deterministic_result
+            deterministic_snapshot = raw_det.model_dump(mode="json") if raw_det is not None else dict(final)
+            effective_deterministic_snapshot = eff_det.model_dump(mode="json") if eff_det is not None else dict(final)
+            if executed is not None and not executed.success:
+                for snap in (deterministic_snapshot, effective_deterministic_snapshot):
+                    snap["reason"] = final["reason"]
+                    snap["evidence"] = None
+        else:
+            deterministic_snapshot = None
+            effective_deterministic_snapshot = None
+        research_prov = build_case_research_provenance(
+            testcase=testcase,
+            target=target,
+            test_input=test_input,
+            evaluation_mode="custom" if self._custom_evaluator else self._evaluation_config.mode,
+            evaluation_strategy=testcase.evaluation.strategy,
+            semantic_enabled=bool(semantic and semantic.enabled),
+            trusted_context=context,
+            diagnostic=diagnostic,
+            evidence=observed.evidence if observed is not None else None,
+            judge_provider_name=self._judge_provider_name,
+            judge_model_name=self._judge_model_name,
+            deterministic_result=deterministic_snapshot,
+            effective_deterministic_result=effective_deterministic_snapshot,
+            final_result=result,
+            execution_success=(executed.success if executed is not None else None),
+        )
+        top_downgrade_reason = (
+            diagnostic["downgrade_reason"]
+            if diagnostic and diagnostic.get("downgrade_reason")
+            else research_prov["evaluation"]["downgrade_reason"]
+        )
         report = {
             "run_id": self._current_run_id or uuid4().hex, "timestamp": datetime.now(timezone.utc).isoformat(),
             "target_id": getattr(target, "id", None), "target_name": getattr(target, "name", None), "testcase_id": testcase.id,
@@ -355,22 +438,8 @@ class Runner:
             "evidence_classification": None if observed is None else classify_observation_evidence(
                 observed.evidence, observed.response_text
             ),
-            "research_provenance": build_case_research_provenance(
-                testcase=testcase,
-                target=target,
-                test_input=test_input,
-                evaluation_mode="custom" if self._custom_evaluator else self._evaluation_config.mode,
-                evaluation_strategy=testcase.evaluation.strategy,
-                semantic_enabled=bool(semantic and semantic.enabled),
-                trusted_context=context,
-                diagnostic=diagnostic,
-                evidence=observed.evidence if observed is not None else None,
-                judge_provider_name=self._judge_provider_name,
-                judge_model_name=self._judge_model_name,
-                deterministic_result=deterministic_snapshot,
-                final_result=result,
-            ),
-            "downgrade_reason": diagnostic["downgrade_reason"] if diagnostic else None,
+            "research_provenance": research_prov,
+            "downgrade_reason": top_downgrade_reason,
             "judge_budget": None if self._budget is None else {
                 "enabled": self._evaluation_config.judge_enabled,
                 "allow_live": self._evaluation_config.allow_live_judge,

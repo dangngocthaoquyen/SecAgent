@@ -16,7 +16,12 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from core.models.evaluation import EvaluationRule
-from evaluators.contract import validate_evaluation_rules
+from evaluators.contract import (
+    RESPONSE_ONLY_SCOPES,
+    TOOL_CALL_TRACE_SCOPES,
+    validate_evaluation_rules,
+    validate_evaluation_scope,
+)
 
 
 PolicyCategory = Literal[
@@ -67,6 +72,36 @@ def normalize_policy_category(raw: str) -> PolicyCategory:
     return mapped
 
 
+def _validate_extra_rules_trace_scope(evaluation_scope: str, extra_rules: dict[str, Any]) -> None:
+    if "required_trace_scope" not in extra_rules or extra_rules["required_trace_scope"] is None:
+        return
+    raw_req = extra_rules["required_trace_scope"]
+    if not isinstance(raw_req, str) or not raw_req.strip():
+        raise ValueError("trace_scope_mismatch: extra_rules.required_trace_scope must be a non-empty string.")
+    validated_req, scope_err = validate_evaluation_scope(raw_req)
+    if scope_err is not None or validated_req is None:
+        raise ValueError(
+            f"Invalid extra_rules.required_trace_scope: "
+            f"{scope_err.code if scope_err else 'invalid_scope'}: "
+            f"{scope_err.message if scope_err else raw_req!r}"
+        )
+    if evaluation_scope in RESPONSE_ONLY_SCOPES:
+        raise ValueError(
+            f"trace_scope_mismatch: response-only evaluation_scope={evaluation_scope!r} "
+            f"cannot specify extra_rules.required_trace_scope={validated_req!r}."
+        )
+    if validated_req not in TOOL_CALL_TRACE_SCOPES:
+        raise ValueError(
+            f"trace_scope_mismatch: extra_rules.required_trace_scope={validated_req!r} "
+            f"must be one of {sorted(TOOL_CALL_TRACE_SCOPES)}."
+        )
+    if evaluation_scope in TOOL_CALL_TRACE_SCOPES and validated_req != evaluation_scope:
+        raise ValueError(
+            f"trace_scope_mismatch: extra_rules.required_trace_scope={validated_req!r} "
+            f"contradicts evaluation_scope={evaluation_scope!r}."
+        )
+
+
 class ResponsePolicyDraft(BaseModel):
     """Target-scoped operator-authored policy fields prior to cryptographic freeze."""
 
@@ -91,6 +126,7 @@ class ResponsePolicyDraft(BaseModel):
 
     @model_validator(mode="after")
     def _validate_evaluation_rules(self) -> "ResponsePolicyDraft":
+        _validate_extra_rules_trace_scope(self.evaluation_scope, self.extra_rules)
         if not self.evaluation_rules:
             return self
         _, diagnostics = validate_evaluation_rules(
@@ -236,6 +272,7 @@ class ResponsePolicyStore:
     def to_trusted_context(self, policy: ReviewedResponsePolicy) -> dict[str, Any]:
         """Convert a verified reviewed policy into HybridEvaluator trusted_context."""
         verified = self.require_reviewed(policy.policy_id, target_id=policy.target_id)
+        _validate_extra_rules_trace_scope(verified.draft.evaluation_scope, verified.draft.extra_rules)
         rev_key = POLICY_REVISION_KEYS[verified.category]
         context: dict[str, Any] = {
             "evaluation_scope": verified.draft.evaluation_scope,
@@ -250,6 +287,8 @@ class ResponsePolicyStore:
             "expected_response_boundary": verified.draft.expected_response_boundary,
             **verified.draft.extra_rules,
         }
+        if verified.draft.evaluation_scope in TOOL_CALL_TRACE_SCOPES:
+            context["required_trace_scope"] = verified.draft.evaluation_scope
         if verified.category == "goal_hijacking":
             context.setdefault("original_goal", verified.draft.allowed_benign_context)
             context.setdefault("attacker_goal", verified.draft.prohibited_behavior)

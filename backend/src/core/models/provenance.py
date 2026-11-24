@@ -332,7 +332,9 @@ def build_case_research_provenance(
     dataset_metadata: Mapping[str, Any] | None = None,
     sent_payload_sha256: str | None = None,
     deterministic_result: Mapping[str, Any] | None = None,
+    effective_deterministic_result: Mapping[str, Any] | None = None,
     final_result: Any = None,
+    execution_success: bool | None = None,
 ) -> dict[str, Any]:
     """Build sanitized, per-case research provenance metadata for a Native Report."""
     from evaluators.contract import is_rule_applicable_to_scope
@@ -398,34 +400,52 @@ def build_case_research_provenance(
         rule_origin = "none"
 
     det_verdict: str | None = None
+    det_reason: str | None = None
     det_matched_id: str | None = None
     det_matched_type: str | None = None
-    if isinstance(deterministic_result, Mapping):
+    if execution_success is not False and isinstance(deterministic_result, Mapping):
         det_verdict = _safe_str(deterministic_result.get("status"))
+        det_reason = _safe_str(deterministic_result.get("reason"), max_len=512)
         det_matched_id = _safe_str(deterministic_result.get("matched_rule_id"))
         det_matched_type = _safe_str(deterministic_result.get("matched_rule_type"))
+
+    eff_det_block = (
+        effective_deterministic_result
+        if isinstance(effective_deterministic_result, Mapping)
+        else (
+            diagnostic.get("effective_deterministic_result")
+            if isinstance(diagnostic, Mapping) and isinstance(diagnostic.get("effective_deterministic_result"), Mapping)
+            else None
+        )
+    )
+    eff_det_verdict: str | None = None
+    eff_det_reason: str | None = None
+    if execution_success is not False:
+        if eff_det_block is not None:
+            eff_det_verdict = _safe_str(eff_det_block.get("status"))
+            eff_det_reason = _safe_str(eff_det_block.get("reason"), max_len=512)
+        else:
+            eff_det_verdict = det_verdict
+            eff_det_reason = det_reason
 
     eff_verdict: str | None = None
     final_matched_id: str | None = None
     final_matched_type: str | None = None
+    final_reason: str | None = None
     if final_result is not None:
         raw_status = getattr(final_result, "status", None)
         eff_verdict = _safe_str(getattr(raw_status, "value", raw_status))
         final_matched_id = _safe_str(getattr(final_result, "matched_rule_id", None))
         final_matched_type = _safe_str(getattr(final_result, "matched_rule_type", None))
-
-    matched_rule_id = final_matched_id or det_matched_id
-    matched_rule_type = final_matched_type or det_matched_type
-    imported_assertions_count = (
-        int(rule_prov_meta["imported_assertions_non_executable_count"])
-        if isinstance(rule_prov_meta.get("imported_assertions_non_executable_count"), int)
-        and rule_prov_meta["imported_assertions_non_executable_count"] >= 0
-        else 0
-    )
+        final_reason = _safe_str(getattr(final_result, "reason", None), max_len=512)
 
     # Actual Judge metadata ONLY when Judge was actually invoked for this case.
     semantic_invoked = bool(diagnostic.get("semantic_invoked")) if isinstance(diagnostic, Mapping) else False
+    raw_fault = diagnostic.get("provider_fault_code") if isinstance(diagnostic, Mapping) else None
+    fault_str = _safe_str(getattr(raw_fault, "value", raw_fault))
     if semantic_invoked and isinstance(diagnostic, Mapping):
+        raw_rec = diagnostic.get("recommendation")
+        rec_str = _safe_str(getattr(raw_rec, "value", raw_rec))
         judge_block = {
             "invoked": True,
             "provider": _safe_str(judge_provider_name),
@@ -433,6 +453,22 @@ def build_case_research_provenance(
             "skill_version": _safe_str(diagnostic.get("skill_version")),
             "skill_sha256": _safe_sha256(diagnostic.get("skill_sha256")),
             "judge_request_sha256": _safe_sha256(diagnostic.get("request_sha256")),
+            "recommendation": rec_str,
+            "classification": _safe_str(diagnostic.get("classification")),
+            "reason": _safe_str(diagnostic.get("judge_reason"), max_len=512),
+            "provider_fault_code": fault_str,
+            "json_validation_status": _safe_str(diagnostic.get("json_validation_status")),
+        }
+    elif isinstance(diagnostic, Mapping) and fault_str is not None:
+        judge_block = {
+            "invoked": False,
+            "provider": None,
+            "model": None,
+            "skill_version": _safe_str(diagnostic.get("skill_version")),
+            "skill_sha256": _safe_sha256(diagnostic.get("skill_sha256")),
+            "judge_request_sha256": _safe_sha256(diagnostic.get("request_sha256")),
+            "provider_fault_code": fault_str,
+            "json_validation_status": _safe_str(diagnostic.get("json_validation_status")),
         }
     else:
         judge_block = {
@@ -443,6 +479,47 @@ def build_case_research_provenance(
             "skill_sha256": None,
             "judge_request_sha256": None,
         }
+
+    # Distinguish effective verdict matched rule vs raw deterministic match (e.g. if downgraded).
+    matched_rule_id = final_matched_id
+    matched_rule_type = final_matched_type
+
+    downgrade_reason = (
+        _safe_str(diagnostic.get("downgrade_reason"), max_len=512)
+        if isinstance(diagnostic, Mapping)
+        else None
+    )
+    if downgrade_reason is None:
+        if det_verdict in {"PASS", "FAIL"} and eff_det_verdict == "INCONCLUSIVE":
+            downgrade_reason = eff_det_reason
+        elif eff_det_verdict in {"PASS", "FAIL"} and eff_verdict == "INCONCLUSIVE":
+            downgrade_reason = final_reason
+        elif (
+            semantic_invoked
+            and isinstance(diagnostic, Mapping)
+            and diagnostic.get("recommendation") is not None
+            and _safe_str(getattr(diagnostic.get("recommendation"), "value", diagnostic.get("recommendation"))) in {"PASS", "FAIL"}
+            and eff_verdict == "INCONCLUSIVE"
+        ):
+            downgrade_reason = final_reason
+
+    if eff_verdict == "ERROR" or execution_success is False:
+        decision_source = "technical_error"
+    elif final_matched_type == "asi05_execution" and eff_verdict in {"PASS", "FAIL"}:
+        decision_source = "asi05_execution"
+    elif not semantic_invoked and eff_verdict in {"PASS", "FAIL"} and final_matched_id is not None:
+        decision_source = "deterministic_rule"
+    elif semantic_invoked and eff_verdict in {"PASS", "FAIL"}:
+        decision_source = "semantic_judge"
+    else:
+        decision_source = "insufficient_evidence"
+
+    imported_assertions_count = (
+        int(rule_prov_meta["imported_assertions_non_executable_count"])
+        if isinstance(rule_prov_meta.get("imported_assertions_non_executable_count"), int)
+        and rule_prov_meta["imported_assertions_non_executable_count"] >= 0
+        else 0
+    )
 
     return {
         "schema_version": RESEARCH_PROVENANCE_SCHEMA_VERSION,
@@ -473,10 +550,17 @@ def build_case_research_provenance(
             "rule_origin": rule_origin,
             "configured_rules": configured_rules,
             "applicable_rule_ids": applicable_rule_ids,
+            "deterministic_matched_rule_id": det_matched_id,
+            "deterministic_matched_rule_type": det_matched_type,
             "matched_rule_id": matched_rule_id,
             "matched_rule_type": matched_rule_type,
             "deterministic_verdict": det_verdict,
+            "deterministic_reason": det_reason,
+            "effective_deterministic_verdict": eff_det_verdict,
+            "effective_deterministic_reason": eff_det_reason,
+            "downgrade_reason": downgrade_reason,
             "effective_verdict": eff_verdict,
+            "decision_source": decision_source,
             "imported_assertions_non_executable_count": imported_assertions_count,
         },
         "judge": judge_block,

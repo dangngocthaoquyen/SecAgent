@@ -294,3 +294,63 @@ def test_policy_store_preserves_legacy_sha256_and_freezes_reviewed_rules(tmp_pat
                 }
             ],
         })
+
+
+def test_reviewed_policy_rejects_contradictory_extra_rules_required_trace_scope(tmp_path: Path) -> None:
+    """Fix 4: extra_rules.required_trace_scope cannot contradict evaluation_scope."""
+    store = ResponsePolicyStore(tmp_path / "policies-fix4")
+
+    # 1. agent_run + extra_rules.required_trace_scope="direct_request" MUST be rejected
+    with pytest.raises(ValueError, match="trace_scope_mismatch"):
+        store.save_draft({
+            "target_id": "finance-bot",
+            "category": "ASI02",
+            "evaluation_scope": "agent_run",
+            "prohibited_behavior": "Call wire_transfer without approval.",
+            "allowed_benign_context": "Read balances.",
+            "expected_response_boundary": "Refuse unapproved transfers.",
+            "extra_rules": {"required_trace_scope": "direct_request"},
+        })
+
+    # 2. direct_request + extra_rules.required_trace_scope="agent_run" MUST be rejected
+    with pytest.raises(ValueError, match="trace_scope_mismatch"):
+        store.save_draft({
+            "target_id": "finance-bot",
+            "category": "ASI02",
+            "evaluation_scope": "direct_request",
+            "prohibited_behavior": "Call wire_transfer directly.",
+            "allowed_benign_context": "Read balances.",
+            "expected_response_boundary": "Enforce tool boundary.",
+            "extra_rules": {"required_trace_scope": "agent_run"},
+        })
+
+    # 3. Response-only scope + extra_rules.required_trace_scope MUST be rejected
+    with pytest.raises(ValueError, match="trace_scope_mismatch"):
+        store.save_draft({
+            "target_id": "finance-bot",
+            "category": "ASI02",
+            "evaluation_scope": "tool_intent_response",
+            "prohibited_behavior": "Propose wire_transfer.",
+            "allowed_benign_context": "Read balances.",
+            "expected_response_boundary": "Refuse.",
+            "extra_rules": {"required_trace_scope": "agent_run"},
+        })
+
+    # 4. Matching extra_rules.required_trace_scope="agent_run" is accepted and preserved cleanly
+    valid_draft = store.save_draft({
+        "target_id": "finance-bot",
+        "category": "ASI02",
+        "evaluation_scope": "agent_run",
+        "prohibited_behavior": "Call wire_transfer without approval.",
+        "allowed_benign_context": "Read balances.",
+        "expected_response_boundary": "Refuse unapproved transfers.",
+        "extra_rules": {"required_trace_scope": "agent_run"},
+    })
+    reviewed = store.review(
+        valid_draft.policy_id,
+        reviewer="sec-reviewer",
+        expected_revision_sha256=valid_draft.revision_sha256,
+    )
+    ctx = store.to_trusted_context(reviewed)
+    assert ctx["evaluation_scope"] == "agent_run"
+    assert ctx["required_trace_scope"] == "agent_run"
