@@ -80,6 +80,7 @@ class EventMapping(ClosedModel):
     items: str = ''  # Empty means the response itself must be an array.
     event_id: str | None = None
     request_id: str | None = None
+    correlation_id: str | None = None
     invocation_id: str | None = None
     timestamp: str | None = None
     tool: str | None = None
@@ -130,6 +131,15 @@ class CollectEvidenceSource(ClosedModel):
 
 def digest(value) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode()).hexdigest()
+
+
+def _revision_payload(row: dict) -> dict:
+    """Canonical revision material preserving legacy pre-G08 hashes when optional mapping.correlation_id is None."""
+    payload = {k: v for k, v in row.items() if k != 'revision'}
+    mapping = payload.get('mapping')
+    if isinstance(mapping, dict) and mapping.get('correlation_id') is None:
+        payload['mapping'] = {k: v for k, v in mapping.items() if k != 'correlation_id'}
+    return payload
 
 
 def pick(row, path):
@@ -190,7 +200,7 @@ class EvidenceSourceStore:
         if not re.fullmatch(ID, source_id):
             raise EvidenceSourceError('invalid_source_id')
         row = EvidenceSourceProfile.model_validate(self._read(f'profiles/{source_id}.json'))
-        if digest(row.model_dump(exclude={'revision'})) != row.revision:
+        if digest(_revision_payload(row.model_dump(exclude={'revision'}))) != row.revision:
             raise EvidenceSourceError('source_integrity_failed')
         return row
 
@@ -234,7 +244,7 @@ class EvidenceSourceStore:
                 raise EvidenceSourceError('source_quota_exceeded')
             source_id = source_id or uuid4().hex
             row = draft.model_dump() | {'schema_version':'1.0.0', 'id':source_id}
-            row['revision'] = digest(row)
+            row['revision'] = digest(_revision_payload(row))
             record = EvidenceSourceProfile.model_validate(row).model_dump()
             self._write(f'revisions/{source_id}-{row["revision"]}.json', record)
             self._write(f'profiles/{source_id}.json', record)

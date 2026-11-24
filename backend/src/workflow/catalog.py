@@ -8,9 +8,48 @@ from urllib.parse import urlsplit
 
 from targets.runtime import build_runtime_target
 from core.models import TargetProfile
-from targets.validator import validate_target
+from evaluators.contract import summarize_target_capabilities_and_scopes
 from targets.validator import validate_target
 from workflow.models import CatalogConfig, TargetDraft, ConnectionCheckResult
+
+
+_OPTIONAL_EXTENSION_PRESET_FIELDS = ("http_config", "capability_states", "capability_provenance")
+
+
+def serialize_preset_for_revision(preset, *, exclude=frozenset()):
+    """Serialize Preset for revision hashing without altering legacy hashes when new optional fields are None."""
+    dumped = preset.model_dump(exclude=set(exclude))
+    for field_name in _OPTIONAL_EXTENSION_PRESET_FIELDS:
+        if dumped.get(field_name) is None:
+            dumped.pop(field_name, None)
+    return dumped
+
+
+def build_http_response_config_dict(http_config) -> dict:
+    resp = {"text_path": http_config.response.text_path}
+    if http_config.response.status_path:
+        resp["status_path"] = http_config.response.status_path
+    if http_config.response.complete_status_values:
+        resp["complete_status_values"] = list(http_config.response.complete_status_values)
+    if http_config.response.incomplete_status_values:
+        resp["incomplete_status_values"] = list(http_config.response.incomplete_status_values)
+    if http_config.response.correlation_id_path:
+        resp["correlation_id_path"] = http_config.response.correlation_id_path
+    if http_config.response.evidence_mapping is not None:
+        resp["evidence_mapping"] = http_config.response.evidence_mapping.model_dump(exclude_none=True)
+    return resp
+
+
+def default_capability_states_for_preset(preset) -> dict[str, str]:
+    if preset.protocol == "mcp-jsonrpc":
+        base = {"mcp": "supported", "direct_tool_access": "supported"}
+    elif preset.protocol == "http-json":
+        base = {"response_behavior": "unverified", "chat": "unverified"}
+    else:
+        base = {"chat": "supported", "response_behavior": "supported"}
+    if preset.capability_states:
+        base.update(preset.capability_states)
+    return base
 
 
 class CatalogError(ValueError):
@@ -61,14 +100,68 @@ def make_profile(preset, model, timeout, credential_env=None):
         profile = TargetProfile(id=preset.id, name=preset.name, target_type="ai_agent",
             interface={"type": "mcp", "adapter": "generic_mcp_jsonrpc", "config": {
                 "url": endpoint, "timeout": timeout, "headers": headers}},
-            capabilities=["tool_call"], observability=["tool_result"],
+            capabilities=["tool_call"],
+            capability_states=default_capability_states_for_preset(preset),
+            observability=["tool_result"],
             credential_refs=credential_refs,
             metadata={"configuration_source": "operator_reviewed_offline_lab" if preset.id == "dvaa-toolbot-lab" else "operator_configured",
                       "protocol": "mcp-jsonrpc"})
+    elif preset.protocol == "http-json":
+        if preset.http_config is None:
+            raise ValueError("http-json preset requires http_config.")
+        try:
+            host = ipaddress.ip_address(parts.hostname or "")
+            safe = (
+                parts.scheme in {"http", "https"}
+                and (host.is_loopback or host.is_private)
+                and not host.is_link_local
+                and not host.is_multicast
+                and not host.is_unspecified
+                and parts.username is None
+                and parts.password is None
+            )
+        except ValueError:
+            safe = (parts.hostname or "").lower() == "localhost" and parts.username is None and parts.password is None
+        if not safe:
+            raise ValueError("HTTP JSON target requires an authorized local or private IP/localhost endpoint.")
+        headers = {"Content-Type": "application/json", **dict(preset.http_config.headers)}
+        credential_refs = []
+        if credential_env is not None:
+            headers["Authorization"] = f"Bearer {{{{credential:{credential_env}}}}}"
+            credential_refs.append(credential_env)
+        obs = ["response"]
+        if preset.http_config.response.evidence_mapping is not None:
+            obs.append("inline_evidence")
+        profile = TargetProfile(
+            id=preset.id,
+            name=preset.name,
+            target_type="ai_agent",
+            interface={
+                "type": "http",
+                "adapter": "generic_http",
+                "config": {
+                    "url": endpoint,
+                    "method": preset.http_config.method,
+                    "headers": headers,
+                    "trust_env": False,
+                    "body": dict(preset.http_config.body_template),
+                    "response": build_http_response_config_dict(preset.http_config),
+                },
+            },
+            capabilities=["http_json"],
+            capability_states=default_capability_states_for_preset(preset),
+            observability=obs,
+            credential_refs=credential_refs,
+            metadata={"configuration_source": "operator_configured", "protocol": "http-json"},
+        )
     else:
         profile = build_runtime_target(endpoint, preset.id, protocol=preset.protocol,
-            authorized_origin=f"{parts.scheme}://{parts.netloc}", model=model,
+            authorized_origin=f"{parts.scheme}://{parts.netloc}", model=model or "default",
             credential_env=credential_env, discover=False)
+        if preset.capability_states:
+            profile = profile.model_copy(
+                update={"capability_states": default_capability_states_for_preset(preset)}
+            )
     profile.interface.config["timeout"] = timeout
     validate_target(profile)
     return profile
@@ -85,7 +178,7 @@ class TargetCatalog:
             # New platform labels only group the UI; they grant no authority and
             # must not invalidate an otherwise unchanged execution profile.
             "policy": self._config.policy_ref,
-            "preset": p.model_dump(exclude={"platform_id", "platform_name"}),
+            "preset": serialize_preset_for_revision(p, exclude={"platform_id", "platform_name"}),
             "credential_binding": self._config.credential_aliases.get(p.credential_alias),
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest() for p in self._config.targets}
 
@@ -95,23 +188,53 @@ class TargetCatalog:
         return "available" if os.environ.get(self._config.credential_aliases[alias], "").strip() else "unavailable"
 
     def public_targets(self):
-        return [{"id": p.id, "name": p.name,
-            "platform_id": p.platform_id, "platform_name": p.platform_name,
-            "profile_revision": self._revisions[p.id],
-            "policy_ref": self._config.policy_ref,
-            "authorization_status": "reviewed_for_offline_configuration" if p.reviewed else "review_required",
-            "endpoint": p.endpoint, "protocol": p.protocol, "method": "POST",
-            "models": list(p.models), "default_model": p.default_model,
-            "timeout_min": p.timeout_min, "timeout_max": p.timeout_max, "timeout_default": p.timeout_default,
-            "credential_alias": p.credential_alias, "credential_availability": self._available(p.credential_alias),
-            "request_mapping": "mcp-tools-call-v1" if p.protocol == "mcp-jsonrpc" else "openai-chat-user-message-v1",
-            "response_parser": "mcp-jsonrpc-result-v1" if p.protocol == "mcp-jsonrpc" else "choices.0.message.content",
-            "capabilities": ["tool_call"] if p.protocol == "mcp-jsonrpc" else ["chat"], "capability_basis": "configured_claim_not_probed",
-            "connection_probe": {"status": "unsupported", "reason": "safe_probe_not_verified",
-                                 "active_probe_authorized": False, "security_execution_authorized": False},
-            "limitations": ["Offline configuration only; no target request is authorized or sent by this service.",
-                            "Reachability and runtime protocol compatibility have not been checked."]}
-            for p in self._config.targets]
+        rows = []
+        for p in self._config.targets:
+            cap_states = default_capability_states_for_preset(p)
+            has_inline = bool(p.http_config and p.http_config.response.evidence_mapping is not None)
+            req_mapping = (
+                "mcp-tools-call-v1"
+                if p.protocol == "mcp-jsonrpc"
+                else ("http-json-template-v1" if p.protocol == "http-json" else "openai-chat-user-message-v1")
+            )
+            resp_parser = (
+                "mcp-jsonrpc-result-v1"
+                if p.protocol == "mcp-jsonrpc"
+                else (p.http_config.response.text_path if p.protocol == "http-json" and p.http_config else "choices.0.message.content")
+            )
+            caps = ["tool_call"] if p.protocol == "mcp-jsonrpc" else (["http_json"] if p.protocol == "http-json" else ["chat"])
+            cap_summary = summarize_target_capabilities_and_scopes(
+                capability_states=cap_states,
+                capabilities=caps,
+                observability=["tool_result"] if p.protocol == "mcp-jsonrpc" else ["response"],
+                has_inline_evidence=has_inline,
+            )
+            row = {
+                "id": p.id, "name": p.name,
+                "platform_id": p.platform_id, "platform_name": p.platform_name,
+                "profile_revision": self._revisions[p.id],
+                "policy_ref": self._config.policy_ref,
+                "authorization_status": "reviewed_for_offline_configuration" if p.reviewed else "review_required",
+                "endpoint": p.endpoint, "protocol": p.protocol, "method": "POST",
+                "models": list(p.models), "default_model": p.default_model or "",
+                "timeout_min": p.timeout_min, "timeout_max": p.timeout_max, "timeout_default": p.timeout_default,
+                "credential_alias": p.credential_alias, "credential_availability": self._available(p.credential_alias),
+                "request_mapping": req_mapping,
+                "response_parser": resp_parser,
+                "capabilities": caps,
+                "capability_states": cap_states,
+                "capability_provenance": dict(p.capability_provenance or {}),
+                "capability_summary": cap_summary,
+                "capability_basis": "configured_claim_not_probed",
+                "connection_probe": {"status": "unsupported", "reason": "safe_probe_not_verified",
+                                     "active_probe_authorized": False, "security_execution_authorized": False},
+                "limitations": ["Offline configuration only; no target request is authorized or sent by this service.",
+                                "Reachability and runtime protocol compatibility have not been checked."],
+            }
+            if p.http_config is not None:
+                row["http_config"] = p.http_config.model_dump(mode="json")
+            rows.append(row)
+        return rows
 
     def connection_check(self, selection):
         """Capability decision only: there is deliberately no network implementation."""
@@ -137,11 +260,22 @@ class TargetCatalog:
             errors.append("policy_mismatch")
         if draft.endpoint != p.endpoint:
             errors.append("unauthorized_endpoint")
+        expected_pair = (
+            ("mcp-tools-call-v1", "mcp-jsonrpc-result-v1")
+            if p.protocol == "mcp-jsonrpc"
+            else (
+                ("http-json-template-v1", p.http_config.response.text_path)
+                if p.protocol == "http-json" and p.http_config is not None
+                else ("openai-chat-user-message-v1", "choices.0.message.content")
+            )
+        )
         if draft.protocol != p.protocol or draft.method != "POST" or (
-                draft.request_mapping, draft.response_parser) != (("mcp-tools-call-v1", "mcp-jsonrpc-result-v1")
-                    if p.protocol == "mcp-jsonrpc" else ("openai-chat-user-message-v1", "choices.0.message.content")):
+                draft.request_mapping, draft.response_parser) != expected_pair:
             errors.append("protocol_mapping_mismatch")
-        if draft.model not in p.models:
+        if p.protocol == "http-json":
+            if draft.model is not None and p.models and draft.model not in p.models:
+                errors.append("model_not_approved")
+        elif draft.model not in p.models:
             errors.append("model_not_approved")
         if not p.timeout_min <= draft.timeout_seconds <= p.timeout_max:
             errors.append("timeout_outside_policy")

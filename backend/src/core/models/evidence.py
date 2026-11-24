@@ -113,6 +113,7 @@ WRAPPER_EVIDENCE_KINDS = frozenset({
 TARGET_CLAIM_EVIDENCE_KINDS = frozenset({
     "declared_tool_call",
     "target_tool_result",
+    "target_inline_event",
     "target_web_fetch",
     "target_outbound_callback",
     "agent_bridge_trace",
@@ -387,6 +388,43 @@ def public_evidence_data(item: Evidence) -> dict[str, Any]:
             data["observation_scope"] = "target_response_tool_declarations"
             if item.data.get("verification_status") == "target_reported_unverified":
                 data["verification_status"] = "target_reported_unverified"
+    if item.source == "http_response" and item.kind == "target_inline_event":
+        data["provenance"] = "target_reported"
+        data["execution_verified"] = False
+        data["observation_scope"] = "target_response_inline_evidence"
+        data["execution_semantics"] = "target_reported_result"
+        data["verification_status"] = "target_reported_unverified"
+        for key in (
+            "target_correlation_id",
+            "target_run_status",
+            "event_id",
+            "action",
+            "decision",
+            "status",
+            "timestamp",
+            "observation_type",
+            "disclosure_limitation",
+        ):
+            val = item.data.get(key)
+            if isinstance(val, str) and len(val) <= 256:
+                data[key] = val
+        arg_keys = item.data.get("argument_keys")
+        if isinstance(arg_keys, list):
+            safe_keys = [k for k in arg_keys[:16] if isinstance(k, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", k)]
+            if safe_keys:
+                data["argument_keys"] = safe_keys
+        for hash_key in ("arguments_sha256", "observation_sha256"):
+            val = item.data.get(hash_key)
+            if isinstance(val, str) and re.fullmatch(r"[a-f0-9]{64}", val):
+                data[hash_key] = val
+        for inc_key in ("arguments_hash_incomplete", "observation_hash_incomplete"):
+            if item.data.get(inc_key) is True:
+                data[inc_key] = True
+        fp = item.data.get("event_fingerprint")
+        if isinstance(fp, str) and re.fullmatch(r"sha256:[a-f0-9]{64}", fp):
+            data["event_fingerprint"] = fp
+        if item.data.get("inline_events_truncated") is True:
+            data["inline_events_truncated"] = True
     if item.source == "http_response" and item.kind in {
             "agent_bridge_trace", "agent_bridge_tool_call"}:
         if item.data.get("provenance") == "target_reported":
@@ -580,6 +618,7 @@ def public_evidence_data(item: Evidence) -> dict[str, Any]:
             "collector_id", "collector_kind", "correlation_status", "correlation_mechanism",
             "verification_status", "claimed_action", "observed_action", "timestamp",
             "integrity_reference", "run_id", "case_id", "request_id", "session_id",
+            "target_correlation_id", "event_id", "event_fingerprint",
         ):
             val = item.data.get(key)
             if isinstance(val, str) and len(val) <= 256:

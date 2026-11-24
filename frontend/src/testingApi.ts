@@ -1,22 +1,87 @@
+export type CapabilityState = 'supported'|'unsupported'|'unverified';
+export type HttpInlineEvidenceMapping = {
+  items: string;
+  event_id?: string|null;
+  action?: string|null;
+  arguments?: string|null;
+  decision?: string|null;
+  status?: string|null;
+  observation?: string|null;
+  timestamp?: string|null;
+  max_events?: number;
+};
+export type HttpResponseContract = {
+  text_path: string;
+  status_path?: string|null;
+  complete_status_values?: string[];
+  incomplete_status_values?: string[];
+  correlation_id_path?: string|null;
+  evidence_mapping?: HttpInlineEvidenceMapping|null;
+};
+export type HttpContractConfig = {
+  method: 'POST';
+  body_template: Record<string, unknown>;
+  headers?: Record<string, string>;
+  response: HttpResponseContract;
+};
+export type CapabilitySummary = {
+  compatible_scopes: string[];
+  unsupported_scopes: string[];
+  unverified_scopes: string[];
+  evidence_availability: string[];
+  limitations: string[];
+};
+export type OpenApiRequiredFieldSpec = {
+  name: string;
+  type: string;
+  location: string;
+  enum?: (string|number|boolean)[];
+};
+export type OpenApiCandidate = {
+  path: string;
+  endpoint: string;
+  method: 'POST';
+  operation_id: string;
+  summary: string;
+  requires_auth: boolean;
+  auth_schemes?: string[];
+  auth_scheme_supported?: boolean;
+  input_field: string;
+  ambiguous_input_field?: boolean;
+  extraction_incomplete?: boolean;
+  unresolved_required_fields: string[];
+  unresolved_required_field_specs?: OpenApiRequiredFieldSpec[];
+  unsupported_required_parameters?: { name: string; in: string }[];
+  response_text_path_discovered: boolean;
+  limitations?: string[];
+  suggested_http_config: HttpContractConfig;
+  classification: string;
+  runtime_verified: false;
+  operator_confirmed: false;
+};
 export type TargetPreset = {
   id: string; name: string; profile_revision: string; policy_ref: string;
   platform_id?: string|null; platform_name?: string|null;
   authorization_status: 'review_required'|'reviewed_for_offline_configuration';
-  endpoint: string; protocol: 'openai-chat'|'mcp-jsonrpc'; method: 'POST'; models: string[]; default_model: string;
+  endpoint: string; protocol: 'openai-chat'|'http-json'|'mcp-jsonrpc'; method: 'POST'; models: string[]; default_model: string;
   timeout_min: number; timeout_max: number; timeout_default: number;
   credential_alias: string|null; credential_availability: string;
-  request_mapping: 'openai-chat-user-message-v1'|'mcp-tools-call-v1'; response_parser: 'choices.0.message.content'|'mcp-jsonrpc-result-v1';
+  request_mapping: 'openai-chat-user-message-v1'|'http-json-template-v1'|'mcp-tools-call-v1'; response_parser: string;
+  http_config?: HttpContractConfig;
+  capability_states?: Record<string, CapabilityState>;
+  capability_provenance?: Record<string, string>;
+  capability_summary?: CapabilitySummary;
   connection_probe: {status:'unsupported'|'supported'|'requires_confirmation';reason:string;active_probe_authorized:boolean;security_execution_authorized:false};
   connection_verification?: {status:'compatible'|'expired'|'stale'|'not_checked';basis:'benign_chat_probe';profile_revision:string;security_execution_authorized:false};
   reviewed_at?: string|null;
   platform_provenance?: 'seed_configured'|'discovery_suggested'|'operator_declared'|'legacy_unknown';
   capabilities: string[]; capability_basis: string; limitations: string[];
 };
-export type Draft = Pick<TargetPreset,'profile_revision'|'policy_ref'|'endpoint'|'protocol'|'method'|'request_mapping'|'response_parser'|'credential_alias'> & {target_id:string;model:string;timeout_seconds:number};
+export type Draft = Pick<TargetPreset,'profile_revision'|'policy_ref'|'endpoint'|'protocol'|'method'|'request_mapping'|'response_parser'|'credential_alias'> & {target_id:string;model:string|null;timeout_seconds:number};
 export type ValidationResult = {configuration_status:'valid'|'invalid';errors:string[];target_id:string;profile_revision:string;connection_reachable:null;runtime_protocol_compatible:null;target_execution_performed:false;security_verdict:null};
 export type EvaluationMode = 'rule_only'|'hybrid';
 export type Asi01TextTarget = {target_id:string;endpoint:string;model:string};
-export type ManagedProfile = {id:string;name:string;platform_id:string;platform_name:string;endpoint:string;protocol:'openai-chat'|'mcp-jsonrpc';model:string;timeout_seconds:number};
+export type ManagedProfile = {id:string;name:string;platform_id:string;platform_name:string;endpoint:string;protocol:'openai-chat'|'http-json'|'mcp-jsonrpc';model:string|null;timeout_seconds:number;credential_alias?:string|null;http_config?:HttpContractConfig|null;capability_states?:Record<string, CapabilityState>|null;capability_provenance?:Record<string, 'operator_declared'|'discovery_suggested'>|null};
 export type PurgedTargetCounts = {application_contexts:number;discoveries:number;evidence_sources:number;policies_and_contracts:number;scan_runs:number};
 export type DeleteTargetResult = {workflow_schema_version:'1.0.0';deleted_target_id:string;purged_counts:PurgedTargetCounts;active_targets:TargetPreset[]};
 export type FieldProvenance = 'discovered_observed'|'suggested_unverified'|'operator_confirmed';
@@ -28,6 +93,7 @@ export type DiscoveryResult = {discovery_id:string;input_url:string;canonical_en
  metadata_sources:{url:string;status:string;classification:string}[];
  evidence_candidates?:{source_name:string;url:string;evidence_type:string;discovery_provenance:string;availability:string;verification_status:string;correlation_capability:string;required_authorization:string;limitations:string}[];
  protocol_candidates:{id:string;classification:string;source:string;runtime_verified:false}[];
+ openapi_candidates?:OpenApiCandidate[];
  advertised_models:{id:string;source:string;classification:string}[];
  advertised_agent:{name:string;source:string;classification:string}|null;
  advertised_tools:{name:string;source:string;classification:string}[];
@@ -86,7 +152,7 @@ export function parseTargets(v:unknown):{targets:TargetPreset[];protocols:{id:st
    if(platforms.has(platformId)&&platforms.get(platformId)!==platformName)throw Error('contract');platforms.set(platformId,platformName);
   }
   if(p.platform_provenance!==undefined&&!['seed_configured','discovery_suggested','operator_declared','legacy_unknown'].includes(String(p.platform_provenance)))throw Error('contract');
-  if(!/^[a-f0-9]{64}$/.test(String(p.profile_revision))||p.method!=='POST'||!(p.protocol==='openai-chat'&&p.request_mapping==='openai-chat-user-message-v1'&&p.response_parser==='choices.0.message.content'||p.protocol==='mcp-jsonrpc'&&p.request_mapping==='mcp-tools-call-v1'&&p.response_parser==='mcp-jsonrpc-result-v1'))throw Error('contract');
+  if(!/^[a-f0-9]{64}$/.test(String(p.profile_revision))||p.method!=='POST'||!(p.protocol==='openai-chat'&&p.request_mapping==='openai-chat-user-message-v1'&&p.response_parser==='choices.0.message.content'||p.protocol==='http-json'&&p.request_mapping==='http-json-template-v1'&&typeof p.response_parser==='string'&&p.response_parser.length>0||p.protocol==='mcp-jsonrpc'&&p.request_mapping==='mcp-tools-call-v1'&&p.response_parser==='mcp-jsonrpc-result-v1'))throw Error('contract');
   if(!['review_required','reviewed_for_offline_configuration'].includes(String(p.authorization_status)))throw Error('contract');
   if(p.connection_verification!==undefined){const check=obj(p.connection_verification);
    if(!['compatible','expired','stale','not_checked'].includes(String(check.status))||check.basis!=='benign_chat_probe'||
@@ -145,7 +211,7 @@ export type Asi05PolicyDraft={target_id:string;prohibited_command_behavior:strin
  expected_response_boundary:string;evaluation_scope:'response_command_artifact';delivery_surface:'direct_chat'};
 export type Asi05Policy={policy_id:string;revision_sha256:string;review_status:'draft'|'reviewed'|'stale';
  response_policy_ready:boolean;readiness_blockers:string[];draft:Asi05PolicyDraft};
-export type EvidenceMapping={items:string;event_id?:string|null;request_id?:string|null;invocation_id?:string|null;timestamp?:string|null;tool?:string|null;content?:string|null};
+export type EvidenceMapping={items:string;event_id?:string|null;request_id?:string|null;correlation_id?:string|null;invocation_id?:string|null;timestamp?:string|null;tool?:string|null;content?:string|null};
 export type EvidenceSemantics='detector_reported'|'declared_tool_call'|'tool_handler_invoked'|'simulated_execution'|'runtime_execution_verified';
 export type EvidenceSourceDraft={name:string;target_id:string;target_revision:string;source_type:'http_json';endpoint:string;credential_ref:string|null;collection_mode:'snapshot';mapping:EvidenceMapping;semantics:EvidenceSemantics;timeout_seconds:number;max_response_bytes:number;max_events:number;enabled:boolean};
 export type EvidenceSource=EvidenceSourceDraft&{id:string;revision:string;schema_version:string;availability?:'not_checked'|'available'|'unavailable';correlation_status?:'uncorrelated';action_eligible?:false;configuration_status?:string;last_checked_at?:string|null;latest_capture_id?:string|null;collection_error?:string|null};
@@ -174,7 +240,7 @@ export type GenericJudgeStatus={judge_configured:boolean;credential_available:bo
 export type GenericJudgeMetadata={mode:'rule_only'|'hybrid';judge_configured:boolean;credential_available:boolean;judge_ready:boolean;provider:string|null;model:string|null;invocation_status:'not_requested'|'running'|'succeeded'|'partial_failure'|'failed'|'not_invoked'|'unknown_unverified';request_count:number;success_count:number;failure_count:number;error_categories:string[]};
 export type GenericCaseStatus={case_id:string;category:string;asi_code?:string;status:'queued'|'running'|'completed'|'error'|'unsupported'|'blocked';stage:string;verdict:string|null;reason:string|null;evidence_level:string|null;run_id:string|null};
 export type GenericRunEvent={at:string;stage:string;case_id:string|null;verdict?:string};
-export type GenericRunPreview={workflow_schema_version:'1.0.0';mode:'live'|'offline';target_id:string;target_name:string;dataset_id?:string|null;dataset_name?:string|null;asi_category:string;use_judge:boolean;pi_judge_ready:boolean;judge_status?:GenericJudgeStatus;capability_states:Record<string,string>;evidence_source_count:number;active_evidence_source_count?:number;configured_evidence_source_count?:number;selected_cases?:number;executed_cases?:number;total_cases?:number;asi_breakdown?:Record<string,number>;has_stored_responses?:boolean;available_modes?:('live'|'offline')[];ready_count:number;blocked_count:number;unsupported_count:number;skipped_count?:number;skipped_cases?:GenericSkippedCase[];target_request_budget?:number;judge_request_budget?:number;policy_id:string|null;policy_revision_sha256:string|null;policy_review_status:string;blocker:string|null;items:GenericPreviewItem[]};
+export type GenericRunPreview={workflow_schema_version:'1.0.0';mode:'live'|'offline';target_id:string;target_name:string;dataset_id?:string|null;dataset_name?:string|null;asi_category:string;use_judge:boolean;pi_judge_ready:boolean;judge_status?:GenericJudgeStatus;capability_states:Record<string,string>;capability_summary?:CapabilitySummary;evidence_source_count:number;active_evidence_source_count?:number;configured_evidence_source_count?:number;selected_cases?:number;executed_cases?:number;total_cases?:number;asi_breakdown?:Record<string,number>;has_stored_responses?:boolean;available_modes?:('live'|'offline')[];ready_count:number;blocked_count:number;unsupported_count:number;skipped_count?:number;skipped_cases?:GenericSkippedCase[];target_request_budget?:number;judge_request_budget?:number;policy_id:string|null;policy_revision_sha256:string|null;policy_review_status:string;blocker:string|null;items:GenericPreviewItem[]};
 export type GenericCollectorDiagnostic={collector_id:string;collector_kind:string;status:string;matched_count:number;uncorrelated_count:number;reason:string};
 export type GenericEvidenceItem={kind:string;source:string;name?:string|null;data?:Record<string,unknown>};
 export type GenericRunCaseResult={case_id:string;run_id:string;category:string;prompt:string;response_text:string|null;response_complete:boolean|null;verdict:string;reason:string;judge_reason:string|null;judge_classification:string|null;semantic_invoked?:boolean;provider_fault_code?:string|null;json_validation_status?:string|null;provider_duration_ms?:number|null;evidence_level:string|null;provenance_tiers:string[];execution_status:string;collector_diagnostics:GenericCollectorDiagnostic[];evidence:GenericEvidenceItem[];report_path:string};
@@ -249,12 +315,12 @@ export const testingApi={
  targets:(signal:AbortSignal)=>request('targets',parseTargets,signal),
  validate:(draft:Draft,nonce:string,signal:AbortSignal)=>request('target-drafts/validate',parseValidation,signal,draft,nonce),
  unlock:(secret:string,nonce:string)=>adminRequest('managed-targets',v=>{const o=envelope(v);return parseTargets({workflow_schema_version:'1.0.0',targets:o.targets,protocols:[]}).targets;},secret,nonce),
- validateManaged:(profile:ManagedProfile,expected:string|null,secret:string,nonce:string)=>adminRequest('managed-targets/validate',v=>{const o=envelope(v);if(o.configuration_status!=='valid'||o.target_request_count!==0||o.target_execution_performed!==false)throw Error('contract');return true;},secret,nonce,{profile,expected_profile_revision:expected}),
+ validateManaged:(profile:ManagedProfile,expected:string|null,secret:string,nonce:string,discoveryId?:string)=>adminRequest('managed-targets/validate',v=>{const o=envelope(v);if(o.configuration_status!=='valid'||o.target_request_count!==0||o.target_execution_performed!==false)throw Error('contract');return true;},secret,nonce,{profile,expected_profile_revision:expected,...(discoveryId?{discovery_id:discoveryId}:{})}),
  saveManaged:(profile:ManagedProfile,expected:string|null,secret:string,nonce:string,discoveryId?:string,platformChangeConfirmed=false)=>adminRequest(`managed-targets/${expected?'update':'create'}`,parseProfile,secret,nonce,{profile,expected_profile_revision:expected,...(discoveryId?{discovery_id:discoveryId}:{}),platform_change_confirmed:platformChangeConfirmed}),
  deleteTarget:(target:{target_id:string;profile_revision:string},secret:string,nonce:string)=>adminRequest('managed-targets/delete',v=>{const o=envelope(v);if(o.deleted_target_id!==target.target_id||!Array.isArray(o.active_targets))throw Error('contract');const counts=obj(o.purged_counts);for(const k of ['application_contexts','discoveries','evidence_sources','policies_and_contracts','scan_runs'])if(!Number.isSafeInteger(counts[k])||Number(counts[k])<0)throw Error('contract');const activeTargets=parseTargets({workflow_schema_version:'1.0.0',targets:o.active_targets,protocols:[]}).targets;if(activeTargets.some(t=>t.id===target.target_id))throw Error('contract');return {workflow_schema_version:'1.0.0' as const,deleted_target_id:o.deleted_target_id as string,purged_counts:counts as unknown as PurgedTargetCounts,active_targets:activeTargets};},secret,nonce,{target_id:target.target_id,profile_revision:target.profile_revision,delete_confirmed:true},30000),
- discover:(url:string,nonce:string,secret:string,protocolHint?:string)=>adminRequest('discoveries',parseDiscovery,secret,nonce,{url,authorization_confirmed:true,...(protocolHint?{protocol_hint:protocolHint}:{})},15000),
+ discover:(url:string,nonce:string,secret:string,protocolHint?:string,specUrl?:string)=>adminRequest('discoveries',parseDiscovery,secret,nonce,{url,authorization_confirmed:true,...(protocolHint?{protocol_hint:protocolHint}:{}),...(specUrl?{spec_url:specUrl}:{})},15000),
  probeDiscovery:(profile:ManagedProfile,discoveryId:string,secret:string,nonce:string)=>adminRequest('discovery-probes',parseProbe,secret,nonce,{profile,discovery_id:discoveryId,authorization_confirmed:true},Math.min(70000,(profile.timeout_seconds+10)*1000)),
- reviewManaged:(target:TargetPreset,secret:string,nonce:string)=>adminRequest('managed-targets/review',parseProfile,secret,nonce,{target_id:target.id,profile_revision:target.profile_revision,policy_ref:target.policy_ref,endpoint:target.endpoint,protocol:target.protocol,model:target.default_model,capabilities:target.capabilities,authorization_confirmed:true}),
+ reviewManaged:(target:TargetPreset,secret:string,nonce:string)=>adminRequest('managed-targets/review',parseProfile,secret,nonce,{target_id:target.id,profile_revision:target.profile_revision,policy_ref:target.policy_ref,endpoint:target.endpoint,protocol:target.protocol,model:target.protocol==='http-json'?(target.default_model||null):target.default_model,capabilities:target.capabilities,authorization_confirmed:true}),
  probe:(target:TargetPreset,secret:string,nonce:string,confirm=false)=>adminRequest('connection-checks',parseProbe,secret,nonce,{target_id:target.id,profile_revision:target.profile_revision,policy_ref:target.policy_ref,...(confirm?{endpoint:target.endpoint,authorization_confirmed:true}:{})},Math.min(70000,(target.timeout_default+10)*1000)),
  listDatasets:(secret:string,nonce:string)=>adminRequest('datasets',v=>{const o=envelope(v);if(!Array.isArray(o.datasets))throw Error('contract');return o.datasets as DatasetSummary[];},secret,nonce),
  validateDataset:(rawJson:File,filename:string,secret:string,nonce:string)=>adminRequest('datasets/validate',v=>{const o=envelope(v);if(!o.dataset)throw Error('contract');return o.dataset as DatasetEnvelope;},secret,nonce,{},10000,{'X-Dataset-Filename':encodeURIComponent(filename)},rawJson),
@@ -301,4 +367,4 @@ export const testingApi={
   URL.revokeObjectURL(objUrl);
  },
 };
-export function draftFor(t:TargetPreset,model:string,timeout:number):Draft{return {target_id:t.id,profile_revision:t.profile_revision,policy_ref:t.policy_ref,endpoint:t.endpoint,protocol:t.protocol,method:t.method,model,request_mapping:t.request_mapping,response_parser:t.response_parser,timeout_seconds:timeout,credential_alias:t.credential_alias};}
+export function draftFor(t:TargetPreset,model:string,timeout:number):Draft{return {target_id:t.id,profile_revision:t.profile_revision,policy_ref:t.policy_ref,endpoint:t.endpoint,protocol:t.protocol,method:t.method,model:t.protocol==='http-json'?(model||null):model,request_mapping:t.request_mapping,response_parser:t.response_parser,timeout_seconds:timeout,credential_alias:t.credential_alias};}

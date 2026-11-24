@@ -2,7 +2,7 @@ import {useEffect,useRef,useState,type FormEvent} from 'react';
 import {testingApi,type TargetPreset,type EvidenceSource,type EvidenceSourceDraft,type EvidenceSourceList,type EvidenceSemantics,type EvidenceMapping} from './testingApi';
 
 const semantics:EvidenceSemantics[]=['detector_reported','declared_tool_call','tool_handler_invoked','simulated_execution','runtime_execution_verified'];
-const mappingFields: [keyof EvidenceMapping,string][]=[['items','Events array path'],['event_id','Event ID field'],['request_id','Request ID field'],['invocation_id','Tool invocation ID field'],['timestamp','Timestamp field'],['tool','Tool name field'],['content','Content field']];
+const mappingFields: [keyof EvidenceMapping,string][]=[['items','Events array path'],['event_id','Event ID field'],['request_id','Request ID field'],['correlation_id','Target correlation ID field'],['invocation_id','Tool invocation ID field'],['timestamp','Timestamp field'],['tool','Tool name field'],['content','Content field']];
 function initial(target:TargetPreset):EvidenceSourceDraft{return {name:'',target_id:target.id,target_revision:target.profile_revision,source_type:'http_json',endpoint:'',credential_ref:null,collection_mode:'snapshot',mapping:{items:''},semantics:'detector_reported',timeout_seconds:5,max_response_bytes:65536,max_events:200,enabled:true};}
 
 export default function EvidenceSources({target,nonce,secret,authorized}:{target:TargetPreset;nonce:string;secret:string;authorized:boolean}){

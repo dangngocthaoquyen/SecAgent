@@ -34,6 +34,12 @@ from core.models.evidence import (
     NEGATIVE_VERIFICATION_STATUSES,
     NON_EXECUTION_SEMANTICS,
 )
+from targets.adapters.http_evidence import (
+    _extract_optional_path,
+    _hash_bounded_value,
+    _safe_scalar_text,
+    build_event_fingerprint,
+)
 from targets.validator import (
     ENV_CREDENTIAL_PATTERN,
     parse_header_credential_placeholder,
@@ -57,6 +63,7 @@ class CollectorContext:
     target_id: str
     request_id: str | None = None
     session_id: str | None = None
+    target_correlation_id: str | None = None
     started_at: str | None = None
     ended_at: str | None = None
     allowed_roots: tuple[Path, ...] = ()
@@ -356,10 +363,14 @@ def _inspect_row_verification_constraints(
     }
 
 
-def _load_json_or_jsonl_rows(raw_bytes: bytes) -> list[dict[str, Any]]:
+def _load_json_or_jsonl_rows(
+    raw_bytes: bytes,
+    *,
+    items_path: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     text = raw_bytes.decode("utf-8-sig").strip()
     if not text:
-        return []
+        return [], None
     try:
         parsed = json.loads(text)
     except ValueError:
@@ -371,15 +382,23 @@ def _load_json_or_jsonl_rows(raw_bytes: bytes) -> list[dict[str, Any]]:
             item = json.loads(line)
             if isinstance(item, dict):
                 rows.append(item)
-        return rows
+        return rows, None
+    root_obj = parsed if isinstance(parsed, dict) else None
+    if isinstance(items_path, str) and items_path.strip():
+        nested = _extract_optional_path(parsed, items_path.strip())
+        if isinstance(nested, list):
+            return [item for item in nested if isinstance(item, dict)], root_obj
+        if isinstance(nested, dict):
+            return [nested], root_obj
+        return [], root_obj
     if isinstance(parsed, list):
-        return [item for item in parsed if isinstance(item, dict)]
+        return [item for item in parsed if isinstance(item, dict)], None
     if isinstance(parsed, dict):
         for list_key in ("items", "events", "records", "logs", "entries"):
             if isinstance(parsed.get(list_key), list):
-                return [item for item in parsed[list_key] if isinstance(item, dict)]
-        return [parsed]
-    return []
+                return [item for item in parsed[list_key] if isinstance(item, dict)], root_obj
+        return [parsed], root_obj
+    return [], None
 
 
 class SandboxLogFileCollector:
@@ -423,7 +442,7 @@ class SandboxLogFileCollector:
             )
         try:
             raw_bytes = scoped.read_bytes()
-            rows = _load_json_or_jsonl_rows(raw_bytes)
+            rows, _ = _load_json_or_jsonl_rows(raw_bytes)
         except (OSError, UnicodeError, ValueError) as exc:
             return CollectedEvidenceOutput(
                 diagnostics=[CollectorDiagnostic(self.collector_id, self.collector_kind, "error", reason=f"Log parse failed: {type(exc).__name__}")]
@@ -792,6 +811,9 @@ class HttpCallbackCollector:
         provenance: ProvenanceTier = "target_reported",
         independent_verifier: bool = False,
         correlation_fields: tuple[str, ...] = ("run_id", "case_id", "execution_id", "request_id", "session_id"),
+        mapping: dict[str, Any] | None = None,
+        max_response_bytes: int = 262144,
+        max_events: int = 200,
         client: httpx.Client | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
@@ -803,6 +825,9 @@ class HttpCallbackCollector:
         self._provenance = provenance
         self._independent_verifier = independent_verifier
         self._correlation_fields = correlation_fields
+        self._mapping = dict(mapping) if isinstance(mapping, dict) else {}
+        self._max_response_bytes = max(256, min(1048576, int(max_response_bytes)))
+        self._max_events = max(1, min(500, int(max_events)))
         self._client = client
         self._transport = transport
 
@@ -815,16 +840,47 @@ class HttpCallbackCollector:
                 diagnostics=[CollectorDiagnostic(self.collector_id, self.collector_kind, "scope_rejected", reason=str(exc))]
             )
         try:
+            def _read_bounded_stream(http_client: httpx.Client) -> tuple[int, bytes | None]:
+                if hasattr(http_client, "stream"):
+                    with http_client.stream("GET", url, headers=resolved_headers, timeout=self._timeout) as resp:
+                        if 300 <= resp.status_code < 400:
+                            return resp.status_code, None
+                        if resp.status_code >= 400:
+                            return resp.status_code, b""
+                        buf = bytearray()
+                        for chunk in resp.iter_bytes():
+                            if len(buf) + len(chunk) > self._max_response_bytes:
+                                return -1, None
+                            buf.extend(chunk)
+                        return resp.status_code, bytes(buf)
+                resp = http_client.get(url, headers=resolved_headers, timeout=self._timeout)
+                if 300 <= resp.status_code < 400:
+                    return resp.status_code, None
+                if resp.status_code >= 400:
+                    return resp.status_code, b""
+                if len(resp.content) > self._max_response_bytes:
+                    return -1, None
+                return resp.status_code, resp.content
+
             if self._client is not None:
-                resp = self._client.get(url, headers=resolved_headers, timeout=self._timeout)
+                status_code, raw_content = _read_bounded_stream(self._client)
             else:
                 with httpx.Client(transport=self._transport, trust_env=False, follow_redirects=False) as client:
-                    resp = client.get(url, headers=resolved_headers, timeout=self._timeout)
-            if resp.status_code >= 400:
+                    status_code, raw_content = _read_bounded_stream(client)
+            if status_code == -1:
                 return CollectedEvidenceOutput(
-                    diagnostics=[CollectorDiagnostic(self.collector_id, self.collector_kind, "unavailable", reason=f"HTTP {resp.status_code}")]
+                    diagnostics=[CollectorDiagnostic(self.collector_id, self.collector_kind, "error", reason="HTTP collector response exceeded max_response_bytes.")]
                 )
-            rows = _load_json_or_jsonl_rows(resp.content)
+            if 300 <= status_code < 400 or raw_content is None:
+                return CollectedEvidenceOutput(
+                    diagnostics=[CollectorDiagnostic(self.collector_id, self.collector_kind, "scope_rejected", reason=f"HTTP redirect rejected ({status_code}).")]
+                )
+            if status_code >= 400:
+                return CollectedEvidenceOutput(
+                    diagnostics=[CollectorDiagnostic(self.collector_id, self.collector_kind, "unavailable", reason=f"HTTP {status_code}")]
+                )
+            items_path = self._mapping.get("items") if isinstance(self._mapping.get("items"), str) else None
+            rows, root_obj = _load_json_or_jsonl_rows(raw_content, items_path=items_path)
         except Exception as exc:
             return CollectedEvidenceOutput(
                 diagnostics=[CollectorDiagnostic(self.collector_id, self.collector_kind, "error", reason=f"HTTP collector error: {type(exc).__name__}")]
@@ -838,8 +894,114 @@ class HttpCallbackCollector:
         ev_items: list[Evidence] = []
         matched = 0
         uncorrelated = 0
-        for idx, row in enumerate(rows[:200]):
-            is_match, mech, _corr_val, corr_strength = _correlate_record(row, context, self._correlation_fields)
+        map_event_id = self._mapping.get("event_id") if isinstance(self._mapping.get("event_id"), str) else None
+        map_request_id = self._mapping.get("request_id") if isinstance(self._mapping.get("request_id"), str) else None
+        map_corr_id = (
+            self._mapping.get("correlation_id")
+            if isinstance(self._mapping.get("correlation_id"), str)
+            else None
+        )
+        map_inv_id = self._mapping.get("invocation_id") if isinstance(self._mapping.get("invocation_id"), str) else None
+        map_ts = self._mapping.get("timestamp") if isinstance(self._mapping.get("timestamp"), str) else None
+        map_tool = (
+            self._mapping.get("tool")
+            if isinstance(self._mapping.get("tool"), str)
+            else (self._mapping.get("action") if isinstance(self._mapping.get("action"), str) else None)
+        )
+        map_content = (
+            self._mapping.get("content")
+            if isinstance(self._mapping.get("content"), str)
+            else (self._mapping.get("observation") if isinstance(self._mapping.get("observation"), str) else None)
+        )
+        map_args = self._mapping.get("arguments") if isinstance(self._mapping.get("arguments"), str) else None
+        map_decision = self._mapping.get("decision") if isinstance(self._mapping.get("decision"), str) else None
+        map_status = self._mapping.get("status") if isinstance(self._mapping.get("status"), str) else None
+        # Configurable target correlation path ONLY (never hardcoded 'run_id').
+        root_target_corr = (
+            _safe_scalar_text(_extract_optional_path(root_obj, map_corr_id), max_len=128)
+            if (map_corr_id and isinstance(root_obj, dict))
+            else None
+        )
+
+        for idx, row in enumerate(rows[: self._max_events]):
+            corr_row = dict(row)
+            req_conflict = False
+            if map_request_id:
+                mapped_req = _safe_scalar_text(_extract_optional_path(row, map_request_id), max_len=128)
+                existing_req = _safe_scalar_text(row.get("request_id"), max_len=128)
+                if mapped_req and existing_req and mapped_req != existing_req:
+                    req_conflict = True
+                elif mapped_req and "request_id" not in corr_row:
+                    corr_row["request_id"] = mapped_req
+
+            sec_match, sec_mech, _corr_val, sec_strength = _correlate_record(
+                corr_row, context, self._correlation_fields
+            )
+            sec_mismatch = (not sec_match) and str(sec_mech).startswith("mismatched_")
+
+            # Strictly separate target correlation ID from SecAgent request/run IDs.
+            # Never fall back from map_request_id to target correlation, and never
+            # inherit context.target_correlation_id when target correlation is missing.
+            event_target_corr = (
+                _safe_scalar_text(_extract_optional_path(row, map_corr_id), max_len=128)
+                if map_corr_id
+                else None
+            )
+            target_corr_conflict = (
+                event_target_corr is not None
+                and root_target_corr is not None
+                and event_target_corr != root_target_corr
+            )
+            row_target_corr = event_target_corr or root_target_corr
+            target_corr_match = (
+                not target_corr_conflict
+                and row_target_corr is not None
+                and context.target_correlation_id is not None
+                and row_target_corr == context.target_correlation_id
+            )
+            target_corr_mismatch = (
+                not target_corr_conflict
+                and row_target_corr is not None
+                and context.target_correlation_id is not None
+                and row_target_corr != context.target_correlation_id
+            )
+
+            matched_via_target_corr_only = False
+            if req_conflict:
+                is_match = False
+                mech = "conflicting_request_id"
+                corr_strength = "none"
+            elif target_corr_conflict:
+                is_match = False
+                mech = "conflicting_target_correlation_id"
+                corr_strength = "none"
+            elif target_corr_mismatch:
+                is_match = False
+                mech = "mismatched_target_correlation_id"
+                corr_strength = "none"
+            elif sec_mismatch:
+                is_match = False
+                mech = str(sec_mech)
+                corr_strength = "none"
+            elif sec_match:
+                is_match = True
+                corr_strength = sec_strength
+                mech = (
+                    f"{sec_mech},target_correlation_id={row_target_corr}"
+                    if target_corr_match
+                    else str(sec_mech)
+                )
+            elif target_corr_match:
+                # Target-reported run association only: always weak and never promotable
+                # to independently_verified or execution_verified=True.
+                is_match = True
+                corr_strength = "weak"
+                mech = f"target_correlation_id={row_target_corr}"
+                matched_via_target_corr_only = True
+            else:
+                is_match = False
+                mech = str(sec_mech)
+                corr_strength = "none"
             entry_sha = sha256(json.dumps(row, sort_keys=True, default=str).encode("utf-8")).hexdigest()
             explicit_exec, exec_conflict = _evaluate_execution_flags(
                 row, include_effect_verified=False
@@ -857,7 +1019,22 @@ class HttpCallbackCollector:
                 explicit_exec = False
             if is_match:
                 matched += 1
-                if corr_strength == "strong" and default_verified:
+                if matched_via_target_corr_only:
+                    # Target-reported correlation match must NEVER establish
+                    # independently_verified provenance or execution_verified=True.
+                    row_tier = "target_reported"
+                    exec_verified = False
+                    corr_status_cb = (
+                        "uncorrelated"
+                        if (constraints["neg_corr_valid"] or constraints["neg_corr_status"])
+                        else "matched"
+                    )
+                    ver_status = (
+                        "conflicting_execution_metadata"
+                        if exec_conflict
+                        else (constraints["neg_ver_status"] or "target_reported_unverified")
+                    )
+                elif corr_strength == "strong" and default_verified:
                     if explicit_exec:
                         row_tier = tier
                         exec_verified = True
@@ -923,6 +1100,46 @@ class HttpCallbackCollector:
                 exec_verified = False
                 corr_status_cb = "uncorrelated"
                 ver_status = "uncorrelated_not_verified"
+
+            mapped_action = (
+                _safe_scalar_text(_extract_optional_path(row, map_tool), max_len=128)
+                if map_tool
+                else None
+            ) or str(row.get("action") or row.get("method") or row.get("path") or "")
+            mapped_ts = (
+                _safe_scalar_text(_extract_optional_path(row, map_ts), max_len=64)
+                if map_ts
+                else None
+            ) or str(row.get("timestamp") or "")
+            mapped_ev_id = (
+                _safe_scalar_text(_extract_optional_path(row, map_event_id), max_len=128)
+                if map_event_id
+                else (_safe_scalar_text(_extract_optional_path(row, map_inv_id), max_len=128) if map_inv_id else None)
+            )
+            mapped_args = _extract_optional_path(row, map_args) if map_args else None
+            mapped_obs = _extract_optional_path(row, map_content) if map_content else None
+            args_sha, args_inc = _hash_bounded_value(mapped_args) if mapped_args is not None else (None, False)
+            obs_sha, obs_inc = _hash_bounded_value(mapped_obs) if mapped_obs is not None else (None, False)
+            mapped_dec = _safe_scalar_text(_extract_optional_path(row, map_decision), max_len=64) if map_decision else None
+            mapped_st = _safe_scalar_text(_extract_optional_path(row, map_status), max_len=64) if map_status else None
+            # Only fingerprint events with explicit event_id and complete hashes,
+            # using the event's OWN correlation ID (never falling back to context).
+            fp = (
+                build_event_fingerprint(
+                    event_id=mapped_ev_id,
+                    action=mapped_action or None,
+                    arguments_sha256=args_sha,
+                    decision=mapped_dec,
+                    status=mapped_st,
+                    observation_sha256=obs_sha,
+                    timestamp=mapped_ts or None,
+                    target_correlation_id=row_target_corr,
+                    incomplete=(args_inc or obs_inc),
+                )
+                if self._mapping
+                else None
+            )
+
             cb_data: dict[str, Any] = {
                 "collector_id": self.collector_id,
                 "collector_kind": self.collector_kind,
@@ -932,10 +1149,16 @@ class HttpCallbackCollector:
                 "correlation_strength": "none" if corr_status_cb == "uncorrelated" else corr_strength,
                 "correlation_mechanism": str(mech),
                 "verification_status": ver_status,
-                "observed_action": str(row.get("action") or row.get("method") or row.get("path") or ""),
-                "timestamp": str(row.get("timestamp") or ""),
+                "observed_action": mapped_action,
+                "timestamp": mapped_ts,
                 "integrity_reference": f"sha256:{entry_sha}",
             }
+            if mapped_ev_id is not None:
+                cb_data["event_id"] = mapped_ev_id
+            if row_target_corr is not None:
+                cb_data["target_correlation_id"] = row_target_corr
+            if fp is not None:
+                cb_data["event_fingerprint"] = fp
             if exec_sem is not None:
                 cb_data["execution_semantics"] = exec_sem
             if row.get("synthetic_mock") is True:
@@ -1010,6 +1233,9 @@ def build_collector_from_spec(spec: dict[str, Any]) -> EvidenceCollector:
             provenance=prov,
             independent_verifier=independent,
             correlation_fields=corr_fields,
+            mapping=spec.get("mapping") if isinstance(spec.get("mapping"), dict) else None,
+            max_response_bytes=int(spec.get("max_response_bytes", 262144)),
+            max_events=int(spec.get("max_events", 200)),
         )
     raise ValueError(f"Unsupported evidence collector kind: {kind!r}")
 

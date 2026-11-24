@@ -15,9 +15,25 @@ from urllib.parse import urlsplit
 from pydantic import Field, model_validator
 from typing import Literal
 
-from workflow.catalog import CatalogError, TargetCatalog, make_profile, read_json
-from workflow.models import (CatalogConfig, ClosedModel, ConnectionCheckResult,
-                             Identifier, ModelName, Preset)
+from workflow.catalog import (
+    CatalogError,
+    TargetCatalog,
+    make_profile,
+    read_json,
+    serialize_preset_for_revision,
+)
+from workflow.models import (
+    CapabilityProvenanceLiteral,
+    CapabilityStateLiteral,
+    CatalogConfig,
+    ClosedModel,
+    ConnectionCheckResult,
+    DeclarableCapabilityProvenanceLiteral,
+    HttpContractConfig,
+    Identifier,
+    ModelName,
+    Preset,
+)
 from workflow.plans import ROOT
 
 
@@ -28,8 +44,24 @@ class ManagedProfile(ClosedModel):
     platform_name: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9 ._-]+$")
     endpoint: str = Field(min_length=1, max_length=256)
     protocol: str = "openai-chat"
-    model: ModelName
+    model: ModelName | None = None
     timeout_seconds: int = Field(ge=1, le=60)
+    credential_alias: Identifier | None = None
+    http_config: HttpContractConfig | None = None
+    capability_states: dict[Identifier, CapabilityStateLiteral] | None = None
+    capability_provenance: dict[Identifier, DeclarableCapabilityProvenanceLiteral] | None = None
+
+    @model_validator(mode="after")
+    def validate_managed_fields(self):
+        if self.protocol != "http-json" and self.credential_alias is not None:
+            raise ValueError("credential_alias cannot be supplied directly on legacy managed profiles.")
+        if self.protocol != "http-json" and self.http_config is not None:
+            raise ValueError("http_config is only allowed for http-json profiles.")
+        if self.protocol == "http-json" and self.http_config is None:
+            raise ValueError("http-json profile requires http_config.")
+        if self.protocol != "http-json" and not self.model:
+            raise ValueError("model is required for this protocol.")
+        return self
 
 
 class SaveProfile(ClosedModel):
@@ -45,7 +77,7 @@ class ReviewProfile(ClosedModel):
     policy_ref: Identifier
     endpoint: str = Field(min_length=1, max_length=256)
     protocol: str
-    model: ModelName
+    model: ModelName | None = None
     capabilities: list[str]
     authorization_confirmed: bool
 
@@ -94,11 +126,18 @@ class ManagedState(ClosedModel):
 
 
 def _revision(config: CatalogConfig, preset: Preset, revision_name: str | None = None) -> str:
-    material = {"policy": config.policy_ref,
-                "preset": preset.model_copy(update={"name": revision_name}).model_dump(
-                    exclude={"platform_id", "platform_name"}) if revision_name is not None
-                    else preset.model_dump(exclude={"platform_id", "platform_name"}),
-                "credential_binding": config.credential_aliases.get(preset.credential_alias)}
+    effective_preset = (
+        preset.model_copy(update={"name": revision_name})
+        if revision_name is not None
+        else preset
+    )
+    material = {
+        "policy": config.policy_ref,
+        "preset": serialize_preset_for_revision(
+            effective_preset, exclude={"platform_id", "platform_name"}
+        ),
+        "credential_binding": config.credential_aliases.get(preset.credential_alias),
+    }
     return sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -243,6 +282,10 @@ class ManagedTargetCatalog(TargetCatalog):
                     "A tools/list probe does not invoke a tool or verify handler execution.",
                     "Target review does not create a testcase execution grant."]
                     if preset.protocol == "mcp-jsonrpc" else
+                    ["Configured HTTP JSON contract is not runtime verification.",
+                     "Unknown API semantics, authorization boundaries, and evidence trust remain unverified until established.",
+                     "Target review does not create a testcase execution grant."]
+                    if preset.protocol == "http-json" else
                     ["Configured chat capability is not runtime verification.",
                      "Target review does not create a testcase execution grant."])
                 if preset.name.endswith(" - Legacy Archived"):
@@ -380,30 +423,79 @@ class ManagedTargetCatalog(TargetCatalog):
             return super().validate(draft)
 
     def _preset(self, profile: ManagedProfile, *, existing: Preset | None = None) -> Preset:
-        if profile.protocol not in {"openai-chat", "mcp-jsonrpc"}:
+        if profile.protocol not in {"openai-chat", "http-json", "mcp-jsonrpc"}:
             raise ValueError("Unsupported target protocol.")
-        preset = Preset(id=profile.id, name=profile.name, platform_id=profile.platform_id,
-            platform_name=profile.platform_name, endpoint=profile.endpoint, protocol=profile.protocol,
-            models=[profile.model], default_model=profile.model,
+        if profile.protocol == "http-json":
+            models = [profile.model] if profile.model else []
+            default_model = profile.model
+            cred_alias = profile.credential_alias
+        else:
+            if not profile.model:
+                raise ValueError("Model identifier is required for this protocol.")
+            models = [profile.model]
+            default_model = profile.model
+            cred_alias = (
+                profile.credential_alias
+                if profile.credential_alias is not None
+                else (existing.credential_alias if existing else None)
+            )
+        if cred_alias is not None and cred_alias not in self._state.catalog.credential_aliases:
+            raise ValueError("Unregistered credential alias.")
+        preset = Preset(
+            id=profile.id,
+            name=profile.name,
+            platform_id=profile.platform_id,
+            platform_name=profile.platform_name,
+            endpoint=profile.endpoint,
+            protocol=profile.protocol,
+            models=models,
+            default_model=default_model,
             timeout_min=existing.timeout_min if existing else 1,
             timeout_max=existing.timeout_max if existing else 60,
             timeout_default=profile.timeout_seconds,
-            credential_alias=existing.credential_alias if existing else None, reviewed=False)
-        make_profile(preset, preset.default_model, preset.timeout_default)
+            credential_alias=cred_alias,
+            http_config=profile.http_config,
+            capability_states=profile.capability_states,
+            capability_provenance=profile.capability_provenance,
+            reviewed=False,
+        )
+        make_profile(preset, preset.default_model, preset.timeout_default,
+                     self._state.catalog.credential_aliases.get(preset.credential_alias))
         return preset
+
+    @staticmethod
+    def _effective_invocation_signature(preset: Preset) -> tuple:
+        """Generic invocation contract identity for duplicate detection.
+
+        Legacy openai-chat and mcp-jsonrpc keep (endpoint, protocol) uniqueness.
+        Generic http-json profiles sharing one REST endpoint are distinct when
+        their effective invocation contract (body_template, headers, response
+        contract, or credential_alias) differs.
+        """
+        if preset.protocol == "http-json":
+            http_blob = (
+                json.dumps(preset.http_config.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+                if preset.http_config is not None
+                else ""
+            )
+            return (preset.endpoint, preset.protocol, preset.credential_alias or "", http_blob)
+        return (preset.endpoint, preset.protocol)
 
     def validate_profile(self, profile: ManagedProfile, *, update=False):
         with self._lock:
             existing = self._targets.get(profile.id)
             if (update and existing is None) or (not update and existing is not None):
                 raise ValueError("Target identity is missing or already exists.")
-            if any(p.id != profile.id and p.endpoint == profile.endpoint
-                   and p.protocol == profile.protocol for p in self._state.catalog.targets):
+            candidate = self._preset(profile, existing=existing)
+            cand_sig = self._effective_invocation_signature(candidate)
+            if any(
+                p.id != profile.id and self._effective_invocation_signature(p) == cand_sig
+                for p in self._state.catalog.targets
+            ):
                 # Legacy duplicates remain readable; a metadata-only edit of one
                 # must not create or silently repair historical identity.
-                if not update or existing is None or (existing.endpoint, existing.protocol) != (profile.endpoint, profile.protocol):
+                if not update or existing is None or self._effective_invocation_signature(existing) != cand_sig:
                     raise ValueError("duplicate_target_endpoint")
-            candidate = self._preset(profile, existing=existing)
             targets = [candidate if p.id == profile.id else p for p in self._state.catalog.targets]
             if not update:
                 targets.append(candidate)
@@ -452,10 +544,17 @@ class ManagedTargetCatalog(TargetCatalog):
     def review_profile(self, request: ReviewProfile):
         with self._lock:
             p = self._targets.get(request.target_id)
+            expected_caps = (
+                ["tool_call"]
+                if p and p.protocol == "mcp-jsonrpc"
+                else (["http_json"] if p and p.protocol == "http-json" else ["chat"])
+            )
+            req_model = request.model or None
+            preset_model = (p.default_model or None) if p is not None else None
             if (p is None or request.profile_revision != self._revisions[p.id]
                     or request.policy_ref != self._config.policy_ref or request.endpoint != p.endpoint
-                    or request.protocol != p.protocol or request.model != p.default_model
-                    or request.capabilities != (["tool_call"] if p.protocol == "mcp-jsonrpc" else ["chat"])):
+                    or request.protocol != p.protocol or req_model != preset_model
+                    or request.capabilities != expected_caps):
                 raise ValueError("Review does not match the current target and policy.")
             record = ReviewRecord(target_id=p.id, profile_revision=self._revisions[p.id],
                                   policy_ref=self._config.policy_ref, endpoint=p.endpoint,

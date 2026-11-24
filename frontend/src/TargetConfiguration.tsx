@@ -38,7 +38,7 @@ export default function TargetConfiguration({initialTargetId='',onSelectDataset}
  const settingsMatch=!!target&&model===target.default_model&&timeout===target.timeout_default;
  const connectionState=settingsMatch&&connection?.key===targetKey(target)?connection.state:'Not checked';
  const ready=result?.configuration_status==='valid'&&connectionState==='Connected';
- const responseScope=target?.protocol==='openai-chat';
+ const responseScope=target?.protocol==='openai-chat'||target?.protocol==='http-json';
  return <><div className="detail-page target-configuration" hidden={planning}>
   <div className="page-title"><div><span className="eyebrow">TARGET SETUP</span><h1>Connect AI Agent</h1><p>Discover a local agent, confirm its connection, then authorize the saved profile for testing.</p></div><button className="text-button" onClick={()=>{invalidate();desiredTarget.current=selected;setRevision(n=>n+1);}}>Reload targets</button></div>
   {error&&<div className="notice error" role="alert"><strong>Configuration unavailable</strong><p>{error}</p></div>}
@@ -70,12 +70,12 @@ export default function TargetConfiguration({initialTargetId='',onSelectDataset}
     <p className="caption">These overrides apply to test planning. Edit and save the profile to probe a different model or timeout.</p>
     <button disabled={busy||!nonce} onClick={()=>void validate()}>Validate Configuration</button><p className="caption">Checks settings only. No Target request.</p>
     <p className="approved-endpoint">Full endpoint URL: <code>{target.endpoint}</code></p>
-    <Facts rows={[["Profile ID",target.id],["Profile revision",target.profile_revision],["Policy reference",target.policy_ref],["Request mapping",target.request_mapping],["Response parser",target.response_parser],["Credential alias",target.credential_alias],["Credential availability",target.credential_availability],["HTTP method",target.method],["Declared capabilities",target.capabilities.join(', ')],["Capability basis",target.capability_basis],["Authorization details",target.authorization_status],["Security execution authorization","Separate per-run grant required"]]}/>
+    <Facts rows={[["Profile ID",target.id],["Profile revision",target.profile_revision],["Policy reference",target.policy_ref],["Request mapping",target.request_mapping],["Response parser",target.response_parser],["Credential alias",target.credential_alias],["Credential availability",target.credential_availability],["HTTP method",target.method],["Declared capabilities",target.capabilities.join(', ')],["Capability basis",target.capability_basis],...(target.capability_summary?([["Compatible scopes",target.capability_summary.compatible_scopes.join(', ')||'none'],["Unsupported scopes",target.capability_summary.unsupported_scopes.join(', ')||'none'],["Unverified scopes",target.capability_summary.unverified_scopes.join(', ')||'none'],["Evidence availability",target.capability_summary.evidence_availability.join(', ')]] as [string,unknown][]):[]),["Authorization details",target.authorization_status],["Security execution authorization","Separate per-run grant required"]]}/>
     {result?.errors.map(code=><p key={code}>{code.replaceAll('_',' ')}</p>)}
     <Facts rows={protocols.map(p=>[p.id,p.state])}/><ul>{target.limitations.map((s,i)=><li key={i}>{value(s)}</li>)}</ul>
    </details>
    <section className="panel target-readiness" aria-label="Readiness summary">
-    <div><h2>{!responseScope?'MCP action planning requires a reviewed workflow':ready?'Ready for response-level planning':approvalRequired?'Review required':result?.configuration_status==='invalid'?'Configuration invalid':connectionState==='Checking'?'Checking connection...':'Connection required for live testing'}</h2>
+    <div><h2>{!responseScope?'MCP action planning requires a reviewed workflow':ready?'Ready for response-level planning':approvalRequired?'Review required':result?.configuration_status==='invalid'?'Configuration invalid':connectionState==='Checking'?'Checking connection...':target.protocol==='http-json'&&result?.configuration_status==='valid'&&target.connection_probe.status==='unsupported'?'Configuration valid · Connection unverified (safe probe unsupported)':'Connection required for live testing'}</h2>
      <p className="caption">{ready?'Dataset, scope and execution authorization are checked before each run.':'You can prepare a dataset now. Live execution remains separately gated.'}</p>
      <div className="target-readiness-facts"><span>{feedback}</span><span>Evidence: {responseScope?'Response only':'Run-specific provenance required'}</span><span>{responseScope?'Action verification not ready':'Autonomous action verification not ready'}</span></div>
     </div>

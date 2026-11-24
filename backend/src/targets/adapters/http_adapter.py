@@ -13,7 +13,11 @@ from core.models.tool_intent import (
     extract_tool_intent_signals,
 )
 from targets.adapters.base import BaseTargetAdapter, TargetAdapterError
-from targets.adapters.http_evidence import reported_http_evidence, structured_http_tool_calls
+from targets.adapters.http_evidence import (
+    extract_configured_http_response_context,
+    reported_http_evidence,
+    structured_http_tool_calls,
+)
 from targets.validator import parse_header_credential_placeholder
 from tools.http import HttpClient, HttpClientError, HttpResponse
 
@@ -189,6 +193,14 @@ class HttpTargetAdapter(BaseTargetAdapter):
             )
 
         events = reported_http_evidence(response.json_body)
+        (
+            inline_events,
+            target_corr_id,
+            target_run_status,
+            configured_status_complete,
+            status_mapping_configured,
+        ) = extract_configured_http_response_context(response.json_body, response_config)
+        events.extend(inline_events)
         if output_text:
             structured_fps = extract_structured_tool_fingerprints(
                 structured_http_tool_calls(response.json_body)
@@ -202,7 +214,7 @@ class HttpTargetAdapter(BaseTargetAdapter):
                 response_id = (
                     response.json_body.get("id")
                     if isinstance(response.json_body, dict) and isinstance(response.json_body.get("id"), str)
-                    else None
+                    else target_corr_id
                 )
                 events.append(build_tool_intent_event(intent_signal, reference=response_id))
         is_json_dict = isinstance(response.json_body, dict)
@@ -232,12 +244,16 @@ class HttpTargetAdapter(BaseTargetAdapter):
             is_json_dict=is_json_dict,
             is_offline=False,
             truncated_flag=truncated_flag,
+            configured_status_complete=configured_status_complete,
+            status_mapping_configured=status_mapping_configured,
         )
         return ExecutionResult(
             success=True,
             status_code=response.status_code,
             output_text=output_text,
             response_complete=resp_complete,
+            target_correlation_id=target_corr_id,
+            target_run_status=target_run_status,
             raw_output=raw_output,
             headers=response.headers,
             duration_ms=response.duration_ms,

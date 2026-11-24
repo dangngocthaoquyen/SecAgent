@@ -220,6 +220,26 @@ export default function ScanPreviewPanel({
               </div>
             </div>
           )}
+          {preview.capability_summary && (
+            <div className="scan-summary-card" aria-label="Capabilities and Evidence Availability">
+              <strong>Capabilities &amp; Evidence Availability:</strong>
+              <p className="caption">
+                Evidence: {preview.capability_summary.evidence_availability.join(', ') || 'response_text'}
+              </p>
+              <p className="caption">
+                Compatible scopes: {preview.capability_summary.compatible_scopes.join(', ') || 'none'}
+                {preview.capability_summary.unsupported_scopes.length > 0
+                  ? ` · Unsupported: ${preview.capability_summary.unsupported_scopes.join(', ')}`
+                  : ''}
+                {preview.capability_summary.unverified_scopes.length > 0
+                  ? ` · Unverified: ${preview.capability_summary.unverified_scopes.join(', ')}`
+                  : ''}
+              </p>
+              {preview.capability_summary.limitations.length > 0 && (
+                <p className="caption">{preview.capability_summary.limitations[0]}</p>
+              )}
+            </div>
+          )}
         </section>
       </div>
 

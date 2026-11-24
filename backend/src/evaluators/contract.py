@@ -58,6 +58,202 @@ RESPONSE_RULE_TYPES: frozenset[str] = frozenset({
     "status_code",
 })
 
+# Canonical capability keys mapped to existing evaluation scopes (never weakens
+# scope validation or invents new verdict semantics).
+SCOPE_CAPABILITY_KEYS: dict[str, tuple[str, ...]] = {
+    "goal_hijack_response": ("response_behavior", "chat", "stored_response_replay"),
+    "tool_intent_response": ("tool_intent", "response_behavior", "chat", "stored_response_replay"),
+    "identity_claim_response": ("response_behavior", "chat", "stored_response_replay"),
+    "response_command_artifact": ("response_behavior", "chat", "stored_response_replay"),
+    "agent_run": ("agent_run", "agent_mediated_actions", "agent_simulated_actions"),
+    "execution_action": ("runtime_execution", "execution_action", "code_execution", "agent_runtime_actions"),
+    "direct_request": ("direct_tool_access", "mcp", "tool_call"),
+    "web_fetch": ("web_fetch",),
+    "web_callback": ("web_callback",),
+}
+
+CAPABILITY_DIMENSION_KEYS: frozenset[str] = frozenset({
+    "response_behavior",
+    "tool_intent",
+    "agent_simulated_actions",
+    "agent_runtime_actions",
+    "agent_run",
+    "runtime_execution",
+    "direct_tool_access",
+    "chat",
+    "mcp",
+    "tool_call",
+    "web_fetch",
+    "web_callback",
+})
+
+
+@dataclass(frozen=True)
+class ScopeCompatibilityAssessment:
+    scope: str
+    capability_state: Literal["supported", "unsupported", "unverified"]
+    admitted: bool
+    reason: str
+    limitations: tuple[str, ...] = ()
+
+
+def assess_target_scope_compatibility(
+    evaluation_scope: str | None,
+    capability_states: Mapping[str, str] | None = None,
+    *,
+    capabilities: Sequence[str] = (),
+    evidence_sources: Sequence[Mapping[str, Any]] = (),
+    has_inline_evidence: bool = False,
+) -> ScopeCompatibilityAssessment:
+    """Assess compatibility of an existing evaluation_scope against target capabilities.
+
+    Rules:
+    - Explicitly ``unsupported`` required capability blocks admission (never silently
+      downgrades an execution scope to response-only).
+    - ``unverified`` remains explicitly ``unverified`` and reports limitations;
+      response-only scopes remain runnable unless explicitly marked unsupported.
+    - Never infers verified execution or authorization from tool/schema listings.
+    """
+    validated_scope, scope_err = validate_evaluation_scope(evaluation_scope)
+    if scope_err is not None or validated_scope is None:
+        return ScopeCompatibilityAssessment(
+            scope=str(evaluation_scope or ""),
+            capability_state="unverified",
+            admitted=False,
+            reason=scope_err.code if scope_err else "missing_evaluation_scope",
+            limitations=("Evaluation scope is missing or unsupported.",),
+        )
+
+    states = {
+        str(k).strip(): str(v).strip().lower()
+        for k, v in (capability_states or {}).items()
+        if isinstance(k, str) and isinstance(v, str)
+    }
+    cap_set = {str(c).strip().lower() for c in capabilities if isinstance(c, str) and c.strip()}
+    keys = SCOPE_CAPABILITY_KEYS.get(validated_scope, ())
+
+    limitations: list[str] = []
+    if validated_scope in EXECUTION_SCOPES and not evidence_sources and not has_inline_evidence:
+        limitations.append(
+            f"Scope '{validated_scope}' requires corroborated runtime evidence; no additional Evidence API or inline mapping is configured."
+        )
+    if validated_scope == "direct_request":
+        limitations.append(
+            "Direct tool/MCP requests are supplementary component tests and never establish autonomous Agent behavior."
+        )
+
+    # For response/intent scopes, an explicit unsupported mark on the primary key
+    # (or response_behavior) rejects execution.
+    if validated_scope in RESPONSE_ONLY_SCOPES:
+        primary_key = keys[0] if keys else "response_behavior"
+        if states.get(primary_key) == "unsupported" or states.get("response_behavior") == "unsupported":
+            return ScopeCompatibilityAssessment(
+                scope=validated_scope,
+                capability_state="unsupported",
+                admitted=False,
+                reason=f"capability_unsupported:{primary_key}",
+                limitations=(f"Target marks '{primary_key}' as unsupported.",),
+            )
+        if any(states.get(k) == "supported" for k in keys) or any(k in cap_set for k in keys):
+            return ScopeCompatibilityAssessment(
+                scope=validated_scope,
+                capability_state="supported",
+                admitted=True,
+                reason="compatible_response_scope",
+                limitations=tuple(limitations),
+            )
+        limitations.append(
+            f"Target capability for '{validated_scope}' is unverified; response-only evaluation will still enforce completeness and evidence gates."
+        )
+        return ScopeCompatibilityAssessment(
+            scope=validated_scope,
+            capability_state="unverified",
+            admitted=True,
+            reason="capability_unverified",
+            limitations=tuple(limitations),
+        )
+
+    # Execution scopes: if ANY canonical key is explicitly unsupported, refuse admission.
+    for k in keys:
+        if states.get(k) == "unsupported":
+            return ScopeCompatibilityAssessment(
+                scope=validated_scope,
+                capability_state="unsupported",
+                admitted=False,
+                reason=f"capability_unsupported:{k}",
+                limitations=(
+                    f"Target marks '{k}' as unsupported; execution-scoped testcase '{validated_scope}' cannot run as supported or downgrade silently.",
+                    *limitations,
+                ),
+            )
+    if any(states.get(k) == "supported" for k in keys):
+        return ScopeCompatibilityAssessment(
+            scope=validated_scope,
+            capability_state="supported",
+            admitted=True,
+            reason="compatible_execution_scope",
+            limitations=tuple(limitations),
+        )
+    limitations.append(
+        f"Target capability for execution scope '{validated_scope}' is unverified; without verified execution evidence, verdicts remain INCONCLUSIVE."
+    )
+    return ScopeCompatibilityAssessment(
+        scope=validated_scope,
+        capability_state="unverified",
+        admitted=True,
+        reason="capability_unverified",
+        limitations=tuple(limitations),
+    )
+
+
+def summarize_target_capabilities_and_scopes(
+    *,
+    capability_states: Mapping[str, str] | None = None,
+    capabilities: Sequence[str] = (),
+    observability: Sequence[str] = (),
+    evidence_sources: Sequence[Mapping[str, Any]] = (),
+    has_inline_evidence: bool = False,
+) -> dict[str, Any]:
+    """Produce a reusable summary of capabilities, evidence availability, and scope compatibility."""
+    compatible: list[str] = []
+    unsupported: list[str] = []
+    unverified: list[str] = []
+    limitations: list[str] = []
+
+    for scope in sorted(SUPPORTED_EVALUATION_SCOPES):
+        assessment = assess_target_scope_compatibility(
+            scope,
+            capability_states,
+            capabilities=capabilities,
+            evidence_sources=evidence_sources,
+            has_inline_evidence=has_inline_evidence,
+        )
+        if assessment.capability_state == "supported":
+            compatible.append(scope)
+        elif assessment.capability_state == "unsupported":
+            unsupported.append(scope)
+        else:
+            unverified.append(scope)
+
+    evidence_availability: list[str] = ["response_text"]
+    if has_inline_evidence:
+        evidence_availability.append("inline_structured_evidence")
+    if evidence_sources:
+        evidence_availability.append("dedicated_http_evidence_api")
+    if any(o in {"sandbox_log", "file_artifact", "tool_result"} for o in observability):
+        evidence_availability.append("configured_artifact_or_tool_source")
+    if len(evidence_availability) == 1:
+        evidence_availability.append("no_additional_accessible_evidence")
+        limitations.append("Only primary response text is configured; execution-level verdicts require independent execution evidence.")
+
+    return {
+        "compatible_scopes": compatible,
+        "unsupported_scopes": unsupported,
+        "unverified_scopes": unverified,
+        "evidence_availability": evidence_availability,
+        "limitations": limitations,
+    }
+
 
 @dataclass(frozen=True)
 class RuleValidationDiagnostic:

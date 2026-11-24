@@ -24,8 +24,18 @@ from core.models.provenance import (
     extract_context_provenance,
     summarize_run_research_provenance,
 )
+from evaluators.contract import (
+    SCOPE_CAPABILITY_KEYS,
+    assess_target_scope_compatibility,
+    summarize_target_capabilities_and_scopes,
+)
 from integrations.external_evaluator.pi import PiEvaluatorConfig, PiEvaluatorProvider
-from observers.evidence_collectors import HttpCallbackCollector, _has_symlink_or_reparse
+from observers.evidence_collectors import (
+    CollectedEvidenceOutput,
+    CollectorDiagnostic,
+    HttpCallbackCollector,
+    _has_symlink_or_reparse,
+)
 from reporting.redaction import Redactor
 from testing.evaluation_config import RunnerEvaluationConfig, _has_pi_auth_provider
 from testing.generic_runner import (
@@ -38,8 +48,13 @@ from testing.generic_runner import (
 )
 from testing.offline_stored_import import CanonicalStoredRecordsAdapter, PromptfooReportAdapter, ImportContext
 from testing.runner import Runner
-from workflow.catalog import read_json
+from workflow.catalog import (
+    build_http_response_config_dict,
+    default_capability_states_for_preset,
+    read_json,
+)
 from workflow.dataset_models import infer_testcase_asi_code
+from workflow.evidence_sources import EvidenceSourceError
 from workflow.response_policies import (
     DEFAULT_EVALUATION_SCOPES,
     POLICY_REVISION_KEYS,
@@ -60,6 +75,59 @@ _HEX32_RE = re.compile(r"^[a-f0-9]{32}$")
 _MAX_WEB_CASES = 50
 
 
+_CAPABILITY_TRUST_RANK: dict[str, int] = {
+    "unsupported": 0,
+    "unverified": 1,
+    "supported": 2,
+}
+
+
+def _merge_authoritative_capability_states(
+    saved_caps: dict[str, str],
+    requested_caps: dict[str, str] | None,
+) -> dict[str, str]:
+    """Merge request capability_states without ever weakening saved managed restrictions.
+
+    On a saved managed Target profile:
+    - A saved 'unsupported' capability (or any sibling alias in the same scope
+      capability group) can NEVER be upgraded to 'unverified' or 'supported'.
+    - A saved 'unverified' capability can NEVER be upgraded to 'supported'.
+    - An undeclared capability key in a scan request can only add 'unsupported' or
+      'unverified', never fabricate 'supported'.
+    """
+    merged = dict(saved_caps)
+    if not isinstance(requested_caps, dict):
+        return merged
+
+    def _group_min_rank(cap_key: str) -> int | None:
+        ranks: list[int] = []
+        if cap_key in merged and merged[cap_key] in _CAPABILITY_TRUST_RANK:
+            ranks.append(_CAPABILITY_TRUST_RANK[merged[cap_key]])
+        for alias_group in SCOPE_CAPABILITY_KEYS.values():
+            if cap_key in alias_group:
+                for sibling in alias_group:
+                    if sibling in merged and merged[sibling] in _CAPABILITY_TRUST_RANK:
+                        ranks.append(_CAPABILITY_TRUST_RANK[merged[sibling]])
+        return min(ranks) if ranks else None
+
+    for raw_key, raw_state in requested_caps.items():
+        if not isinstance(raw_key, str) or not isinstance(raw_state, str):
+            continue
+        key = raw_key.strip()
+        state = raw_state.strip().lower()
+        if not key or state not in _CAPABILITY_TRUST_RANK:
+            continue
+        req_rank = _CAPABILITY_TRUST_RANK[state]
+        group_ceiling = _group_min_rank(key)
+        if key in merged:
+            existing_rank = _CAPABILITY_TRUST_RANK.get(merged[key], 1)
+            if req_rank < existing_rank and (group_ceiling is None or req_rank <= group_ceiling):
+                merged[key] = state
+        elif state != "supported" and (group_ceiling is None or req_rank <= group_ceiling):
+            merged[key] = state
+    return merged
+
+
 def _sanitize_for_api(value: Any) -> Any:
     if isinstance(value, str):
         return Redactor().clean(value, opaque=False, limit=max(4096, len(value) * 2))
@@ -72,6 +140,19 @@ def _sanitize_for_api(value: Any) -> Any:
     if isinstance(value, list):
         return [_sanitize_for_api(item) for item in value]
     return value
+
+
+class _StaticDiagnosticCollector:
+    """Read-only collector that surfaces pre-run evidence-source load errors without altering verdicts."""
+
+    collector_id = "evidence_source_store"
+    collector_kind = "evidence_source_store"
+
+    def __init__(self, diagnostics: list[CollectorDiagnostic]) -> None:
+        self._diagnostics = list(diagnostics)
+
+    def collect(self, context: Any) -> CollectedEvidenceOutput:
+        return CollectedEvidenceOutput(evidence=[], diagnostics=list(self._diagnostics))
 
 
 class GenericRunService:
@@ -215,23 +296,37 @@ class GenericRunService:
     def pi_judge_ready(self) -> bool:
         return bool(self.judge_status()["judge_ready"])
 
-    def _resolve_saved_evidence_sources(
+    def _resolve_saved_evidence_sources_with_diagnostics(
         self,
         target_id: str,
         *,
         for_execution: bool = False,
         mode: str = "live",
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         if self.evidence_source_store is None:
-            return []
+            return [], []
         if for_execution and mode == "offline":
-            return []
+            return [], []
         try:
             rows = self.evidence_source_store.list(target_id)
-        except Exception:
-            return []
+        except Exception as exc:
+            err_code = (
+                str(exc)
+                if isinstance(exc, EvidenceSourceError)
+                else f"evidence_source_load_error:{type(exc).__name__}"
+            )
+            return [], [
+                {
+                    "collector_id": "evidence_source_store",
+                    "collector_kind": "evidence_source_store",
+                    "status": "error",
+                    "matched_count": 0,
+                    "uncorrelated_count": 0,
+                    "reason": f"Saved evidence sources could not be loaded ({err_code}).",
+                }
+            ]
         if not isinstance(rows, list):
-            return []
+            return [], []
         cred_env_map = getattr(getattr(self.evidence_source_store, "policy", None), "credential_env", {}) or {}
         specs: list[dict[str, Any]] = []
         for row in rows:
@@ -248,6 +343,8 @@ class GenericRunService:
                 env_var = cred_env_map.get(cred_ref)
                 if isinstance(env_var, str) and env_var:
                     headers["Authorization"] = f"Bearer {{{{credential:{env_var}}}}}"
+            raw_mapping = row.get("mapping")
+            mapping_dict = dict(raw_mapping) if isinstance(raw_mapping, dict) else {}
             specs.append({
                 "id": str(row.get("id") or "evidence_source"),
                 "name": str(row.get("name") or "evidence_source"),
@@ -255,11 +352,26 @@ class GenericRunService:
                 "url": endpoint.strip(),
                 "headers": headers,
                 "timeout_seconds": float(row.get("timeout_seconds") or 5.0),
+                "max_response_bytes": int(row.get("max_response_bytes") or 65536),
+                "max_events": int(row.get("max_events") or 200),
+                "mapping": mapping_dict,
                 "provenance": "target_reported",
                 "independent_verifier": False,
                 "source_revision": row.get("revision"),
                 "reported_semantics": row.get("semantics", "detector_reported"),
             })
+        return specs, []
+
+    def _resolve_saved_evidence_sources(
+        self,
+        target_id: str,
+        *,
+        for_execution: bool = False,
+        mode: str = "live",
+    ) -> list[dict[str, Any]]:
+        specs, _ = self._resolve_saved_evidence_sources_with_diagnostics(
+            target_id, for_execution=for_execution, mode=mode
+        )
         return specs
 
     def _resolve_target(
@@ -277,7 +389,14 @@ class GenericRunService:
             if evidence_sources is not None
             else self._resolve_saved_evidence_sources(target_id, for_execution=for_execution, mode=mode)
         )
+        saved_preset = (
+            self.catalog.get(target_id)
+            if hasattr(self.catalog, "get")
+            else getattr(self.catalog, "_targets", {}).get(target_id)
+        )
         if target_profile_dict is not None:
+            if saved_preset is not None and mode == "live":
+                raise ValueError("generic_managed_target_override_forbidden")
             profile = TargetProfile.model_validate(target_profile_dict)
             if capability_states:
                 profile = profile.model_copy(update={"capability_states": {**profile.capability_states, **capability_states}})
@@ -298,18 +417,15 @@ class GenericRunService:
                 evidence_sources=resolved_evidence,
             )
 
-        preset = (
-            self.catalog.get(target_id)
-            if hasattr(self.catalog, "get")
-            else getattr(self.catalog, "_targets", {}).get(target_id)
-        )
+        preset = saved_preset
         if preset is None:
             raise ValueError("generic_target_not_found")
 
         cred_refs: list[str] = []
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if getattr(preset, "credential_alias", None):
-            aliases = getattr(getattr(self.catalog, "config", None), "credential_aliases", {})
+            cat_cfg = getattr(self.catalog, "_config", None) or getattr(self.catalog, "config", None)
+            aliases = getattr(cat_cfg, "credential_aliases", {}) or {}
             env_name = aliases.get(preset.credential_alias)
             if env_name:
                 cred_refs.append(env_name)
@@ -323,7 +439,30 @@ class GenericRunService:
             if cred_refs:
                 iface_cfg["headers"] = headers
             iface = {"type": "mcp", "adapter": "generic_mcp_jsonrpc", "config": iface_cfg}
-            default_caps = {"mcp": "supported"}
+            default_caps = default_capability_states_for_preset(preset)
+            observability = ["tool_result"]
+            target_type = "mcp_server"
+        elif preset.protocol == "http-json" and getattr(preset, "http_config", None) is not None:
+            http_cfg = preset.http_config
+            merged_headers = {**headers, **dict(http_cfg.headers)}
+            iface = {
+                "type": "http",
+                "adapter": "generic_http",
+                "config": {
+                    "url": preset.endpoint,
+                    "method": http_cfg.method,
+                    "timeout": preset.timeout_default,
+                    "headers": merged_headers,
+                    "trust_env": False,
+                    "body": dict(http_cfg.body_template),
+                    "response": build_http_response_config_dict(http_cfg),
+                },
+            }
+            default_caps = default_capability_states_for_preset(preset)
+            observability = ["response"] + (
+                ["inline_evidence"] if http_cfg.response.evidence_mapping is not None else []
+            )
+            target_type = "ai_agent"
         else:
             iface = {
                 "type": "http",
@@ -340,15 +479,18 @@ class GenericRunService:
                     "response": {"text_path": "choices.0.message.content"},
                 },
             }
-            default_caps = {"chat": "supported"}
+            default_caps = default_capability_states_for_preset(preset)
+            observability = ["response"]
+            target_type = "llm_chat"
 
         return TargetProfile(
             id=preset.id,
             name=preset.name,
-            target_type="llm_chat" if preset.protocol == "openai-chat" else "mcp_server",
+            target_type=target_type,
             interface=iface,
             capabilities=list(getattr(preset, "capabilities", []) or ([preset.protocol])),
-            capability_states={**default_caps, **(capability_states or {})},
+            capability_states=_merge_authoritative_capability_states(default_caps, capability_states),
+            observability=observability,
             credential_refs=cred_refs,
             evidence_sources=resolved_evidence,
         )
@@ -599,6 +741,14 @@ class GenericRunService:
         context_sources_seen: set[str] = set()
         overall_blocker: str | None = None
 
+        missing_live_cred = (
+            mode == "live"
+            and any(
+                isinstance(env_name, str) and env_name and not os.environ.get(env_name, "").strip()
+                for env_name in (target.credential_refs or [])
+            )
+        )
+
         for idx, row in enumerate(raw_cases):
             case_id = str(row.get("case_id") or f"case-{idx + 1}")
             prompt = str(row.get("prompt") or "")
@@ -640,7 +790,9 @@ class GenericRunService:
             row_reviewed_policy: Any | None = None
             row_reviewed_rules: list[Any] = []
             if not is_unsupported:
-                if row.get("rules") or row.get("evaluation_rules"):
+                if missing_live_cred:
+                    row_blocker = "credential_unavailable"
+                elif row.get("rules") or row.get("evaluation_rules"):
                     row_blocker = "unreviewed_inline_rules_rejected"
                 elif row_cat is None:
                     row_blocker = "unmapped_asi_category"
@@ -705,9 +857,36 @@ class GenericRunService:
                 if row_blocker and overall_blocker is None:
                     overall_blocker = row_blocker
 
+            scope_unsupported_reason: str | None = None
+            if not is_unsupported and row_blocker is None:
+                resolved_scope: str | None = None
+                if isinstance(trusted_context, dict) and isinstance(trusted_context.get("evaluation_scope"), str):
+                    resolved_scope = trusted_context["evaluation_scope"]
+                elif row_reviewed_policy is not None and hasattr(row_reviewed_policy, "draft"):
+                    resolved_scope = getattr(row_reviewed_policy.draft, "evaluation_scope", None)
+                if resolved_scope:
+                    has_inline = bool(
+                        isinstance(target.interface.config.get("response"), dict)
+                        and isinstance(target.interface.config["response"].get("evidence_mapping"), dict)
+                    )
+                    scope_compat = assess_target_scope_compatibility(
+                        resolved_scope,
+                        target.capability_states,
+                        capabilities=target.capabilities,
+                        evidence_sources=target.evidence_sources,
+                        has_inline_evidence=has_inline,
+                    )
+                    if not scope_compat.admitted and scope_compat.capability_state == "unsupported":
+                        is_unsupported = True
+                        scope_unsupported_reason = scope_compat.reason
+
             item_status = "unsupported" if is_unsupported else ("blocked" if row_blocker else "ready")
             item_reason = (
-                ("mcp_tool_name_required" if mcp_tool_missing else "capability_unsupported")
+                (
+                    scope_unsupported_reason
+                    if scope_unsupported_reason is not None
+                    else ("mcp_tool_name_required" if mcp_tool_missing else "capability_unsupported")
+                )
                 if is_unsupported
                 else row_blocker
             )
@@ -882,16 +1061,16 @@ class GenericRunService:
             for_execution=True,
         )
         raw_sources = payload.get("evidence_sources")
+        evidence_source_diagnostics: list[dict[str, Any]] = []
         if isinstance(raw_sources, list):
             configured_evidence_source_count = len([s for s in raw_sources if isinstance(s, dict)])
         else:
-            configured_evidence_source_count = len(
-                self._resolve_saved_evidence_sources(
-                    target_id,
-                    for_execution=False,
-                    mode=mode,
-                )
+            configured_specs, evidence_source_diagnostics = self._resolve_saved_evidence_sources_with_diagnostics(
+                target_id,
+                for_execution=False,
+                mode=mode,
             )
+            configured_evidence_source_count = len(configured_specs)
         active_evidence_source_count = len(target.evidence_sources)
         raw_cases = self._extract_raw_cases(payload)
         _, preview_meta = self._build_cases(
@@ -908,6 +1087,21 @@ class GenericRunService:
             env = self.dataset_repo.get_dataset(dataset_id)
             if env is not None:
                 dataset_name = env.name
+        has_inline_ev = bool(
+            isinstance(target.interface.config.get("response"), dict)
+            and isinstance(target.interface.config["response"].get("evidence_mapping"), dict)
+        )
+        capability_summary = summarize_target_capabilities_and_scopes(
+            capability_states=target.capability_states,
+            capabilities=target.capabilities,
+            observability=target.observability,
+            evidence_sources=target.evidence_sources,
+            has_inline_evidence=has_inline_ev,
+        )
+        if evidence_source_diagnostics:
+            capability_summary["limitations"] = list(capability_summary.get("limitations") or []) + [
+                d["reason"] for d in evidence_source_diagnostics if isinstance(d.get("reason"), str)
+            ]
         return {
             "workflow_schema_version": "1.0.0",
             "mode": mode,
@@ -920,9 +1114,11 @@ class GenericRunService:
             "pi_judge_ready": self.pi_judge_ready(),
             "judge_status": self.judge_status(),
             "capability_states": target.capability_states,
+            "capability_summary": capability_summary,
             "evidence_source_count": active_evidence_source_count,
             "active_evidence_source_count": active_evidence_source_count,
             "configured_evidence_source_count": configured_evidence_source_count,
+            "evidence_source_diagnostics": evidence_source_diagnostics,
             **preview_meta,
         }
 
@@ -1367,7 +1563,28 @@ class GenericRunService:
                         extra_roots.append(candidate)
 
             ev_transport = getattr(self.evidence_source_store, "transport", None)
-            injected_collectors = []
+            injected_collectors: list[Any] = []
+            ev_store_diagnostics: list[dict[str, Any]] = []
+            if payload.get("evidence_sources") is None and mode != "offline":
+                _, ev_store_diagnostics = self._resolve_saved_evidence_sources_with_diagnostics(
+                    target_id,
+                    for_execution=True,
+                    mode=mode,
+                )
+                if ev_store_diagnostics:
+                    injected_collectors.append(
+                        _StaticDiagnosticCollector(
+                            [
+                                CollectorDiagnostic(
+                                    collector_id=str(d["collector_id"]),
+                                    collector_kind=str(d["collector_kind"]),
+                                    status="error",
+                                    reason=str(d["reason"]),
+                                )
+                                for d in ev_store_diagnostics
+                            ]
+                        )
+                    )
             run_target = target
             if ev_transport is not None and any(
                 isinstance(s, dict) and s.get("kind") == "http_callback" for s in target.evidence_sources
@@ -1383,6 +1600,9 @@ class GenericRunService:
                                 timeout_seconds=float(spec.get("timeout_seconds") or 5.0),
                                 provenance="target_reported",
                                 independent_verifier=False,
+                                mapping=spec.get("mapping") if isinstance(spec.get("mapping"), dict) else None,
+                                max_response_bytes=int(spec.get("max_response_bytes") or 65536),
+                                max_events=int(spec.get("max_events") or 200),
                                 transport=ev_transport,
                             )
                         )
@@ -1472,6 +1692,7 @@ class GenericRunService:
                 "judge_requests_used": 0,
                 "verdict_counts": {},
                 "evidence_summary": {},
+                "evidence_source_diagnostics": ev_store_diagnostics,
                 "judge_metadata": self._build_judge_metadata(
                     use_judge=use_judge,
                     run_status="running",

@@ -27,6 +27,8 @@ def resolve_response_completeness(
     is_json_dict: bool = True,
     is_offline: bool = False,
     truncated_flag: bool | None = None,
+    configured_status_complete: bool | None = None,
+    status_mapping_configured: bool = False,
 ) -> bool | None:
     """Resolve tri-state target-reported response text completeness (True / False / None).
 
@@ -34,10 +36,11 @@ def resolve_response_completeness(
     - True: Target/transport reported normal response-text completion. Never implies
       agent execution completion, tool execution, or complete runtime trace.
     - False: Explicit incompleteness/truncation (incomplete HTTP body, explicit
-      response_complete=False, truncated=True, or finish_reason in
-      {"length", "max_tokens", "content_filter"}).
+      response_complete=False, truncated=True, configured incomplete status, or
+      finish_reason in {"length", "max_tokens", "content_filter"}).
     - None: Unknown/unverified completeness (e.g., missing/unknown finish_reason,
-      tool_calls/function_call stop, or response_only_completion=False).
+      unmapped configured status, tool_calls/function_call stop, or
+      response_only_completion=False).
     """
     if body_complete is False or truncated_flag is True or explicit_response_complete is False:
         return False
@@ -50,10 +53,21 @@ def resolve_response_completeness(
     if normalized_reason in EXPLICIT_TRUNCATION_FINISH_REASONS:
         return False
 
+    if configured_status_complete is False:
+        return False
+
     if explicit_response_complete is True:
         return True if (has_output_text and response_only_completion) else None
 
     if not response_only_completion or not has_output_text:
+        return None
+
+    if configured_status_complete is True:
+        return True if body_complete is True else None
+
+    if status_mapping_configured:
+        # Configured status semantics were provided, but the observed status was
+        # missing or unmapped; keep completeness explicitly unknown (None).
         return None
 
     if normalized_reason == "stop":
@@ -83,6 +97,11 @@ class ExecutionResult(BaseModel):
     # Explicit target/transport-reported response-text completion (True/False/None).
     # Never implies agent execution completion or internal tool-trace completeness.
     response_complete: bool | None = Field(default=None, strict=True)
+    # Optional target-generated correlation/run identifier extracted via config,
+    # kept strictly separate from SecAgent run_id/case_id/execution_id/request_id.
+    target_correlation_id: str | None = None
+    # Optional target-reported run termination status (separate from response/trace completeness).
+    target_run_status: str | None = None
     raw_output: Any = None
     headers: dict[str, str] = Field(default_factory=dict)
     events: list[dict[str, Any]] = Field(default_factory=list)

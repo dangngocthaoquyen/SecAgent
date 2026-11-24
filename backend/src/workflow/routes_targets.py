@@ -68,6 +68,7 @@ def register_target_routes(app, ctx) -> None:
             targets=rows,
             protocols=[
                 {"id": "openai-chat", "state": "offline_configuration_supported"},
+                {"id": "http-json", "state": "offline_configuration_supported"},
                 {"id": "mcp-jsonrpc", "state": "local_discovery_and_review_supported"},
                 {"id": "a2a", "state": "unsupported"},
             ],
@@ -124,7 +125,11 @@ def register_target_routes(app, ctx) -> None:
                                 endpoint=preset.endpoint,
                                 protocol=preset.protocol,
                                 model=preset.default_model,
-                                capabilities=["tool_call"] if preset.protocol == "mcp-jsonrpc" else ["chat"],
+                                capabilities=(
+                                    ["tool_call"]
+                                    if preset.protocol == "mcp-jsonrpc"
+                                    else (["http_json"] if preset.protocol == "http-json" else ["chat"])
+                                ),
                                 authorization_confirmed=True,
                             )
                         )
@@ -207,7 +212,12 @@ def register_target_routes(app, ctx) -> None:
         if imported_service is not None:
             for row in rows:
                 row["connection_verification"] = imported_service.connection_state(catalog._targets[row["id"]])
-        return jsonify(workflow_schema_version="1.0.0", targets=rows, policy_ref=catalog._config.policy_ref)
+        return jsonify(
+            workflow_schema_version="1.0.0",
+            targets=rows,
+            policy_ref=catalog._config.policy_ref,
+            credential_aliases=sorted(catalog._config.credential_aliases.keys()),
+        )
 
     def _collect_target_artifacts(target_id: str) -> tuple[list[tuple[str, Path]], dict[str, int]]:
         """Identify all target-scoped files and directories across managed stores."""
@@ -670,11 +680,17 @@ def register_target_routes(app, ctx) -> None:
             with admin_lock, dispatcher._lock if dispatcher else nullcontext():
                 if dispatcher and dispatcher._active:
                     return fail("run_active", 409)
-                discovery.validate_association(item.discovery_id, item.profile.endpoint, item.profile.protocol)
+                discovery.validate_association(
+                    item.discovery_id,
+                    item.profile.endpoint,
+                    item.profile.protocol,
+                    credential_alias=item.profile.credential_alias,
+                )
                 result, status = catalog.probe_candidate(item.profile)
             return jsonify(result.model_dump()), status
         except DiscoveryError as exc:
-            return fail(exc.code, 409)
+            status_code = 400 if exc.code in {"discovery_authentication_required", "unsupported_authentication_scheme"} else 409
+            return fail(exc.code, status_code)
         except (ValueError, TypeError, ValidationError):
             return fail("invalid_discovery_probe", 400)
 
@@ -688,12 +704,23 @@ def register_target_routes(app, ctx) -> None:
             update = item.expected_profile_revision is not None
             if update and catalog._revisions.get(item.profile.id) != item.expected_profile_revision:
                 return fail("stale_profile_revision", 409)
-            catalog.validate_profile(item.profile, update=update)
+            if item.discovery_id:
+                discovery.validate_association(
+                    item.discovery_id,
+                    item.profile.endpoint,
+                    item.profile.protocol,
+                    credential_alias=item.profile.credential_alias,
+                )
+            candidate = catalog.validate_profile(item.profile, update=update)
+        except DiscoveryError as exc:
+            status_code = 400 if exc.code in {"discovery_authentication_required", "unsupported_authentication_scheme"} else 409
+            return fail(exc.code, status_code)
         except (ValueError, TypeError, ValidationError):
             return fail("invalid_managed_profile", 400)
         return jsonify(
             workflow_schema_version="1.0.0",
             configuration_status="valid",
+            credential_availability=catalog._available(candidate.credential_alias),
             target_request_count=0,
             target_execution_performed=False,
         )
@@ -711,15 +738,25 @@ def register_target_routes(app, ctx) -> None:
                 if dispatcher and dispatcher._active:
                     return fail("run_active", 409)
                 if not review and item.discovery_id:
-                    discovery.validate_association(item.discovery_id, item.profile.endpoint, item.profile.protocol)
+                    discovery.validate_association(
+                        item.discovery_id,
+                        item.profile.endpoint,
+                        item.profile.protocol,
+                        credential_alias=item.profile.credential_alias,
+                    )
                 profile = (
                     catalog.review_profile(item) if review else catalog.save_profile(item, update=update)
                 )
                 if not review and item.discovery_id:
                     discovery.associate(item.discovery_id, profile)
         except DiscoveryError as exc:
-            return fail(exc.code, 409)
-        except (ValueError, OSError, ValidationError):
+            status_code = 400 if exc.code in {"discovery_authentication_required", "unsupported_authentication_scheme"} else 409
+            return fail(exc.code, status_code)
+        except ValueError as exc:
+            if str(exc) == "Unregistered credential alias.":
+                return fail("invalid_managed_profile", 400)
+            return fail("profile_change_rejected", 409)
+        except (OSError, ValidationError):
             return fail("profile_change_rejected", 409)
         return jsonify(workflow_schema_version="1.0.0", profile=profile)
 

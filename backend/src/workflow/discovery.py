@@ -25,12 +25,21 @@ from workflow.models import ClosedModel, Identifier
 
 MAX_REQUESTS = 3
 MAX_BYTES = 16384
+MAX_OPENAPI_BYTES = 262144
+MAX_OPENAPI_DEPTH = 24
+MAX_OPENAPI_REF_DEPTH = 8
+MAX_OPENAPI_CANDIDATES = 30
 TIMEOUT_SECONDS = 3.0
 METADATA_PATHS = ("/v1/models", "/openapi.json", "/.well-known/agent.json")
 INPUT_PATHS = ("/", "/v1/chat/completions", "/chat/completions",
                "/openapi.json", "/.well-known/agent.json", "/mcp", "/jsonrpc")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/ -]{0,127}$")
 SAFE_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$")
+SAFE_HTTP_PATH = re.compile(r"^/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]*$")
+_INPUT_FIELD_PRIORITY = ("goal", "prompt", "message", "input", "query", "text", "instruction", "content")
+_RESPONSE_TEXT_PRIORITY = ("answer", "output", "response", "text", "reply", "content", "message")
+_CORRELATION_ID_PRIORITY = ("run_id", "execution_id", "request_id", "trace_id", "id")
+_EVIDENCE_ARRAY_PRIORITY = ("steps", "events", "transcript", "trace", "actions", "tool_calls")
 
 
 class DiscoveryRequest(ClosedModel):
@@ -38,12 +47,13 @@ class DiscoveryRequest(ClosedModel):
     authorization_confirmed: bool
     protocol_hint: str | None = None
     credential_alias: Identifier | None = None
+    spec_url: str | None = Field(default=None, max_length=256)
 
     @model_validator(mode="after")
     def confirmed(self):
         if self.authorization_confirmed is not True:
             raise ValueError("Explicit metadata discovery authorization required.")
-        if self.protocol_hint not in {None, "openai-chat", "openapi-http", "a2a", "mcp-jsonrpc"}:
+        if self.protocol_hint not in {None, "openai-chat", "openapi-http", "http-json", "a2a", "mcp-jsonrpc"}:
             raise ValueError("Unsupported discovery protocol hint.")
         return self
 
@@ -54,7 +64,7 @@ class DiscoveryError(ValueError):
         super().__init__(code)
 
 
-def canonical_input(raw: str) -> tuple[str, str, str]:
+def canonical_input(raw: str, *, allow_custom_http_path: bool = False) -> tuple[str, str, str]:
     if any(ord(char) < 33 or char in "\\%" for char in raw) or raw != raw.strip():
         raise DiscoveryError("invalid_discovery_url")
     try:
@@ -70,12 +80,416 @@ def canonical_input(raw: str) -> tuple[str, str, str]:
         address = ipaddress.ip_address(parsed.hostname or "")
     except ValueError:
         raise DiscoveryError("unsafe_discovery_destination") from None
-    if not address.is_loopback or parsed.path not in INPUT_PATHS:
+    path = parsed.path or "/"
+    if not address.is_loopback:
         raise DiscoveryError("unsafe_discovery_destination")
+    if path not in INPUT_PATHS:
+        if not (
+            allow_custom_http_path
+            and SAFE_HTTP_PATH.fullmatch(path)
+            and "//" not in path
+            and not any(seg in {".", ".."} for seg in path.split("/"))
+        ):
+            raise DiscoveryError("unsafe_discovery_destination")
     host = f"[{address.compressed}]" if address.version == 6 else str(address)
     origin = f"{parsed.scheme}://{host}:{port}"
-    path = parsed.path or "/"
     return origin, path, origin + path
+
+
+def _check_json_depth(value: object, max_depth: int = MAX_OPENAPI_DEPTH) -> bool:
+    stack: list[tuple[object, int]] = [(value, 0)]
+    while stack:
+        cur, depth = stack.pop()
+        if depth > max_depth:
+            return False
+        if isinstance(cur, dict):
+            stack.extend((v, depth + 1) for v in cur.values())
+        elif isinstance(cur, list):
+            stack.extend((v, depth + 1) for v in cur)
+    return True
+
+
+def _resolve_local_ref(doc: dict, schema: object, *, depth: int = 0, seen: frozenset[str] = frozenset()) -> dict | None:
+    if not isinstance(schema, dict) or depth > MAX_OPENAPI_REF_DEPTH:
+        return None
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        # Strictly reject remote/non-local refs; never fetch external URLs or files.
+        if not ref.startswith("#/") or ref in seen:
+            return None
+        current: object = doc
+        for part in ref[2:].split("/"):
+            key = part.replace("~1", "/").replace("~0", "~")
+            if not isinstance(current, dict) or key not in current:
+                return None
+            current = current[key]
+        return _resolve_local_ref(doc, current, depth=depth + 1, seen=seen | {ref})
+    for combiner in ("anyOf", "oneOf"):
+        variants = schema.get(combiner)
+        if isinstance(variants, list):
+            for variant in variants:
+                resolved = _resolve_local_ref(doc, variant, depth=depth + 1, seen=seen)
+                if isinstance(resolved, dict) and resolved.get("type") != "null":
+                    return resolved
+    return schema
+
+
+def _classify_openapi_auth(
+    doc: dict,
+    op: dict,
+    global_security_reqs: list,
+    security_schemes: dict,
+) -> tuple[bool, list[str], bool]:
+    """Classify OpenAPI operation authentication requirements and Bearer-alias compatibility.
+
+    Returns ``(requires_auth, auth_schemes, auth_scheme_supported)``.
+    """
+    raw_op_sec = op.get("security")
+    if isinstance(raw_op_sec, list):
+        effective_reqs = raw_op_sec
+    else:
+        effective_reqs = global_security_reqs
+
+    # Empty security list or an empty requirement object `{}` permits anonymous access.
+    if effective_reqs:
+        has_anonymous_alt = any(isinstance(req, dict) and len(req) == 0 for req in effective_reqs)
+        requires_auth = not has_anonymous_alt
+    else:
+        requires_auth = False
+
+    header_auth_names: list[str] = []
+    if isinstance(op.get("parameters"), list):
+        for p in op["parameters"][:50]:
+            if (
+                isinstance(p, dict)
+                and p.get("in") == "header"
+                and p.get("required") is not False
+                and str(p.get("name") or "").lower() in {"authorization", "x-api-key"}
+            ):
+                header_auth_names.append(str(p.get("name") or "").lower())
+    if not requires_auth and header_auth_names:
+        requires_auth = True
+
+    if not requires_auth:
+        return False, [], True
+
+    scheme_labels: list[str] = []
+    any_alternative_supported = False
+    has_typed_scheme_req = False
+
+    def _scheme_supported(scheme_name: str) -> tuple[str, bool]:
+        raw_def = security_schemes.get(scheme_name)
+        resolved = _resolve_local_ref(doc, raw_def) if isinstance(raw_def, dict) else None
+        if not isinstance(resolved, dict):
+            # Scheme name referenced without components.securitySchemes definition;
+            # keep compatibility with server-managed Bearer credential alias.
+            return f"unspecified:{scheme_name[:40]}", True
+        stype = str(resolved.get("type") or "").strip().lower()
+        if stype == "http":
+            scheme = str(resolved.get("scheme") or "").strip().lower()
+            label = f"http:{scheme or 'unknown'}"
+            return label, scheme == "bearer"
+        if stype == "apikey":
+            loc = str(resolved.get("in") or "").strip().lower()
+            hdr_name = str(resolved.get("name") or "").strip().lower()
+            label = f"apiKey:{loc or 'unknown'}" + (f":{hdr_name[:32]}" if hdr_name else "")
+            return label, (loc == "header" and hdr_name == "authorization")
+        if stype == "basic":
+            return "basic", False
+        if stype in {"oauth2", "openidconnect", "mutualtls"}:
+            return stype, False
+        return stype or "unknown", False
+
+    for req in effective_reqs[:10]:
+        if not isinstance(req, dict) or not req:
+            continue
+        has_typed_scheme_req = True
+        alt_supported = True
+        for sname in req.keys():
+            if not isinstance(sname, str):
+                alt_supported = False
+                continue
+            label, is_sup = _scheme_supported(sname)
+            if label not in scheme_labels and len(scheme_labels) < 10:
+                scheme_labels.append(label)
+            if not is_sup:
+                alt_supported = False
+        if alt_supported:
+            any_alternative_supported = True
+
+    if not has_typed_scheme_req and header_auth_names:
+        for hname in header_auth_names:
+            lbl = f"header:{hname}"
+            if lbl not in scheme_labels:
+                scheme_labels.append(lbl)
+            if hname == "authorization":
+                any_alternative_supported = True
+
+    return True, scheme_labels, any_alternative_supported
+
+
+def _extract_openapi_candidates(doc: dict, origin: str, *, preferred_path: str | None = None) -> list[dict]:
+    """Bounded, read-only extraction of POST JSON API candidates from an untrusted OpenAPI document."""
+    paths = doc.get("paths")
+    if not isinstance(paths, dict) or not _check_json_depth(doc):
+        return []
+    global_security_reqs = doc.get("security") if isinstance(doc.get("security"), list) else []
+    components = doc.get("components")
+    security_schemes: dict = {}
+    if isinstance(components, dict) and isinstance(components.get("securitySchemes"), dict):
+        security_schemes = components["securitySchemes"]
+    elif isinstance(doc.get("securityDefinitions"), dict):
+        security_schemes = doc["securityDefinitions"]
+    candidates: list[dict] = []
+    for raw_path, path_item in paths.items():
+        if len(candidates) >= MAX_OPENAPI_CANDIDATES:
+            break
+        if (
+            not isinstance(raw_path, str)
+            or not SAFE_HTTP_PATH.fullmatch(raw_path)
+            or "{" in raw_path
+            or "}" in raw_path
+            or "//" in raw_path
+            or any(seg in {".", ".."} for seg in raw_path.split("/"))
+            or not isinstance(path_item, dict)
+        ):
+            continue
+        op = path_item.get("post")
+        if not isinstance(op, dict):
+            continue
+        # Extract JSON request body schema (OpenAPI 3.x or Swagger 2.0 body parameter).
+        req_schema: dict | None = None
+        req_body = op.get("requestBody")
+        if isinstance(req_body, dict):
+            content = req_body.get("content")
+            if isinstance(content, dict):
+                app_json = content.get("application/json")
+                if isinstance(app_json, dict):
+                    req_schema = _resolve_local_ref(doc, app_json.get("schema"))
+        if req_schema is None and isinstance(op.get("parameters"), list):
+            for param in op["parameters"]:
+                if isinstance(param, dict) and param.get("in") == "body":
+                    req_schema = _resolve_local_ref(doc, param.get("schema"))
+                    break
+        if not isinstance(req_schema, dict):
+            continue
+        props = req_schema.get("properties")
+        if not isinstance(props, dict) or not props:
+            continue
+        required_raw = req_schema.get("required")
+        required_set = {r for r in required_raw if isinstance(r, str)} if isinstance(required_raw, list) else set()
+
+        # Identify likely input text field (or OpenAI messages array).
+        input_field: str | None = None
+        ambiguous_input_field = False
+        if "messages" in props and raw_path in {"/v1/chat/completions", "/chat/completions"}:
+            input_field = "messages"
+        else:
+            priority_matches: list[str] = []
+            for cand_name in _INPUT_FIELD_PRIORITY:
+                if cand_name in props:
+                    ps = _resolve_local_ref(doc, props[cand_name])
+                    if isinstance(ps, dict) and ps.get("type") in {None, "string"}:
+                        priority_matches.append(cand_name)
+            if priority_matches:
+                input_field = priority_matches[0]
+                if len(priority_matches) > 1:
+                    ambiguous_input_field = True
+            else:
+                string_fields: list[str] = []
+                for pname, pval in props.items():
+                    if not isinstance(pname, str):
+                        continue
+                    ps = _resolve_local_ref(doc, pval)
+                    if isinstance(ps, dict) and ps.get("type") == "string":
+                        string_fields.append(pname)
+                if string_fields:
+                    input_field = string_fields[0]
+                    if len(string_fields) > 1:
+                        ambiguous_input_field = True
+        if input_field is None:
+            continue
+
+        body_template: dict[str, object] = {}
+        unresolved_required: list[str] = []
+        unresolved_required_specs: list[dict[str, object]] = []
+        prop_items = list(props.items())
+        extraction_incomplete = len(prop_items) > 25
+        covered_names: set[str] = set()
+        for pname, pval in prop_items[:25]:
+            if not isinstance(pname, str) or not pname:
+                continue
+            covered_names.add(pname)
+            ps = _resolve_local_ref(doc, pval) or {}
+            ptype = ps.get("type") if isinstance(ps.get("type"), str) else "string"
+            if pname == input_field:
+                if pname == "messages":
+                    body_template[pname] = [{"role": "user", "content": "{{input}}"}]
+                else:
+                    body_template[pname] = "{{input}}"
+            elif "default" in ps and isinstance(ps["default"], (str, int, float, bool)):
+                body_template[pname] = ps["default"]
+            elif pname in required_set:
+                enum_vals = ps.get("enum")
+                if isinstance(enum_vals, list) and len(enum_vals) == 1 and isinstance(enum_vals[0], (str, int, bool)):
+                    body_template[pname] = enum_vals[0]
+                else:
+                    unresolved_required.append(pname)
+                    spec_entry: dict[str, object] = {"name": pname, "type": ptype, "location": "body"}
+                    if isinstance(enum_vals, list) and enum_vals and all(isinstance(v, (str, int, float, bool)) for v in enum_vals[:20]):
+                        spec_entry["enum"] = list(enum_vals[:20])
+                    unresolved_required_specs.append(spec_entry)
+                    body_template[pname] = f"<REQUIRED:{pname}>"
+
+        # Ensure required fields beyond the 25-property cap or absent from properties are NEVER silently dropped.
+        for req_name in sorted(required_set):
+            if req_name == input_field or req_name in covered_names:
+                continue
+            extraction_incomplete = True
+            ps = _resolve_local_ref(doc, props.get(req_name)) if req_name in props else None
+            ptype = ps.get("type") if isinstance(ps, dict) and isinstance(ps.get("type"), str) else "unknown"
+            unresolved_required.append(req_name)
+            unresolved_required_specs.append({"name": req_name, "type": ptype, "location": "body"})
+            body_template[req_name] = f"<REQUIRED:{req_name}>"
+
+        # Detect unsupported required query/header parameters (other than standard auth headers).
+        unsupported_required_params: list[dict[str, str]] = []
+        if isinstance(op.get("parameters"), list):
+            for param in op["parameters"][:50]:
+                if not isinstance(param, dict) or param.get("required") is not True:
+                    continue
+                loc = str(param.get("in") or "")
+                pname = str(param.get("name") or "")
+                if not pname or loc == "body":
+                    continue
+                if loc == "header" and pname.lower() in {"authorization", "x-api-key"}:
+                    continue
+                unsupported_required_params.append({"name": pname[:64], "in": loc[:32]})
+
+        # Inspect 200/201 JSON response schema for text_path, correlation_id_path, status_path, and evidence_mapping.
+        resp_schema: dict | None = None
+        responses = op.get("responses")
+        if isinstance(responses, dict):
+            for code in ("200", "201", "default"):
+                r_obj = responses.get(code)
+                if not isinstance(r_obj, dict):
+                    continue
+                content = r_obj.get("content")
+                if isinstance(content, dict) and isinstance(content.get("application/json"), dict):
+                    resp_schema = _resolve_local_ref(doc, content["application/json"].get("schema"))
+                    break
+                if "schema" in r_obj:
+                    resp_schema = _resolve_local_ref(doc, r_obj.get("schema"))
+                    break
+
+        text_path: str | None = "choices.0.message.content" if raw_path in {"/v1/chat/completions", "/chat/completions"} else None
+        correlation_id_path: str | None = None
+        status_path: str | None = None
+        evidence_mapping: dict | None = None
+        if isinstance(resp_schema, dict) and isinstance(resp_schema.get("properties"), dict):
+            rprops = resp_schema["properties"]
+            if text_path is None:
+                for tname in _RESPONSE_TEXT_PRIORITY:
+                    if tname in rprops:
+                        text_path = tname
+                        break
+            for cname in _CORRELATION_ID_PRIORITY:
+                if cname in rprops:
+                    correlation_id_path = cname
+                    break
+            if "status" in rprops:
+                status_path = "status"
+            for ename in _EVIDENCE_ARRAY_PRIORITY:
+                if ename in rprops:
+                    es = _resolve_local_ref(doc, rprops[ename])
+                    if isinstance(es, dict) and es.get("type") == "array":
+                        item_schema = _resolve_local_ref(doc, es.get("items"))
+                        item_props = item_schema.get("properties") if isinstance(item_schema, dict) and isinstance(item_schema.get("properties"), dict) else {}
+                        mapping: dict[str, object] = {"items": ename}
+                        for target_key, aliases in (
+                            ("event_id", ("seq", "id", "event_id", "step_id")),
+                            ("action", ("action", "tool", "operation", "name", "type")),
+                            ("arguments", ("action_input", "arguments", "parameters", "args", "input")),
+                            ("decision", ("decision",)),
+                            ("status", ("status",)),
+                            ("observation", ("observation", "result", "output", "content")),
+                            ("timestamp", ("timestamp", "created_at", "at")),
+                        ):
+                            found_key = next((a for a in aliases if a in item_props), None)
+                            if found_key:
+                                mapping[target_key] = found_key
+                        evidence_mapping = mapping
+                        break
+
+        requires_auth, auth_schemes, auth_scheme_supported = _classify_openapi_auth(
+            doc, op, global_security_reqs, security_schemes
+        )
+
+        limitations: list[str] = []
+        if unresolved_required:
+            limitations.append(
+                f"Required request parameters unresolved: {', '.join(unresolved_required)}."
+            )
+        if unsupported_required_params:
+            limitations.append(
+                "Operation requires unsupported query/header parameters: "
+                + ", ".join(f"{p['in']}:{p['name']}" for p in unsupported_required_params)
+                + "."
+            )
+        if extraction_incomplete:
+            limitations.append("Request schema exceeded bounded property extraction limit; review template manually.")
+        if ambiguous_input_field:
+            limitations.append("Multiple candidate string input fields exist; confirm which field receives '{{input}}'.")
+        if text_path is None:
+            limitations.append("Response text field was not reliably identified from schema; confirm response text path manually.")
+        if requires_auth and not auth_scheme_supported:
+            limitations.append(
+                "Operation requires an authentication scheme not supported by server-managed Bearer credential aliases."
+            )
+        elif requires_auth:
+            limitations.append("Operation advertises authentication; select a server-managed credential alias before validating or saving.")
+
+        summary = op.get("summary") if isinstance(op.get("summary"), str) else ""
+        op_id = op.get("operationId") if isinstance(op.get("operationId"), str) else ""
+        suggested_response: dict[str, object] = {"text_path": text_path or ""}
+        if status_path:
+            suggested_response["status_path"] = status_path
+        if correlation_id_path:
+            suggested_response["correlation_id_path"] = correlation_id_path
+        if evidence_mapping:
+            suggested_response["evidence_mapping"] = evidence_mapping
+
+        candidates.append({
+            "path": raw_path,
+            "endpoint": origin + raw_path,
+            "method": "POST",
+            "operation_id": op_id[:128],
+            "summary": summary[:200],
+            "requires_auth": requires_auth,
+            "auth_schemes": auth_schemes,
+            "auth_scheme_supported": auth_scheme_supported,
+            "input_field": input_field,
+            "ambiguous_input_field": ambiguous_input_field,
+            "extraction_incomplete": extraction_incomplete,
+            "unresolved_required_fields": unresolved_required,
+            "unresolved_required_field_specs": unresolved_required_specs,
+            "unsupported_required_parameters": unsupported_required_params,
+            "response_text_path_discovered": text_path is not None,
+            "limitations": limitations,
+            "suggested_http_config": {
+                "method": "POST",
+                "body_template": body_template,
+                "headers": {},
+                "response": suggested_response,
+            },
+            "classification": "advertised_metadata",
+            "runtime_verified": False,
+            "operator_confirmed": False,
+        })
+
+    if preferred_path:
+        candidates.sort(key=lambda c: (0 if c["path"] == preferred_path else 1, c["path"]))
+    return candidates
 
 
 def _short(value, pattern=SAFE_NAME) -> str | None:
@@ -173,14 +587,15 @@ class DiscoveryEngine:
         except httpx.RequestError:
             return "connection_failure", []
 
-    def _read_source(self, client: httpx.Client, origin: str, path: str) -> tuple[str, dict | None]:
+    def _read_source(self, client: httpx.Client, origin: str, path: str, *, allow_spec_path: bool = False) -> tuple[str, dict | None]:
         # Revalidate at the connection boundary. Only literal loopback IPs are
         # accepted; there is no DNS resolution or redirect destination switch.
-        if path not in METADATA_PATHS:
+        if path not in METADATA_PATHS and not (allow_spec_path and SAFE_HTTP_PATH.fullmatch(path)):
             raise DiscoveryError("unsafe_discovery_destination")
         checked_origin, _, _ = canonical_input(origin + "/")
         if checked_origin != origin:
             raise DiscoveryError("unsafe_discovery_destination")
+        byte_limit = MAX_OPENAPI_BYTES if (path == "/openapi.json" or allow_spec_path) else MAX_BYTES
         try:
             with client.stream("GET", origin + path, headers={"Accept": "application/json"}) as response:
                 if 300 <= response.status_code < 400:
@@ -192,7 +607,7 @@ class DiscoveryEngine:
                 parts, size = [], 0
                 for part in response.iter_bytes():
                     size += len(part)
-                    if size > MAX_BYTES:
+                    if size > byte_limit:
                         raise DiscoveryError("discovery_response_too_large")
                     parts.append(part)
                 try:
@@ -207,18 +622,34 @@ class DiscoveryEngine:
 
     def discover(self, request: DiscoveryRequest, *, allowed_aliases: set[str],
                  testcase_items: list[dict], text_case_ids: set[str]) -> dict:
-        origin, input_path, canonical = canonical_input(request.url)
+        allow_custom_http = request.protocol_hint in {"openapi-http", "http-json"} or bool(request.spec_url)
+        origin, input_path, canonical = canonical_input(request.url, allow_custom_http_path=allow_custom_http)
+        spec_path: str | None = None
+        if request.spec_url:
+            spec_origin, spec_path, _ = canonical_input(request.spec_url, allow_custom_http_path=True)
+            if spec_origin != origin:
+                raise DiscoveryError("unsafe_discovery_destination")
         if request.credential_alias and request.credential_alias not in allowed_aliases:
             raise DiscoveryError("unknown_credential_alias")
         sources, models, agent, advertised_tools, advertised_skills = [], [], None, [], []
         mcp_tool_entries: list[dict] = []
         openapi_chat_path = None
+        openapi_candidates: list[dict] = []
         adapter_hint = (next((hint for provider in self.evidence_providers
             if (hint := getattr(provider, "preferred_protocol", lambda **_: None)(
                 origin=origin, input_path=input_path)) is not None), None)
             if request.protocol_hint is None and input_path == "/" else None)
         mcp_mode = (request.protocol_hint == "mcp-jsonrpc" or
                     input_path in {"/mcp", "/jsonrpc"} or adapter_hint == "mcp-jsonrpc")
+        metadata_paths = (
+            ()
+            if mcp_mode
+            else (
+                tuple(dict.fromkeys((spec_path, *METADATA_PATHS)))[:MAX_REQUESTS]
+                if spec_path
+                else METADATA_PATHS
+            )
+        )
         client = httpx.Client(transport=self.transport, timeout=TIMEOUT_SECONDS,
                              follow_redirects=False, trust_env=False)
         try:
@@ -227,8 +658,9 @@ class DiscoveryEngine:
                 advertised_tools = [entry["name"] for entry in mcp_tool_entries]
                 sources.append({"url": canonical, "status": status,
                     "classification": "mcp_tools_list" if status == "advertised" else "unverified"})
-            for path in (() if mcp_mode else METADATA_PATHS):
-                status, body = self._read_source(client, origin, path)
+            for path in metadata_paths:
+                is_spec = path == "/openapi.json" or (spec_path is not None and path == spec_path)
+                status, body = self._read_source(client, origin, path, allow_spec_path=(spec_path is not None and path == spec_path))
                 source = {"url": origin + path, "status": status,
                           "classification": "advertised_metadata" if status == "advertised" else "unverified"}
                 sources.append(source)
@@ -243,13 +675,15 @@ class DiscoveryEngine:
                     else:
                         source["status"] = "malformed"
                         source["classification"] = "unverified"
-                elif path == "/openapi.json":
+                elif is_spec:
                     paths = body.get("paths")
                     if isinstance(paths, dict):
                         openapi_chat_path = next((candidate for candidate in
                             ("/v1/chat/completions", "/chat/completions")
                             if isinstance(paths.get(candidate), dict) and
                             isinstance(paths[candidate].get("post"), dict)), None)
+                        preferred = input_path if input_path not in INPUT_PATHS else None
+                        openapi_candidates = _extract_openapi_candidates(body, origin, preferred_path=preferred)
                     else:
                         source["status"] = "malformed"
                         source["classification"] = "unverified"
@@ -271,34 +705,76 @@ class DiscoveryEngine:
             client.close()
         explicit_chat = input_path in {"/v1/chat/completions", "/chat/completions"}
         chat_path = input_path if explicit_chat else openapi_chat_path
-        endpoint = canonical if mcp_mode and sources[0]["status"] == "advertised" else origin + chat_path if chat_path else None
+        matching_custom_candidate = (
+            next((c for c in openapi_candidates if c["path"] == input_path), None)
+            if input_path not in INPUT_PATHS
+            else (openapi_candidates[0] if len(openapi_candidates) == 1 and not chat_path else None)
+        )
+        unambiguous_custom = (
+            matching_custom_candidate is not None
+            and not matching_custom_candidate.get("unresolved_required_fields")
+            and not matching_custom_candidate.get("unsupported_required_parameters")
+            and not matching_custom_candidate.get("extraction_incomplete")
+            and not matching_custom_candidate.get("ambiguous_input_field")
+            and matching_custom_candidate.get("response_text_path_discovered") is True
+            and not matching_custom_candidate.get("requires_auth")
+        )
+        endpoint = (
+            canonical
+            if mcp_mode and sources[0]["status"] == "advertised"
+            else (
+                origin + chat_path
+                if chat_path
+                else (matching_custom_candidate["endpoint"] if unambiguous_custom and matching_custom_candidate else None)
+            )
+        )
         protocol_candidates = []
         if mcp_mode and endpoint:
             protocol_candidates.append({"id": "mcp-jsonrpc", "classification": "observed_tools_list",
                 "source": canonical, "runtime_verified": False})
-        elif endpoint:
+        elif chat_path and endpoint:
             protocol_candidates.append({"id": "openai-chat", "classification":
                 "operator_supplied" if explicit_chat else "advertised_metadata",
                 "source": canonical if explicit_chat else origin + "/openapi.json",
                 "runtime_verified": False})
-        if any(row["url"].endswith("/openapi.json") and row["status"] == "advertised" for row in sources):
+        elif unambiguous_custom and matching_custom_candidate:
+            protocol_candidates.append({"id": "http-json", "classification": "advertised_metadata",
+                "source": origin + (spec_path or "/openapi.json"),
+                "runtime_verified": False})
+        if any((row["url"].endswith("/openapi.json") or (spec_path and row["url"].endswith(spec_path))) and row["status"] == "advertised" for row in sources):
             protocol_candidates.append({"id": "openapi-http", "classification": "advertised_metadata",
-                "source": origin + "/openapi.json", "runtime_verified": False})
+                "source": origin + (spec_path or "/openapi.json"), "runtime_verified": False})
         if agent:
             protocol_candidates.append({"id": "a2a", "classification": "advertised_metadata",
                 "source": origin + "/.well-known/agent.json", "runtime_verified": False})
         target_id = "local-agent-" + str(urlsplit(origin).port)
-        proposed = ({"id": target_id, "name": "Local AI Agent", "platform_id": "local-agent",
-                     "platform_name": "Local Agent", "endpoint": endpoint,
-                     "protocol": "mcp-jsonrpc" if mcp_mode else "openai-chat",
-                     "model": "mcp-service" if mcp_mode else models[0] if models else "", "timeout_seconds": 30}
-                    if endpoint else None)
+        if mcp_mode and endpoint:
+            proposed = {"id": target_id, "name": "Local AI Agent", "platform_id": "local-agent",
+                        "platform_name": "Local Agent", "endpoint": endpoint,
+                        "protocol": "mcp-jsonrpc", "model": "mcp-service", "timeout_seconds": 30}
+        elif chat_path and endpoint:
+            proposed = {"id": target_id, "name": "Local AI Agent", "platform_id": "local-agent",
+                        "platform_name": "Local Agent", "endpoint": endpoint,
+                        "protocol": "openai-chat", "model": models[0] if models else "", "timeout_seconds": 30}
+        elif unambiguous_custom and matching_custom_candidate:
+            proposed = {"id": target_id, "name": "Local AI Agent", "platform_id": "local-agent",
+                        "platform_name": "Local Agent", "endpoint": matching_custom_candidate["endpoint"],
+                        "protocol": "http-json", "model": None, "timeout_seconds": 30,
+                        "http_config": matching_custom_candidate["suggested_http_config"]}
+        else:
+            proposed = None
         unknown = (["model", "tool_execution", "handler_receipt", "trace_completeness",
                     "agent_selected_action"] + ([] if endpoint else ["mcp_endpoint"])
                    if mcp_mode else
                    [field for field, known in (("runtime_chat_contract", False),
                     ("tool_execution", False), ("model", bool(models)),
                     ("chat_endpoint", bool(endpoint))) if not known])
+        if len(openapi_candidates) > 1 and not chat_path:
+            unknown.append("ambiguous_openapi_operation_selection")
+        if any(c.get("unresolved_required_fields") for c in openapi_candidates):
+            unknown.append("unresolved_required_request_parameters")
+        if any(c.get("requires_auth") for c in openapi_candidates):
+            unknown.append("authentication_credential_alias")
         warnings = ["Metadata and operator input do not verify runtime behavior or execution authorization."]
         for condition, message in (("timeout", "A metadata request timed out."),
                                    ("connection_failure", "A metadata request could not connect."),
@@ -306,7 +782,9 @@ class DiscoveryEngine:
                                    ("http_error", "A metadata endpoint returned an HTTP error.")):
             if any(row["status"] == condition for row in sources):
                 warnings.append(message)
-        if not endpoint:
+        if openapi_candidates and proposed is None:
+            warnings.append("OpenAPI candidates were discovered, but require explicit operator selection and confirmation of unresolved fields or authentication before saving.")
+        elif not endpoint:
             warnings.append("No supported target endpoint was verified; configure the target manually.")
         if mcp_mode:
             warnings.append("MCP tools/list verifies tool metadata only; no tool was invoked or handler execution verified.")
@@ -388,6 +866,7 @@ class DiscoveryEngine:
             "status": status, "connection_status": connection_status,
             "request_count": len(sources), "request_budget": MAX_REQUESTS,
             "metadata_sources": sources, "protocol_candidates": protocol_candidates,
+            "openapi_candidates": openapi_candidates,
             "evidence_candidates": evidence_candidates,
             "advertised_models": [{"id": model, "source": origin + "/v1/models",
                                    "classification": "advertised_metadata"} for model in models],
@@ -463,17 +942,46 @@ class DiscoveryEngine:
         return json.loads(path.read_text(encoding="utf-8"))
 
     def associate(self, discovery_id: str, profile: dict):
-        record = self.validate_association(discovery_id, profile["endpoint"], profile["protocol"])
+        record = self.validate_association(
+            discovery_id,
+            profile["endpoint"],
+            profile["protocol"],
+            credential_alias=profile.get("credential_alias"),
+        )
         record["saved_target_id"] = profile["id"]
         record["profile_revision"] = profile["profile_revision"]
         record["associated_at"] = datetime.now(timezone.utc).isoformat()
         self._save(record)
 
-    def validate_association(self, discovery_id: str, endpoint: str, protocol: str) -> dict:
+    def validate_association(
+        self,
+        discovery_id: str,
+        endpoint: str,
+        protocol: str,
+        *,
+        credential_alias: str | None = None,
+    ) -> dict:
         record = self.load(discovery_id)
-        if (record["proposed_profile"] is None or
-                record["canonical_endpoint"] != endpoint or
-                record["proposed_profile"]["protocol"] != protocol or
-                record["profile_revision"] is not None):
+        if record["profile_revision"] is not None:
             raise DiscoveryError("discovery_profile_mismatch")
-        return record
+        proposed = record.get("proposed_profile")
+        if (
+            isinstance(proposed, dict)
+            and record.get("canonical_endpoint") == endpoint
+            and proposed.get("protocol") == protocol
+        ):
+            return record
+        if protocol == "http-json":
+            candidates = record.get("openapi_candidates") or []
+            matched = next(
+                (c for c in candidates if isinstance(c, dict) and c.get("endpoint") == endpoint),
+                None,
+            )
+            if matched is not None:
+                if matched.get("requires_auth") is True:
+                    if matched.get("auth_scheme_supported") is False:
+                        raise DiscoveryError("unsupported_authentication_scheme")
+                    if not (isinstance(credential_alias, str) and credential_alias.strip()):
+                        raise DiscoveryError("discovery_authentication_required")
+                return record
+        raise DiscoveryError("discovery_profile_mismatch")

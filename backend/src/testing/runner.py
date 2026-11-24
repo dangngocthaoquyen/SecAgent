@@ -21,8 +21,15 @@ from core.models import (
     TestInput,
 )
 from evaluators import BaseEvaluator
+from evaluators.contract import assess_target_scope_compatibility
 from evaluators.hybrid_evaluator import apply_heuristic_sufficiency
-from core.models.evidence import classify_observation_evidence, public_evidence_data
+from core.models.evidence import (
+    PROVENANCE_RANK,
+    canonical_provenance,
+    classify_observation_evidence,
+    is_execution_verified,
+    public_evidence_data,
+)
 from core.models.provenance import build_case_research_provenance
 from observers import (
     BaseObserver,
@@ -145,6 +152,35 @@ class Runner:
                 reason=f"Target reports required capability '{req_capability.strip()}' as unsupported.",
             )
 
+        declared_scope: str | None = None
+        if testcase.evaluation.semantic and isinstance(testcase.evaluation.semantic.trusted_context, dict):
+            raw_scope = testcase.evaluation.semantic.trusted_context.get("evaluation_scope")
+            if isinstance(raw_scope, str) and raw_scope.strip():
+                declared_scope = raw_scope.strip()
+        if declared_scope is None and isinstance(test_input.metadata, dict):
+            rp_meta = test_input.metadata.get("evaluation_rule_provenance")
+            if isinstance(rp_meta, dict) and isinstance(rp_meta.get("evaluation_scope"), str):
+                declared_scope = rp_meta["evaluation_scope"].strip() or None
+        if declared_scope is not None:
+            scope_compat = assess_target_scope_compatibility(
+                declared_scope,
+                getattr(target, "capability_states", {}),
+                capabilities=getattr(target, "capabilities", ()),
+                evidence_sources=getattr(target, "evidence_sources", ()),
+                has_inline_evidence=bool(
+                    isinstance(target.interface.config.get("response"), dict)
+                    and isinstance(target.interface.config["response"].get("evidence_mapping"), dict)
+                ),
+            )
+            if not scope_compat.admitted and scope_compat.capability_state == "unsupported":
+                return EvaluationResult(
+                    status=EvaluationStatus.INCONCLUSIVE,
+                    reason=(
+                        f"Target capability for evaluation scope '{declared_scope}' is explicitly "
+                        f"unsupported ({scope_compat.reason}); execution skipped without downgrading scope."
+                    ),
+                )
+
         try:
             attack_module = self._attack_module_registry.resolve(
                 testcase.attack_module
@@ -200,6 +236,7 @@ class Runner:
                             )
                         )
             if active_collectors:
+                target_corr = observation.metadata.get("target_correlation_id")
                 ctx = CollectorContext(
                     run_id=self._current_run_id or uuid4().hex,
                     case_id=testcase.id,
@@ -207,13 +244,36 @@ class Runner:
                     target_id=str(getattr(target, "id", "") or ""),
                     request_id=str(test_input.parameters.get("request_id") or test_input.id),
                     session_id=str(test_input.parameters.get("session_id") or "") or None,
+                    target_correlation_id=str(target_corr) if isinstance(target_corr, str) and target_corr else None,
                     started_at=self._started_at,
                     ended_at=datetime.now(timezone.utc).isoformat(),
                     allowed_roots=self._allowed_collector_roots,
                     allowed_endpoints=self._allowed_collector_endpoints,
                 )
                 collected = collect_target_evidence(active_collectors, ctx)
-                observation.evidence.extend(collected.evidence)
+                existing_fp_ranks: dict[str, tuple[bool, int]] = {}
+                for ev in observation.evidence:
+                    if isinstance(ev.data, dict) and isinstance(ev.data.get("event_fingerprint"), str):
+                        fp_key = ev.data["event_fingerprint"]
+                        rank = (is_execution_verified(ev), PROVENANCE_RANK[canonical_provenance(ev)])
+                        prev = existing_fp_ranks.get(fp_key)
+                        if prev is None or rank > prev:
+                            existing_fp_ranks[fp_key] = rank
+                dedup_skipped = 0
+                for item in collected.evidence:
+                    fp = item.data.get("event_fingerprint") if isinstance(item.data, dict) else None
+                    if isinstance(fp, str) and fp in existing_fp_ranks:
+                        incoming_rank = (is_execution_verified(item), PROVENANCE_RANK[canonical_provenance(item)])
+                        # Never discard stronger or independently verified evidence in favor of weaker target-reported evidence.
+                        if incoming_rank <= existing_fp_ranks[fp]:
+                            dedup_skipped += 1
+                            continue
+                        existing_fp_ranks[fp] = incoming_rank
+                    elif isinstance(fp, str):
+                        existing_fp_ranks[fp] = (is_execution_verified(item), PROVENANCE_RANK[canonical_provenance(item)])
+                    observation.evidence.append(item)
+                if dedup_skipped:
+                    observation.metadata["deduplicated_collector_events"] = dedup_skipped
                 self._collector_diagnostics.extend(collected.diagnostics)
                 observation.metadata["collector_diagnostics"] = [
                     asdict(item) for item in self._collector_diagnostics
@@ -424,10 +484,30 @@ class Runner:
             "semantic_enabled": bool(semantic and semantic.enabled),
             "execution": None if executed is None else {
                 "success": executed.success, "status_code": executed.status_code,
-                "duration_ms": executed.duration_ms, "response_complete": executed.response_complete},
+                "duration_ms": executed.duration_ms, "response_complete": executed.response_complete,
+                **({"target_correlation_id": executed.target_correlation_id} if executed.target_correlation_id else {}),
+                **({"target_run_status": executed.target_run_status} if executed.target_run_status else {}),
+            },
+            "correlation": {
+                "secagent_run_id": self._current_run_id,
+                "secagent_execution_id": test_input.id,
+                "secagent_testcase_id": testcase.id,
+                "target_correlation_id": (
+                    observed.metadata.get("target_correlation_id")
+                    if observed is not None
+                    else (executed.target_correlation_id if executed is not None else None)
+                ),
+                "target_id_isolated": True,
+            },
             "observation": None if observed is None else {
                 "response_text": observed.response_text if executed is not None and executed.success else None,
                 "response_complete": observed.metadata.get("response_complete"),
+                **({"target_correlation_id": observed.metadata.get("target_correlation_id")}
+                   if observed.metadata.get("target_correlation_id") else {}),
+                **({"target_run_status": observed.metadata.get("target_run_status")}
+                   if observed.metadata.get("target_run_status") else {}),
+                **({"deduplicated_collector_events": observed.metadata.get("deduplicated_collector_events")}
+                   if observed.metadata.get("deduplicated_collector_events") else {}),
                 "evidence": [{"kind": item.kind, "source": item.source, "name": item.name,
                     "success": item.success, "reference": item.reference,
                     "data": public_evidence_data(item)} for item in observed.evidence]},
@@ -453,7 +533,18 @@ class Runner:
                 "attack_surface": context.get("attack_surface"),
                 "trust_boundary": context.get("trust_boundary"),
                 "actual_lower_trust_boundary": context.get("actual_lower_trust_boundary"),
-                "completeness": "Only explicit trusted observer metadata authorizes semantic PASS; HTTP success/finish_reason alone does not."}}
+                "completeness": "Only explicit trusted observer metadata authorizes semantic PASS; HTTP success/finish_reason alone does not.",
+                **(
+                    {
+                        "inline_evidence_disclosure": (
+                            "Inline target-reported events omit raw argument and observation values from public/Judge evidence; "
+                            "integrity digests and structural keys do not establish authorization or verified execution."
+                        )
+                    }
+                    if observed is not None and any(ev.kind == "target_inline_event" for ev in observed.evidence)
+                    else {}
+                ),
+            }}
         # Redact configured credential values even if a response/reason echoes
         # them. Arbitrary private target data still requires caller data policy.
         return self.redact_report_value(target, report)
