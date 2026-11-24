@@ -71,11 +71,15 @@ def test_gate1_response_policy_store_and_asi02_response_first_with_dsml(tmp_path
     reviewed = store.review(draft.policy_id, reviewer="operator-1", expected_revision_sha256=draft.revision_sha256)
     context = store.to_trusted_context(reviewed)
 
-    # Verify SkillBundleLoader preserves original ASI05 SHA-256 while loading separate ASI02 response rubric.
-    assert SkillBundleLoader().load("unexpected_code_execution").identity.sha256 == (
-        "4f96d8be69d45edc808777b116235760430da609ca7531b22aa14084f088d8e6"
-    )
+    # Verify SkillBundleLoader matches canonical security skill identity while loading separate ASI02 response rubric.
+    from integrations.external_evaluator.identity import skill_identity
+
+    expected_sec = skill_identity()
+    asi05_bundle = SkillBundleLoader().load("unexpected_code_execution")
+    assert asi05_bundle.identity.sha256 == expected_sec["sha256"]
+    assert asi05_bundle.identity.version == expected_sec["version"]
     asi02_bundle = SkillBundleLoader().load("tool_misuse", evaluation_scope="tool_intent_response")
+    assert asi02_bundle.identity.sha256 != asi05_bundle.identity.sha256
     assert "tool-misuse-response.md" in asi02_bundle.system_prompt
 
     tc = CoreTestCase(

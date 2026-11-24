@@ -106,8 +106,6 @@ def build_blind_record_testcase(
         }
         if use_semantic:
             context = policy_store.to_trusted_context(reviewed)
-            if category == "goal_hijacking":
-                context.setdefault("source_text", record.prompt)
             evaluation_cfg: dict[str, Any] = {
                 "strategy": "hybrid" if reviewed_rules else "semantic",
                 "rules": [r.model_dump(mode="json") for r in reviewed_rules],
@@ -495,7 +493,17 @@ def resolve_trusted_context_for_target_category(
     if isinstance(app_ctx_row, dict) and app_ctx_row.get("provenance") == "operator_declared":
         raw_draft = app_ctx_row.get("draft")
         if isinstance(raw_draft, dict):
-            if current_target_revision and raw_draft.get("target_revision") != current_target_revision:
+            raw_rev = app_ctx_row.get("revision_sha256")
+            expected_app_rev = sha256(
+                json.dumps(raw_draft, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if raw_draft.get("target_id") != target_id:
+                if reviewed_policy is None:
+                    return None, None, "application_context_target_mismatch"
+            elif not isinstance(raw_rev, str) or raw_rev != expected_app_rev:
+                if reviewed_policy is None:
+                    return None, None, "application_context_integrity_failed"
+            elif current_target_revision and raw_draft.get("target_revision") != current_target_revision:
                 if reviewed_policy is None:
                     return None, None, "application_context_stale"
             else:
@@ -513,7 +521,7 @@ def resolve_trusted_context_for_target_category(
                     else:
                         cleaned_draft[k] = v
                 verified_app_draft = cleaned_draft
-                app_rev_sha = str(app_ctx_row.get("revision_sha256") or "")
+                app_rev_sha = raw_rev
 
     if reviewed_policy is not None and policy_store is not None:
         ctx = policy_store.to_trusted_context(reviewed_policy)
@@ -524,6 +532,28 @@ def resolve_trusted_context_for_target_category(
             ctx["application_context_sha256"] = app_rev_sha
             ctx["application_context_revision_sha256"] = app_rev_sha
             ctx["application_context_provenance"] = "operator_declared"
+            # Fill only fields left "unknown" by the reviewed policy using operator-confirmed
+            # Application Context declarations; never override reviewed policy fields.
+            raw_tools = str(verified_app_draft.get("available_tools") or "")
+            confirmed_tools = [t.strip() for t in re.split(r"[,;\n]+", raw_tools) if t.strip()]
+            auth_actions = str(verified_app_draft.get("authorized_actions") or "").strip()
+            auth_required = str(verified_app_draft.get("authorization_required") or "").strip()
+            users_val = str(verified_app_draft.get("users") or "").strip()
+            if norm_category == "tool_misuse":
+                if ctx.get("declared_tool_capabilities") == "unknown" and confirmed_tools:
+                    ctx["declared_tool_capabilities"] = confirmed_tools
+                if ctx.get("authorized_tool_operations") == "unknown" and auth_actions:
+                    ctx["authorized_tool_operations"] = [auth_actions]
+                if ctx.get("tool_authorization_status") == "unknown" and auth_required:
+                    ctx["tool_authorization_status"] = auth_required
+            elif norm_category == "identity_privilege_abuse":
+                if ctx.get("established_identity") == "unknown" and users_val:
+                    ctx["established_identity"] = users_val
+                if ctx.get("allowed_privileges") == "unknown" and auth_actions:
+                    ctx["allowed_privileges"] = auth_actions
+            elif norm_category == "unexpected_code_execution":
+                if ctx.get("allowed_command_behavior") == "unknown" and auth_actions:
+                    ctx["allowed_command_behavior"] = auth_actions
         return ctx, reviewed_policy, None
 
     if verified_app_draft is not None and app_rev_sha:
@@ -556,7 +586,6 @@ def resolve_trusted_context_for_target_category(
             if not exec_boundary:
                 return None, None, "policy_review_required"
 
-        rev_key = POLICY_REVISION_KEYS[norm_category]
         prohibited = (
             verified_app_draft.get("prohibited_resources")
             or verified_app_draft.get("high_risk_actions")
@@ -576,14 +605,14 @@ def resolve_trusted_context_for_target_category(
         )
         raw_tools = str(verified_app_draft.get("available_tools") or "")
         tool_list = [t.strip() for t in re.split(r"[,;\n]+", raw_tools) if t.strip()]
+        auth_actions = str(verified_app_draft.get("authorized_actions") or "").strip()
+        auth_required = str(verified_app_draft.get("authorization_required") or "").strip()
+        users_val = str(verified_app_draft.get("users") or "").strip()
         ctx = {
             "evaluation_scope": DEFAULT_EVALUATION_SCOPES[norm_category],
             "context_source": "application_context",
-            "policy_id": f"appctx-{target_id}",
             "reviewed_policy_id": None,
             "reviewed_policy_revision_sha256": None,
-            rev_key: app_rev_sha,
-            "policy_review_status": "reviewed",
             "delivery_surface": "direct_chat",
             "allowed_benign_context": allowed,
             "expected_response_boundary": boundary,
@@ -600,14 +629,20 @@ def resolve_trusted_context_for_target_category(
             ctx["prohibited_goal_behavior"] = prohibited
         elif norm_category == "tool_misuse":
             ctx["prohibited_tool_behavior"] = prohibited
+            ctx["declared_tool_capabilities"] = tool_list if tool_list else "unknown"
+            ctx["actual_callable_capabilities"] = "unknown"
+            ctx["authorized_tool_operations"] = [auth_actions] if auth_actions else "unknown"
+            ctx["unauthorized_tool_operations"] = [prohibited]
+            ctx["tool_authorization_status"] = auth_required if auth_required else "unknown"
             ctx["authorized_tools"] = tool_list
         elif norm_category == "identity_privilege_abuse":
+            ctx["established_identity"] = users_val if users_val else "unknown"
+            ctx["allowed_privileges"] = auth_actions if auth_actions else "unknown"
             ctx["prohibited_identity_claim"] = prohibited
             ctx["prohibited_authority_claim"] = prohibited
-            ctx["asi03_policy_id"] = f"appctx-{target_id}"
         elif norm_category == "unexpected_code_execution":
+            ctx["allowed_command_behavior"] = auth_actions if auth_actions else "unknown"
             ctx["prohibited_command_behavior"] = prohibited
-            ctx["asi05_policy_id"] = f"appctx-{target_id}"
         return ctx, None, None
 
     if has_unverified_fields:
@@ -660,8 +695,6 @@ def prepare_generic_case_pair(
     serialized_rules = [r.model_dump(mode="json") for r in validated_rules]
     if trusted_context is not None:
         ctx = {**trusted_context}
-        if norm_category == "goal_hijacking":
-            ctx.setdefault("source_text", prompt)
         eval_cfg: dict[str, Any] = {
             "strategy": evaluation_strategy or ("hybrid" if serialized_rules else "semantic"),
             "rules": serialized_rules,
@@ -857,8 +890,6 @@ def build_live_case_and_input(
         if reviewed.category != norm_cat:
             raise ValueError(f"Reviewed policy '{policy_id}' is for '{reviewed.category}', not '{norm_cat}'.")
         trusted_ctx = policy_store.to_trusted_context(reviewed)
-        if norm_cat == "goal_hijacking":
-            trusted_ctx.setdefault("source_text", test_input.prompt or "")
         policy_rules = policy_store.reviewed_rules(reviewed)
         combined_rules = list(bound_tc.evaluation.rules) + list(policy_rules)
         if combined_rules:

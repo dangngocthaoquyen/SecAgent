@@ -58,6 +58,30 @@ POLICY_REVISION_KEYS: dict[PolicyCategory, str] = {
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
+RESERVED_EXTRA_RULE_KEYS: frozenset[str] = frozenset({
+    "evaluation_scope",
+    "context_source",
+    "policy_id",
+    "reviewed_policy_id",
+    "reviewed_policy_revision_sha256",
+    "policy_review_status",
+    "asi01_policy_revision_sha256",
+    "asi02_policy_revision_sha256",
+    "asi03_policy_revision_sha256",
+    "asi03_contract_revision_sha256",
+    "asi05_policy_revision_sha256",
+    "asi03_policy_id",
+    "asi05_policy_id",
+    "delivery_surface",
+    "allowed_benign_context",
+    "expected_response_boundary",
+    "application_details",
+    "application_context_id",
+    "application_context_sha256",
+    "application_context_revision_sha256",
+    "application_context_provenance",
+})
+
 
 def canonical_policy_hash(payload: dict[str, Any]) -> str:
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -70,6 +94,15 @@ def normalize_policy_category(raw: str) -> PolicyCategory:
     if mapped is None:
         raise ValueError(f"Unsupported ASI policy category: {raw!r}")
     return mapped
+
+
+def _validate_extra_rules_canonical_protection(extra_rules: dict[str, Any]) -> None:
+    forbidden = sorted(k for k in extra_rules if k in RESERVED_EXTRA_RULE_KEYS)
+    if forbidden:
+        raise ValueError(
+            "reserved_canonical_field: extra_rules cannot override canonical policy fields: "
+            + ", ".join(forbidden)
+        )
 
 
 def _validate_extra_rules_trace_scope(evaluation_scope: str, extra_rules: dict[str, Any]) -> None:
@@ -126,6 +159,7 @@ class ResponsePolicyDraft(BaseModel):
 
     @model_validator(mode="after")
     def _validate_evaluation_rules(self) -> "ResponsePolicyDraft":
+        _validate_extra_rules_canonical_protection(self.extra_rules)
         _validate_extra_rules_trace_scope(self.evaluation_scope, self.extra_rules)
         if not self.evaluation_rules:
             return self
@@ -272,9 +306,18 @@ class ResponsePolicyStore:
     def to_trusted_context(self, policy: ReviewedResponsePolicy) -> dict[str, Any]:
         """Convert a verified reviewed policy into HybridEvaluator trusted_context."""
         verified = self.require_reviewed(policy.policy_id, target_id=policy.target_id)
+        _validate_extra_rules_canonical_protection(verified.draft.extra_rules)
         _validate_extra_rules_trace_scope(verified.draft.evaluation_scope, verified.draft.extra_rules)
         rev_key = POLICY_REVISION_KEYS[verified.category]
+        # Start from validated category-specific extra_rules, then overlay canonical
+        # policy fields last so extra_rules can never override policy identity,
+        # review status, revision digest, or evaluation scope.
         context: dict[str, Any] = {
+            k: v
+            for k, v in verified.draft.extra_rules.items()
+            if k not in RESERVED_EXTRA_RULE_KEYS
+        }
+        context.update({
             "evaluation_scope": verified.draft.evaluation_scope,
             "context_source": "reviewed_policy",
             "policy_id": verified.policy_id,
@@ -285,8 +328,7 @@ class ResponsePolicyStore:
             "delivery_surface": verified.draft.delivery_surface,
             "allowed_benign_context": verified.draft.allowed_benign_context,
             "expected_response_boundary": verified.draft.expected_response_boundary,
-            **verified.draft.extra_rules,
-        }
+        })
         if verified.draft.evaluation_scope in TOOL_CALL_TRACE_SCOPES:
             context["required_trace_scope"] = verified.draft.evaluation_scope
         if verified.category == "goal_hijacking":
@@ -296,11 +338,19 @@ class ResponsePolicyStore:
             context["prohibited_goal_behavior"] = verified.draft.prohibited_behavior
         elif verified.category == "tool_misuse":
             context["prohibited_tool_behavior"] = verified.draft.prohibited_behavior
+            context.setdefault("declared_tool_capabilities", "unknown")
+            context.setdefault("actual_callable_capabilities", "unknown")
+            context.setdefault("authorized_tool_operations", "unknown")
+            context.setdefault("unauthorized_tool_operations", [verified.draft.prohibited_behavior])
+            context.setdefault("tool_authorization_status", "unknown")
         elif verified.category == "identity_privilege_abuse":
+            context.setdefault("established_identity", "unknown")
+            context.setdefault("allowed_privileges", "unknown")
             context.setdefault("prohibited_identity_claim", verified.draft.prohibited_behavior)
             context.setdefault("prohibited_authority_claim", verified.draft.prohibited_behavior)
             context["asi03_policy_id"] = verified.policy_id
         elif verified.category == "unexpected_code_execution":
+            context.setdefault("allowed_command_behavior", "unknown")
             context["prohibited_command_behavior"] = verified.draft.prohibited_behavior
             context["asi05_policy_id"] = verified.policy_id
         return context

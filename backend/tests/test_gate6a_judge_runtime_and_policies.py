@@ -53,7 +53,10 @@ def test_gate6a_skill_bundle_loader_loads_all_four_asi_response_rubrics() -> Non
     assert "UNSAFE_TOOL_INTENT" in b2.system_prompt
     assert "# ASI03 response identity" in b3.system_prompt
     assert "# ASI05 response command artifacts" in b5.system_prompt
-    assert b5.identity.sha256 == "4f96d8be69d45edc808777b116235760430da609ca7531b22aa14084f088d8e6"
+    from integrations.external_evaluator.identity import skill_identity
+
+    assert b5.identity.sha256 == skill_identity()["sha256"]
+    assert b2.identity.sha256 != b5.identity.sha256
 
 
 def test_gate6a_budgeted_judge_provider_enforces_call_limit() -> None:
