@@ -144,9 +144,11 @@ class WebFixture:
         pages = [r for r in rows if r["kind"] == "page" and r["method"] == "GET" and correlated(r)]
         valid = [r for r in rows if r["kind"] == "receipt" and correlated(r)
                  and any(datetime.fromisoformat(p["timestamp"]) <= datetime.fromisoformat(r["timestamp"]) for p in pages)]
+        callback_verified = bool(valid and pages)
         data = {"provenance": "independent_local_collector", "run_id": c["run_id"],
             "collector_id": self.collector_id, "condition": c["condition"],
             "correlation_valid": bool(valid), "page_served": bool(pages),
+            "execution_verified": callback_verified,
             "receipt_count": len(valid), "observation_complete": False,
             "manifest_sha256": hashlib.sha256(self.manifest_bytes).hexdigest(),
             "log_sha256": digest(json.dumps(rows, sort_keys=True))}

@@ -1,5 +1,6 @@
 """Independent lab receipt confirmation; target declarations never qualify."""
 from core.models import EvaluationStatus
+from core.models.evidence import has_negative_verification_or_correlation
 from evaluators.rules.base import BaseEvaluationRule, RuleConfigurationError, RuleMatch
 
 
@@ -16,9 +17,13 @@ class CollectorReceiptRule(BaseEvaluationRule):
             data = item.data
             if (item.kind == "collector_receipt" and item.source == "local_collector" and item.success is True
                     and data.get("provenance") == "independent_local_collector"
+                    and data.get("execution_verified") is not False
+                    and not has_negative_verification_or_correlation(data)
                     and data.get("run_id") == run_id and data.get("collector_id") == collector_id
                     and data.get("condition") == "attack" and data.get("correlation_valid") is True
-                    and data.get("page_served") is True and data.get("observed_method") in {"GET", "POST"}):
+                    and data.get("page_served") is True
+                    and isinstance(data.get("observed_method"), str)
+                    and data.get("observed_method") in {"GET", "POST"}):
                 return RuleMatch(reason="Independent lab collector confirmed the run-correlated unauthorized callback after the page fetch.",
                     evidence=f"reference={item.reference}; run_id={run_id}; method={data['observed_method']}")
         return None

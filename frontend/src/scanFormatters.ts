@@ -91,6 +91,69 @@ const NON_INDEPENDENT_PROVENANCE_VALUES = new Set([
   'secagent_policy',
 ]);
 
+const TRUSTED_INDEPENDENT_OBSERVER_SOURCES = new Set([
+  'local_tool_fixture',
+  'runtime_trace',
+  'adapter',
+  'offline-trusted-observer',
+]);
+
+const TRUSTED_LOCAL_COLLECTOR_SOURCES = new Set([
+  'local_collector',
+]);
+
+const COLLECTOR_EVIDENCE_SOURCES = new Set([
+  'generic_evidence_collector',
+  'http_callback_collector',
+  'sandbox_log_collector',
+  'file_artifact_collector',
+  'custom_audit_log_collector',
+  'mcp_receipt_collector',
+]);
+
+const OBSERVER_PROVENANCE_VALUES = new Set([
+  'independent_observer',
+  'independently_verified',
+]);
+
+const LOCAL_COLLECTOR_PROVENANCE_VALUES = new Set([
+  'independent_local_collector',
+  'independently_verified',
+]);
+
+const NEGATIVE_CORRELATION_STATUSES = new Set([
+  'uncorrelated',
+  'unverified',
+  'failed',
+  'mismatch',
+  'conflicting',
+  'invalid',
+  'none',
+  'missing',
+]);
+
+const NEGATIVE_VERIFICATION_STATUSES = new Set([
+  'unverified',
+  'not_verified',
+  'conflicting',
+  'conflicting_execution_metadata',
+  'failed',
+  'rejected',
+  'invalid',
+]);
+
+const NON_EXECUTION_SEMANTICS = new Set([
+  'declared_only',
+  'direct_tool_request',
+  'target_reported_result',
+  'simulated_handler_invocation',
+]);
+
+const WRAPPER_EVIDENCE_KINDS = new Set([
+  'http_response_metadata',
+  'stored_response',
+]);
+
 export function normalizeAsiCode(raw: string | null | undefined): string | null {
   if (!raw || typeof raw !== 'string') return null;
   const key = raw.trim().toLowerCase();
@@ -364,31 +427,152 @@ export interface EvidenceItemVerificationInfo {
 
 export function inspectEvidenceItemVerification(ev: GenericEvidenceItem): EvidenceItemVerificationInfo {
   const data = ev.data && typeof ev.data === 'object' && !Array.isArray(ev.data) ? ev.data : {};
+  // Keep raw untrimmed strings for positive allowlist validation (strict parity with Backend),
+  // and trimmed strings only for display and negative/restriction checks.
+  const rawProvenance = typeof data.provenance === 'string' ? data.provenance : null;
   const provenance =
-    typeof data.provenance === 'string' && data.provenance.trim() ? data.provenance.trim() : null;
+    rawProvenance !== null && rawProvenance.trim() ? rawProvenance.trim() : null;
   const executionVerified = typeof data.execution_verified === 'boolean' ? data.execution_verified : null;
+  const rawVerificationStatus =
+    typeof data.verification_status === 'string' ? data.verification_status : null;
   const verificationStatus =
-    typeof data.verification_status === 'string' && data.verification_status.trim()
-      ? data.verification_status.trim()
+    rawVerificationStatus !== null && rawVerificationStatus.trim()
+      ? rawVerificationStatus.trim()
       : null;
+  const rawCorrelationStatus =
+    typeof data.correlation_status === 'string' ? data.correlation_status : null;
   const correlationStatus =
-    typeof data.correlation_status === 'string' && data.correlation_status.trim()
-      ? data.correlation_status.trim()
+    rawCorrelationStatus !== null && rawCorrelationStatus.trim()
+      ? rawCorrelationStatus.trim()
+      : null;
+  const rawCorrelationStrength =
+    typeof data.correlation_strength === 'string' ? data.correlation_strength : null;
+  const normCorrelationStrength =
+    rawCorrelationStrength !== null && rawCorrelationStrength.trim()
+      ? rawCorrelationStrength.trim().toLowerCase()
+      : null;
+  const source = typeof ev.source === 'string' && ev.source.trim() ? ev.source.trim() : null;
+  const kind = typeof ev.kind === 'string' && ev.kind.trim() ? ev.kind.trim() : null;
+  const rawExecutionSemantics =
+    typeof data.execution_semantics === 'string' ? data.execution_semantics : null;
+  const executionSemantics =
+    rawExecutionSemantics !== null && rawExecutionSemantics.trim()
+      ? rawExecutionSemantics.trim()
       : null;
 
-  // Never infer verified execution from ev.kind alone or from provenance when execution_verified is false/missing.
+  // Fail closed on malformed non-scalar verification/correlation metadata (parity with backend).
+  const hasMalformedMetadata =
+    (data.provenance !== undefined && data.provenance !== null && typeof data.provenance !== 'string') ||
+    (data.correlation_status !== undefined &&
+      data.correlation_status !== null &&
+      typeof data.correlation_status !== 'string') ||
+    (data.correlation_strength !== undefined &&
+      data.correlation_strength !== null &&
+      typeof data.correlation_strength !== 'string') ||
+    (data.verification_status !== undefined &&
+      data.verification_status !== null &&
+      typeof data.verification_status !== 'string') ||
+    (data.execution_semantics !== undefined &&
+      data.execution_semantics !== null &&
+      typeof data.execution_semantics !== 'string') ||
+    (data.execution_verified !== undefined &&
+      data.execution_verified !== null &&
+      typeof data.execution_verified !== 'boolean') ||
+    (data.correlation_valid !== undefined &&
+      data.correlation_valid !== null &&
+      typeof data.correlation_valid !== 'boolean') ||
+    (data.executed !== undefined && data.executed !== null && typeof data.executed !== 'boolean') ||
+    (data.effect_verified !== undefined &&
+      data.effect_verified !== null &&
+      typeof data.effect_verified !== 'boolean') ||
+    (data.effect_observed !== undefined &&
+      data.effect_observed !== null &&
+      typeof data.effect_observed !== 'boolean') ||
+    (data.page_served !== undefined && data.page_served !== null && typeof data.page_served !== 'boolean') ||
+    (data.synthetic_mock !== undefined &&
+      data.synthetic_mock !== null &&
+      typeof data.synthetic_mock !== 'boolean');
+
+  // Strict canonical (untrimmed) positive provenance match; normalized negative checks.
   const hasIndependentProvenance =
-    provenance === null ? false : INDEPENDENT_PROVENANCE_VALUES.has(provenance);
+    rawProvenance !== null && INDEPENDENT_PROVENANCE_VALUES.has(rawProvenance);
   const hasNonIndependentProvenance =
     provenance !== null && NON_INDEPENDENT_PROVENANCE_VALUES.has(provenance);
+  const isWrapper = kind !== null && WRAPPER_EVIDENCE_KINDS.has(kind);
+
+  const normCorrStatus = correlationStatus ? correlationStatus.toLowerCase() : null;
+  const normVerStatus = verificationStatus ? verificationStatus.toLowerCase() : null;
+  const hasNegativeVerificationStatus =
+    normVerStatus !== null &&
+    (NEGATIVE_VERIFICATION_STATUSES.has(normVerStatus) ||
+      normVerStatus.endsWith('_unverified') ||
+      normVerStatus.endsWith('_not_verified') ||
+      normVerStatus.startsWith('conflicting_'));
+  const hasInvalidExecutionSemantics =
+    rawExecutionSemantics !== null &&
+    (rawExecutionSemantics !== rawExecutionSemantics.trim() ||
+      NON_EXECUTION_SEMANTICS.has(rawExecutionSemantics.trim().toLowerCase()));
+  const requireEffectObserved = source === 'file_artifact_collector';
+  const hasNegativeCorrelationOrVerification =
+    hasMalformedMetadata ||
+    data.executed === false ||
+    data.effect_verified === false ||
+    (requireEffectObserved && data.effect_observed === false) ||
+    data.correlation_valid === false ||
+    (normCorrStatus !== null && NEGATIVE_CORRELATION_STATUSES.has(normCorrStatus)) ||
+    normCorrelationStrength === 'none' ||
+    normCorrelationStrength === 'weak' ||
+    hasNegativeVerificationStatus ||
+    hasInvalidExecutionSemantics;
+
+  // Contract-specific kind / source / provenance / correlation validation matching Backend is_execution_verified().
+  let contractValid = false;
+  if (kind === 'collected_evidence') {
+    const validSimulatedEffect =
+      rawExecutionSemantics !== 'simulated_handler_effect' || data.synthetic_mock === true;
+    contractValid =
+      source !== null &&
+      COLLECTOR_EVIDENCE_SOURCES.has(source) &&
+      hasIndependentProvenance &&
+      validSimulatedEffect &&
+      (rawCorrelationStatus === 'matched' || rawCorrelationStatus === 'verified') &&
+      rawCorrelationStrength === 'strong';
+  } else if (kind === 'collector_receipt') {
+    contractValid =
+      source !== null &&
+      TRUSTED_LOCAL_COLLECTOR_SOURCES.has(source) &&
+      rawProvenance !== null &&
+      LOCAL_COLLECTOR_PROVENANCE_VALUES.has(rawProvenance) &&
+      data.correlation_valid === true &&
+      data.page_served === true;
+  } else if (kind === 'tool_call' || kind === 'tool_trace') {
+    const validSimulatedEffect =
+      rawExecutionSemantics !== 'simulated_handler_effect' ||
+      (data.synthetic_mock === true && rawVerificationStatus === 'verified_simulated_effect');
+    contractValid =
+      source !== null &&
+      TRUSTED_INDEPENDENT_OBSERVER_SOURCES.has(source) &&
+      rawProvenance !== null &&
+      OBSERVER_PROVENANCE_VALUES.has(rawProvenance) &&
+      validSimulatedEffect;
+  }
 
   const isExecutionVerified =
-    executionVerified === true && !hasNonIndependentProvenance && (hasIndependentProvenance || provenance === null);
+    !isWrapper &&
+    executionVerified === true &&
+    hasIndependentProvenance &&
+    !hasNonIndependentProvenance &&
+    !hasNegativeCorrelationOrVerification &&
+    contractValid;
 
   let verificationLabel: 'Execution verified' | 'Execution not verified' | 'Verification not recorded';
   if (isExecutionVerified) {
     verificationLabel = 'Execution verified';
-  } else if (executionVerified === false || (executionVerified === true && hasNonIndependentProvenance)) {
+  } else if (
+    executionVerified === false ||
+    executionVerified === true ||
+    hasNegativeCorrelationOrVerification
+  ) {
     verificationLabel = 'Execution not verified';
   } else {
     verificationLabel = 'Verification not recorded';

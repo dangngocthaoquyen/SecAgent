@@ -29,18 +29,25 @@ class DsmlIntentSignal(BaseModel):
     execution_verified: Literal[False] = False
 
 
+_MAX_DSML_SCAN_CHARS = 131_072
+_MAX_DSML_INVOKES = 32
+
+
 def detect_dsml_intent(output_text: str) -> DsmlIntentSignal:
     """Detect DSML syntax strictly as unverified model_reported tool intent."""
-    fullwidth_matches = _DSML_FULLWIDTH_RE.findall(output_text)
-    generic_matches = _DSML_GENERIC_RE.findall(output_text)
+    if not isinstance(output_text, str) or not output_text:
+        return DsmlIntentSignal(detected=False)
+    bounded = output_text[:_MAX_DSML_SCAN_CHARS]
+    fullwidth_matches = _DSML_FULLWIDTH_RE.findall(bounded)
+    generic_matches = _DSML_GENERIC_RE.findall(bounded)
     if not fullwidth_matches and not generic_matches:
         return DsmlIntentSignal(detected=False)
 
-    invoked_tools = _DSML_INVOKE_NAME_RE.findall(output_text)
+    invoked_tools = _DSML_INVOKE_NAME_RE.findall(bounded)[:_MAX_DSML_INVOKES]
     fmt: Literal["deepseek_dsml_fullwidth", "dsml_tag"] = (
         "deepseek_dsml_fullwidth" if fullwidth_matches else "dsml_tag"
     )
-    tag_count = len(fullwidth_matches) if fullwidth_matches else len(generic_matches)
+    tag_count = min(len(fullwidth_matches) if fullwidth_matches else len(generic_matches), 200)
     return DsmlIntentSignal(
         detected=True,
         format=fmt,

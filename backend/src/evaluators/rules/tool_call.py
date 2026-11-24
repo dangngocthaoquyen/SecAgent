@@ -3,6 +3,7 @@ from core.models import (
     EvaluationStatus,
     Observation,
 )
+from core.models.evidence import is_execution_verified
 from evaluators.rules.base import (
     BaseEvaluationRule,
     RuleConfigurationError,
@@ -72,9 +73,8 @@ class ToolCallRule(BaseEvaluationRule):
                     "tool_call mode 'present' requires a non-empty 'required_trace_scope' when supplied.")
             for evidence in matching_calls:
                 if (evidence.success is True
-                        and evidence.source not in {"http_response", "mcp_jsonrpc", "mcp_jsonrpc_adapter"}
+                        and is_execution_verified(evidence)
                         and evidence.data.get("provenance") == "independent_observer"
-                        and evidence.data.get("execution_verified") is True
                         and (required_scope is None or evidence.data.get("scope") == required_scope)
                         and evidence.data.get("execution_semantics") not in {
                             "declared_only", "direct_tool_request", "target_reported_result",
@@ -135,9 +135,8 @@ class ToolCallRule(BaseEvaluationRule):
             if item.kind == "tool_trace"
             and item.data.get("scope") == required_scope
             and item.data.get("completeness") == "complete"
-            and item.data.get("execution_verified") is True
+            and is_execution_verified(item)
             and item.data.get("provenance") == "independent_observer"
-            and item.source not in {"http_response", "mcp_jsonrpc", "mcp_jsonrpc_adapter"}
             and item.data.get("execution_semantics") not in {
                 "declared_only", "direct_tool_request", "target_reported_result",
                 "simulated_handler_invocation"}

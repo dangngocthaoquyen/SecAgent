@@ -8,7 +8,11 @@ import re
 from typing import Any
 
 from core.models import ExecutionResult, TargetProfile, TestInput
-from core.models.dsml import detect_dsml_intent
+from core.models.tool_intent import (
+    build_tool_intent_event,
+    extract_structured_tool_fingerprints,
+    extract_tool_intent_signals,
+)
 from targets.adapters.base import BaseTargetAdapter
 
 
@@ -75,40 +79,44 @@ class OfflineStoredTargetAdapter(BaseTargetAdapter):
                     func = call.get("function") if isinstance(call.get("function"), dict) else {}
                     tool_name = call.get("name") or func.get("name") or "declared_tool"
                     raw_args = call.get("arguments") if "arguments" in call else func.get("arguments")
-                    arg_hash = sha256(
-                        json.dumps(raw_args, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
-                    ).hexdigest()
+                    arg_hash: str | None = None
+                    try:
+                        if isinstance(raw_args, str):
+                            arg_bytes = raw_args.encode("utf-8")
+                        else:
+                            arg_bytes = json.dumps(
+                                raw_args, sort_keys=True, ensure_ascii=False, default=str
+                            ).encode("utf-8")
+                        if len(arg_bytes) <= 65536:
+                            arg_hash = sha256(arg_bytes).hexdigest()
+                    except (UnicodeEncodeError, TypeError, ValueError, RecursionError):
+                        arg_hash = None
+                    decl_data: dict[str, Any] = {
+                        "provenance": "target_reported",
+                        "execution_verified": False,
+                        "observation_scope": "target_response_tool_declaration",
+                        "execution_semantics": "declared_only",
+                        "verification_status": "target_reported_unverified",
+                    }
+                    if arg_hash is not None:
+                        decl_data["arguments_sha256"] = arg_hash
                     events.append({
                         "kind": "declared_tool_call",
                         "source": "http_response",
                         "name": str(tool_name),
                         "success": None,
                         "reference": call.get("id") if isinstance(call.get("id"), str) else response_id,
-                        "data": {
-                            "observation_scope": "target_response_tool_declaration",
-                            "execution_semantics": "declared_only",
-                            "verification_status": "target_reported_unverified",
-                            "arguments_sha256": arg_hash,
-                        },
+                        "data": decl_data,
                     })
 
-        dsml = detect_dsml_intent(stored_response)
-        if dsml.detected:
-            events.append({
-                "kind": "model_reported_tool_intent",
-                "source": "response_output_dsml",
-                "name": "dsml_tool_invocation_markup",
-                "success": None,
-                "reference": response_id,
-                "data": {
-                    "provenance": "model_reported",
-                    "execution_verified": False,
-                    "format": dsml.format,
-                    "tag_count": dsml.tag_count,
-                    "invoke_count": dsml.invoke_count,
-                    "invoked_tool_names": list(dsml.invoked_tool_names),
-                },
-            })
+        structured_fps = extract_structured_tool_fingerprints(tool_calls)
+        intent_signal = extract_tool_intent_signals(
+            stored_response,
+            structured_events=events,
+            structured_fingerprints=structured_fps,
+        )
+        if intent_signal.detected:
+            events.append(build_tool_intent_event(intent_signal, reference=response_id))
 
         return ExecutionResult(
             success=True,

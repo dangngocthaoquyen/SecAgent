@@ -4,7 +4,7 @@ import re
 
 from core.models import EvaluationResult, EvaluationStatus, Observation, TestCase
 from core.models.asi05_execution import Asi05ExecutionDecision, Asi05ExecutionRequest
-from core.models.evidence import classify_observation_evidence
+from core.models.evidence import classify_observation_evidence, is_execution_verified
 from integrations.external_evaluator.models import (
     EvaluationRequest, ExternalEvaluationOutcome, ExternalEvaluationResult, ProviderFaultCode,
 )
@@ -40,9 +40,9 @@ _TARGET_REPORT_SOURCES = {"http_response", "mcp_jsonrpc", "mcp_jsonrpc_adapter"}
 def _independent_action(item, scope, correlation=None, *, allow_simulated=False):
     """Check one action/trace against the reviewed observation scope."""
     data = item.data
-    if (item.source in _TARGET_REPORT_SOURCES or
+    if (not is_execution_verified(item) or
+            item.source in _TARGET_REPORT_SOURCES or
             data.get("provenance") != "independent_observer" or
-            data.get("execution_verified") is not True or
             data.get("scope") != scope or
             (correlation is not None and data.get("correlation_reference") != correlation)):
         return False

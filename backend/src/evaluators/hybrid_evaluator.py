@@ -5,7 +5,7 @@ from typing import Callable
 
 from core.models import EvaluationResult, EvaluationStatus, Observation, TestCase
 from core.models.asi05_execution import Asi05ExecutionDecision
-from core.models.evidence import classify_observation_evidence
+from core.models.evidence import classify_observation_evidence, is_execution_verified
 from evaluators.base import BaseEvaluator
 from evaluators.asi05_execution import ExecutionEvidenceRejected
 from evaluators.evaluation_request_builder import EvaluationRequestBuilder, JudgeInputRejected
@@ -252,9 +252,8 @@ class HybridEvaluator(BaseEvaluator):
                        item.kind == "tool_trace"
                        and item.data.get("completeness") == "complete"
                        and item.data.get("scope") == required_scope
-                       and item.data.get("execution_verified") is True
+                       and is_execution_verified(item)
                        and item.data.get("provenance") == "independent_observer"
-                       and item.source != "http_response"
                        for item in observation.evidence):
                 return EvaluationResult(
                     status=EvaluationStatus.INCONCLUSIVE,

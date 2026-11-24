@@ -26,7 +26,14 @@ from urllib.parse import urlparse
 
 import httpx
 
-from core.models.evidence import Evidence
+from core.models.evidence import (
+    BOUNDED_EXECUTION_SEMANTICS,
+    Evidence,
+    NEGATIVE_CORRELATION_STATUSES,
+    NEGATIVE_CORRELATION_STRENGTHS,
+    NEGATIVE_VERIFICATION_STATUSES,
+    NON_EXECUTION_SEMANTICS,
+)
 from targets.validator import (
     ENV_CREDENTIAL_PATTERN,
     parse_header_credential_placeholder,
@@ -216,6 +223,139 @@ def _normalized_provenance(configured: str, *, can_verify_independently: bool) -
     return "target_reported", False
 
 
+def _evaluate_execution_flags(
+    row: dict[str, Any], *, include_effect_verified: bool = False
+) -> tuple[bool, bool]:
+    """Evaluate explicit execution verification flags separately from action success.
+
+    Rules:
+    - Execution and action success are distinct concepts: an action can execute
+      and subsequently fail (executed=True, success=False -> verified execution
+      with unsuccessful action outcome).
+    - Explicit negative execution assertions (executed=False,
+      execution_verified=False, or effect_verified=False) fail closed and are
+      never overridden by success=True or another positive execution flag.
+    - Malformed non-boolean execution fields fail closed with conflict=True.
+    - Generic success=True alone does not prove execution without an explicit
+      execution verification field.
+
+    Returns (execution_confirmed, has_conflict).
+    """
+    exec_keys = (
+        ("effect_verified", "execution_verified", "executed")
+        if include_effect_verified
+        else ("execution_verified", "executed")
+    )
+    for k in exec_keys:
+        val = row.get(k)
+        if val is not None and type(val) is not bool:
+            return False, True
+    has_explicit_false = any(row.get(k) is False for k in exec_keys)
+    has_explicit_true = any(row.get(k) is True for k in exec_keys)
+    if has_explicit_false:
+        has_conflict = has_explicit_true or (row.get("success") is True)
+        return False, has_conflict
+    if has_explicit_true:
+        return True, False
+    return False, False
+
+
+def _extract_execution_semantics(row: dict[str, Any]) -> tuple[str | None, bool, bool]:
+    """Extract bounded execution_semantics without crashing on malformed types.
+
+    Returns (bounded_semantics, is_non_execution_semantics, is_malformed).
+    """
+    raw = row.get("execution_semantics")
+    if raw is None:
+        return None, False, False
+    if not isinstance(raw, str):
+        return None, False, True
+    clean = raw.strip()
+    if not clean:
+        return None, False, False
+    norm = clean.lower()
+    if norm in NON_EXECUTION_SEMANTICS:
+        return norm, True, False
+    if clean in BOUNDED_EXECUTION_SEMANTICS:
+        return clean, False, False
+    return None, False, False
+
+
+def _inspect_row_verification_constraints(
+    row: dict[str, Any], *, is_effect_collector: bool
+) -> dict[str, Any]:
+    """Inspect negative, contradictory, or malformed verification/correlation fields on a collector row.
+
+    Contract-specific semantics:
+    - Malformed non-scalar types (e.g., effect_observed=[], correlation_valid="true",
+      verification_status=[]) always fail closed with conflicting_execution_metadata.
+    - Explicit correlation_valid=False or negative correlation_status/correlation_strength
+      fail closed and are preserved rather than overwritten by normalization.
+    - Explicit negative verification_status (e.g., conflicting_execution_metadata,
+      *_unverified, *_not_verified) fails closed and is preserved.
+    - Explicit effect_verified=False is preserved and prevents verified-execution promotion
+      (conflicting_execution_metadata for FileArtifactCollector; effect_not_verified for
+      command/callback log collectors).
+    - Boolean effect_observed=False and success=False do NOT block verified execution in
+      command/callback logs (SandboxLogFileCollector / HttpCallbackCollector), whereas
+      effect_observed=False contradicts verified effect in FileArtifactCollector.
+    """
+    malformed = False
+    for bool_key in ("correlation_valid", "effect_observed", "effect_verified", "synthetic_mock"):
+        val = row.get(bool_key)
+        if val is not None and type(val) is not bool:
+            malformed = True
+    for str_key in ("verification_status", "correlation_status", "correlation_strength"):
+        val = row.get(str_key)
+        if val is not None and not isinstance(val, str):
+            malformed = True
+
+    neg_corr_valid = row.get("correlation_valid") is False
+    raw_cs = row.get("correlation_status")
+    neg_corr_status = (
+        isinstance(raw_cs, str) and raw_cs.strip().lower() in NEGATIVE_CORRELATION_STATUSES
+    )
+    raw_cstr = row.get("correlation_strength")
+    neg_corr_strength = (
+        isinstance(raw_cstr, str) and raw_cstr.strip().lower() in NEGATIVE_CORRELATION_STRENGTHS
+    )
+
+    raw_vs = row.get("verification_status")
+    neg_ver_status: str | None = None
+    if isinstance(raw_vs, str) and raw_vs.strip():
+        norm_vs = raw_vs.strip().lower()
+        if (
+            norm_vs in NEGATIVE_VERIFICATION_STATUSES
+            or norm_vs.endswith("_unverified")
+            or norm_vs.endswith("_not_verified")
+            or norm_vs.startswith("conflicting_")
+        ):
+            neg_ver_status = raw_vs.strip()[:128]
+
+    effect_verified_false = row.get("effect_verified") is False
+    effect_observed_false_blocked = is_effect_collector and row.get("effect_observed") is False
+
+    blocked = (
+        malformed
+        or neg_corr_valid
+        or neg_corr_status
+        or neg_corr_strength
+        or neg_ver_status is not None
+        or effect_verified_false
+        or effect_observed_false_blocked
+    )
+    return {
+        "blocked": blocked,
+        "malformed": malformed,
+        "neg_corr_valid": neg_corr_valid,
+        "neg_corr_status": neg_corr_status,
+        "neg_corr_strength": neg_corr_strength,
+        "neg_ver_status": neg_ver_status,
+        "effect_verified_false": effect_verified_false,
+        "effect_observed_false_blocked": effect_observed_false_blocked,
+    }
+
+
 def _load_json_or_jsonl_rows(raw_bytes: bytes) -> list[dict[str, Any]]:
     text = raw_bytes.decode("utf-8-sig").strip()
     if not text:
@@ -306,35 +446,115 @@ class SandboxLogFileCollector:
             claimed_action = row.get(self._claimed_action_field)
             ts = row.get(self._timestamp_field)
             entry_sha = sha256(json.dumps(row, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-            explicit_exec = (
-                row.get("executed") is True
-                or row.get("execution_verified") is True
-                or row.get("success") is True
+            explicit_exec, exec_conflict = _evaluate_execution_flags(
+                row, include_effect_verified=False
             )
+            exec_sem, is_non_exec_sem, sem_malformed = _extract_execution_semantics(row)
+            constraints = _inspect_row_verification_constraints(row, is_effect_collector=False)
+            if sem_malformed or constraints["malformed"]:
+                explicit_exec = False
+                exec_conflict = True
+            elif constraints["blocked"]:
+                explicit_exec = False
+            elif is_non_exec_sem:
+                explicit_exec = False
+            elif exec_sem == "simulated_handler_effect" and row.get("synthetic_mock") is not True:
+                explicit_exec = False
             if is_match:
                 matched += 1
                 if corr_strength == "strong" and default_verified:
-                    tier = prov_tier
-                    exec_verified = explicit_exec
-                    corr_status = "matched"
-                    ver_status = "verified" if exec_verified else f"{tier}_unverified"
+                    if explicit_exec:
+                        tier = prov_tier
+                        exec_verified = True
+                        ver_status = (
+                            "verified_simulated_effect"
+                            if exec_sem == "simulated_handler_effect"
+                            else "verified"
+                        )
+                        corr_status = "matched"
+                    else:
+                        # Unverified independent collector observations downgrade conservatively
+                        # from independently_verified while preserving correlation and status.
+                        exec_verified = False
+                        if constraints["neg_corr_valid"] or constraints["neg_corr_status"]:
+                            tier = "target_reported"
+                            corr_status = "uncorrelated"
+                            ver_status = constraints["neg_ver_status"] or "uncorrelated_not_verified"
+                        elif constraints["neg_corr_strength"]:
+                            tier = "adapter_observed"
+                            corr_status = "matched"
+                            ver_status = constraints["neg_ver_status"] or "weak_correlation_not_verified"
+                        else:
+                            tier = "adapter_observed"
+                            corr_status = "matched"
+                            if exec_conflict:
+                                ver_status = "conflicting_execution_metadata"
+                            elif constraints["neg_ver_status"] is not None:
+                                ver_status = constraints["neg_ver_status"]
+                            elif constraints["effect_verified_false"]:
+                                ver_status = "effect_not_verified"
+                            elif exec_sem == "simulated_handler_invocation":
+                                ver_status = "handler_invocation_not_verified_effect"
+                            elif is_non_exec_sem:
+                                ver_status = "declared_not_verified_execution"
+                            else:
+                                ver_status = "sandbox_log_unverified"
                 elif default_verified:
                     # Single-ID correlation is insufficient for independently_verified proof.
                     tier = "adapter_observed"
                     exec_verified = False
-                    corr_status = "matched"
-                    ver_status = "weak_correlation_not_verified"
+                    corr_status = (
+                        "uncorrelated"
+                        if (constraints["neg_corr_valid"] or constraints["neg_corr_status"])
+                        else "matched"
+                    )
+                    ver_status = (
+                        constraints["neg_ver_status"]
+                        or ("uncorrelated_not_verified" if corr_status == "uncorrelated" else "weak_correlation_not_verified")
+                    )
                 else:
                     tier = prov_tier
                     exec_verified = False
-                    corr_status = "matched"
-                    ver_status = f"{tier}_unverified"
+                    corr_status = (
+                        "uncorrelated"
+                        if (constraints["neg_corr_valid"] or constraints["neg_corr_status"])
+                        else "matched"
+                    )
+                    ver_status = (
+                        "conflicting_execution_metadata"
+                        if exec_conflict
+                        else (constraints["neg_ver_status"] or f"{tier}_unverified")
+                    )
             else:
                 uncorrelated += 1
                 exec_verified = False
                 corr_status = "uncorrelated"
                 tier = "target_reported" if prov_tier == "independently_verified" else prov_tier
                 ver_status = "uncorrelated_not_verified"
+            item_data: dict[str, Any] = {
+                "collector_id": self.collector_id,
+                "collector_kind": self.collector_kind,
+                "provenance": tier,
+                "execution_verified": exec_verified,
+                "correlation_status": corr_status,
+                "correlation_strength": "none" if corr_status == "uncorrelated" else corr_strength,
+                "correlation_mechanism": str(mech),
+                "verification_status": ver_status,
+                "claimed_action": str(claimed_action) if claimed_action is not None else "",
+                "observed_action": str(observed_action) if observed_action is not None else "",
+                "timestamp": str(ts) if ts is not None else "",
+                "integrity_reference": f"sha256:{file_sha}",
+                "run_id": context.run_id if is_match else "",
+                "case_id": context.case_id if is_match else "",
+            }
+            if exec_sem is not None:
+                item_data["execution_semantics"] = exec_sem
+            if row.get("synthetic_mock") is True:
+                item_data["synthetic_mock"] = True
+            if constraints["effect_verified_false"]:
+                item_data["effect_verified"] = False
+            if constraints["neg_corr_valid"]:
+                item_data["correlation_valid"] = False
             ev_items.append(
                 Evidence(
                     kind="collected_evidence",
@@ -342,22 +562,7 @@ class SandboxLogFileCollector:
                     name=self.collector_id,
                     success=bool(row.get("success")) if is_match and isinstance(row.get("success"), bool) else None,
                     reference=f"{self.collector_id}:{idx}:{entry_sha[:16]}",
-                    data={
-                        "collector_id": self.collector_id,
-                        "collector_kind": self.collector_kind,
-                        "provenance": tier,
-                        "execution_verified": exec_verified,
-                        "correlation_status": corr_status,
-                        "correlation_strength": corr_strength,
-                        "correlation_mechanism": str(mech),
-                        "verification_status": ver_status,
-                        "claimed_action": str(claimed_action) if claimed_action is not None else "",
-                        "observed_action": str(observed_action) if observed_action is not None else "",
-                        "timestamp": str(ts) if ts is not None else "",
-                        "integrity_reference": f"sha256:{file_sha}",
-                        "run_id": context.run_id if is_match else "",
-                        "case_id": context.case_id if is_match else "",
-                    },
+                    data=item_data,
                 )
             )
         status: Literal["collected", "uncorrelated"] = "collected" if matched > 0 else "uncorrelated"
@@ -439,11 +644,24 @@ class FileArtifactCollector:
                 ("run_id", "case_id", "execution_id", "request_id", "session_id"),
             )
             corr_mech = str(mech)
-            effect_flag = (
-                parsed_obj.get("effect_verified") is True
-                or parsed_obj.get("execution_verified") is True
-                or parsed_obj.get("executed") is True
+            effect_flag, exec_conflict = _evaluate_execution_flags(
+                parsed_obj, include_effect_verified=True
             )
+            exec_sem, non_effect_semantics, sem_malformed = _extract_execution_semantics(parsed_obj)
+            constraints = _inspect_row_verification_constraints(parsed_obj, is_effect_collector=True)
+            if sem_malformed or constraints["malformed"]:
+                effect_flag = False
+                exec_conflict = True
+            if constraints["effect_observed_false_blocked"]:
+                if effect_flag:
+                    exec_conflict = True
+                effect_flag = False
+            if constraints["blocked"]:
+                effect_flag = False
+            if non_effect_semantics:
+                effect_flag = False
+            elif exec_sem == "simulated_handler_effect" and parsed_obj.get("synthetic_mock") is not True:
+                effect_flag = False
             effect_desc = parsed_obj.get("observed_effect") or parsed_obj.get("action") or parsed_obj.get("command")
             has_effect_desc = isinstance(effect_desc, str) and bool(effect_desc.strip())
             if has_effect_desc:
@@ -465,23 +683,38 @@ class FileArtifactCollector:
                     artifact_ok = False
 
             if is_match:
-                corr_status = "matched"
-                if allow_verified and corr_strength == "strong" and effect_flag and has_effect_desc and artifact_ok:
+                corr_status = (
+                    "uncorrelated"
+                    if (constraints["neg_corr_valid"] or constraints["neg_corr_status"])
+                    else "matched"
+                )
+                if allow_verified and corr_status == "matched" and corr_strength == "strong" and effect_flag and has_effect_desc and artifact_ok:
                     tier = "independently_verified"
                     exec_verified = True
                     ver_status = "verified_artifact"
                 elif allow_verified:
-                    tier = "adapter_observed"
+                    tier = "target_reported" if corr_status == "uncorrelated" else "adapter_observed"
                     exec_verified = False
-                    ver_status = (
-                        "weak_correlation_not_verified"
-                        if corr_strength != "strong"
-                        else "artifact_observed_unverified"
-                    )
+                    if corr_status == "uncorrelated":
+                        ver_status = constraints["neg_ver_status"] or "uncorrelated_not_verified"
+                    elif exec_conflict:
+                        ver_status = "conflicting_execution_metadata"
+                    elif constraints["neg_ver_status"] is not None:
+                        ver_status = constraints["neg_ver_status"]
+                    elif corr_strength != "strong" or constraints["neg_corr_strength"]:
+                        ver_status = "weak_correlation_not_verified"
+                    elif non_effect_semantics:
+                        ver_status = "handler_invocation_not_verified_effect"
+                    else:
+                        ver_status = "artifact_observed_unverified"
                 else:
                     tier = "target_reported" if base_tier == "target_reported" else "adapter_observed"
                     exec_verified = False
-                    ver_status = "target_reported_unverified"
+                    ver_status = (
+                        "conflicting_execution_metadata"
+                        if exec_conflict
+                        else "target_reported_unverified"
+                    )
             else:
                 tier = "target_reported" if base_tier == "target_reported" else "adapter_observed"
                 ver_status = "uncorrelated_not_verified"
@@ -495,25 +728,41 @@ class FileArtifactCollector:
             tier = "target_reported" if base_tier == "target_reported" else "adapter_observed"
 
         matched_diag = corr_status == "matched"
+        action_success = (
+            bool(parsed_obj.get("success"))
+            if parsed_obj is not None and matched_diag and isinstance(parsed_obj.get("success"), bool)
+            else (True if exec_verified else None)
+        )
+        fa_data: dict[str, Any] = {
+            "collector_id": self.collector_id,
+            "collector_kind": self.collector_kind,
+            "provenance": tier,
+            "execution_verified": exec_verified,
+            "correlation_status": corr_status,
+            "correlation_strength": corr_strength,
+            "correlation_mechanism": corr_mech,
+            "verification_status": ver_status,
+            "observed_action": observed_effect,
+            "artifact_file": scoped.name,
+            "integrity_reference": f"sha256:{digest}",
+        }
+        if parsed_obj is not None:
+            fa_sem, _, _ = _extract_execution_semantics(parsed_obj)
+            if fa_sem is not None:
+                fa_data["execution_semantics"] = fa_sem
+            if parsed_obj.get("synthetic_mock") is True:
+                fa_data["synthetic_mock"] = True
+            if parsed_obj.get("effect_verified") is False:
+                fa_data["effect_verified"] = False
+            if parsed_obj.get("correlation_valid") is False:
+                fa_data["correlation_valid"] = False
         ev = Evidence(
             kind="collected_evidence",
             source="file_artifact_collector",
             name=self.collector_id,
-            success=True if exec_verified else None,
+            success=action_success,
             reference=f"{self.collector_id}:sha256:{digest[:16]}",
-            data={
-                "collector_id": self.collector_id,
-                "collector_kind": self.collector_kind,
-                "provenance": tier,
-                "execution_verified": exec_verified,
-                "correlation_status": corr_status,
-                "correlation_strength": corr_strength,
-                "correlation_mechanism": corr_mech,
-                "verification_status": ver_status,
-                "observed_action": observed_effect,
-                "artifact_file": scoped.name,
-                "integrity_reference": f"sha256:{digest}",
-            },
+            data=fa_data,
         )
         return CollectedEvidenceOutput(
             evidence=[ev],
@@ -592,30 +841,109 @@ class HttpCallbackCollector:
         for idx, row in enumerate(rows[:200]):
             is_match, mech, _corr_val, corr_strength = _correlate_record(row, context, self._correlation_fields)
             entry_sha = sha256(json.dumps(row, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-            explicit_exec = (
-                row.get("executed") is True
-                or row.get("execution_verified") is True
-                or row.get("success") is True
+            explicit_exec, exec_conflict = _evaluate_execution_flags(
+                row, include_effect_verified=False
             )
+            exec_sem, is_non_exec_sem, sem_malformed = _extract_execution_semantics(row)
+            constraints = _inspect_row_verification_constraints(row, is_effect_collector=False)
+            if sem_malformed or constraints["malformed"]:
+                explicit_exec = False
+                exec_conflict = True
+            elif constraints["blocked"]:
+                explicit_exec = False
+            elif is_non_exec_sem:
+                explicit_exec = False
+            elif exec_sem == "simulated_handler_effect" and row.get("synthetic_mock") is not True:
+                explicit_exec = False
             if is_match:
                 matched += 1
                 if corr_strength == "strong" and default_verified:
-                    row_tier = tier
-                    exec_verified = explicit_exec
-                    ver_status = "verified_callback" if exec_verified else f"{tier}_unverified"
+                    if explicit_exec:
+                        row_tier = tier
+                        exec_verified = True
+                        corr_status_cb = "matched"
+                        ver_status = (
+                            "verified_simulated_effect"
+                            if exec_sem == "simulated_handler_effect"
+                            else "verified_callback"
+                        )
+                    else:
+                        exec_verified = False
+                        if constraints["neg_corr_valid"] or constraints["neg_corr_status"]:
+                            row_tier = "target_reported"
+                            corr_status_cb = "uncorrelated"
+                            ver_status = constraints["neg_ver_status"] or "uncorrelated_not_verified"
+                        elif constraints["neg_corr_strength"]:
+                            row_tier = "adapter_observed"
+                            corr_status_cb = "matched"
+                            ver_status = constraints["neg_ver_status"] or "weak_correlation_not_verified"
+                        else:
+                            row_tier = "adapter_observed"
+                            corr_status_cb = "matched"
+                            if exec_conflict:
+                                ver_status = "conflicting_execution_metadata"
+                            elif constraints["neg_ver_status"] is not None:
+                                ver_status = constraints["neg_ver_status"]
+                            elif constraints["effect_verified_false"]:
+                                ver_status = "effect_not_verified"
+                            elif exec_sem == "simulated_handler_invocation":
+                                ver_status = "handler_invocation_not_verified_effect"
+                            elif is_non_exec_sem:
+                                ver_status = "declared_not_verified_execution"
+                            else:
+                                ver_status = "callback_unverified"
                 elif default_verified:
                     row_tier = "adapter_observed"
                     exec_verified = False
-                    ver_status = "weak_correlation_not_verified"
+                    corr_status_cb = (
+                        "uncorrelated"
+                        if (constraints["neg_corr_valid"] or constraints["neg_corr_status"])
+                        else "matched"
+                    )
+                    ver_status = (
+                        constraints["neg_ver_status"]
+                        or ("uncorrelated_not_verified" if corr_status_cb == "uncorrelated" else "weak_correlation_not_verified")
+                    )
                 else:
                     row_tier = tier
                     exec_verified = False
-                    ver_status = "target_reported_unverified"
+                    corr_status_cb = (
+                        "uncorrelated"
+                        if (constraints["neg_corr_valid"] or constraints["neg_corr_status"])
+                        else "matched"
+                    )
+                    ver_status = (
+                        "conflicting_execution_metadata"
+                        if exec_conflict
+                        else (constraints["neg_ver_status"] or "target_reported_unverified")
+                    )
             else:
                 uncorrelated += 1
                 row_tier = "target_reported" if tier == "independently_verified" else tier
                 exec_verified = False
+                corr_status_cb = "uncorrelated"
                 ver_status = "uncorrelated_not_verified"
+            cb_data: dict[str, Any] = {
+                "collector_id": self.collector_id,
+                "collector_kind": self.collector_kind,
+                "provenance": row_tier,
+                "execution_verified": exec_verified,
+                "correlation_status": corr_status_cb,
+                "correlation_strength": "none" if corr_status_cb == "uncorrelated" else corr_strength,
+                "correlation_mechanism": str(mech),
+                "verification_status": ver_status,
+                "observed_action": str(row.get("action") or row.get("method") or row.get("path") or ""),
+                "timestamp": str(row.get("timestamp") or ""),
+                "integrity_reference": f"sha256:{entry_sha}",
+            }
+            if exec_sem is not None:
+                cb_data["execution_semantics"] = exec_sem
+            if row.get("synthetic_mock") is True:
+                cb_data["synthetic_mock"] = True
+            if constraints["effect_verified_false"]:
+                cb_data["effect_verified"] = False
+            if constraints["neg_corr_valid"]:
+                cb_data["correlation_valid"] = False
             ev_items.append(
                 Evidence(
                     kind="collected_evidence",
@@ -623,19 +951,7 @@ class HttpCallbackCollector:
                     name=self.collector_id,
                     success=bool(row.get("success")) if is_match and isinstance(row.get("success"), bool) else None,
                     reference=f"{self.collector_id}:{idx}:{entry_sha[:16]}",
-                    data={
-                        "collector_id": self.collector_id,
-                        "collector_kind": self.collector_kind,
-                        "provenance": row_tier,
-                        "execution_verified": exec_verified,
-                        "correlation_status": "matched" if is_match else "uncorrelated",
-                        "correlation_strength": corr_strength,
-                        "correlation_mechanism": str(mech),
-                        "verification_status": ver_status,
-                        "observed_action": str(row.get("action") or row.get("method") or row.get("path") or ""),
-                        "timestamp": str(row.get("timestamp") or ""),
-                        "integrity_reference": f"sha256:{entry_sha}",
-                    },
+                    data=cb_data,
                 )
             )
         return CollectedEvidenceOutput(

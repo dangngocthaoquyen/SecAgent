@@ -63,8 +63,13 @@ def reported_http_evidence(body):
                     data["correlation_reference"] = "sha256:" + hashlib.sha256(
                         ("openai-tool-call-id:" + call_id).encode()).hexdigest()
                 arguments = function.get("arguments") if isinstance(function, dict) else None
-                if isinstance(arguments, str) and len(arguments.encode("utf-8")) <= 65536:
-                    data["arguments_sha256"] = hashlib.sha256(arguments.encode("utf-8")).hexdigest()
+                if isinstance(arguments, str):
+                    try:
+                        arg_bytes = arguments.encode("utf-8")
+                    except UnicodeEncodeError:
+                        arg_bytes = None
+                    if arg_bytes is not None and len(arg_bytes) <= 65536:
+                        data["arguments_sha256"] = hashlib.sha256(arg_bytes).hexdigest()
             events.append(dict(kind="declared_tool_call", source="http_response", name=safe_name,
                 reference=f"http.choices.0.message.tool_calls.{index}",
                 data=data))
@@ -150,3 +155,15 @@ def reported_http_evidence(body):
                       "mcp_response_present_reported": call["mcp_response_present"],
                       "trace_completeness": "partial"}))
     return events
+
+
+def structured_http_tool_calls(body):
+    """Return raw structured choices[0].message.tool_calls list for canonical deduplication."""
+    if not isinstance(body, dict):
+        return []
+    choices = body.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    message = choice.get("message")
+    message = message if isinstance(message, dict) else {}
+    calls = message.get("tool_calls")
+    return calls if isinstance(calls, list) else []

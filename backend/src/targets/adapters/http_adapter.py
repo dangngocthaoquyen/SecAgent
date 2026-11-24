@@ -6,9 +6,13 @@ from collections.abc import Mapping
 from typing import Any
 
 from core.models import ExecutionResult, TargetProfile, TestInput
-from core.models.dsml import detect_dsml_intent
+from core.models.tool_intent import (
+    build_tool_intent_event,
+    extract_structured_tool_fingerprints,
+    extract_tool_intent_signals,
+)
 from targets.adapters.base import BaseTargetAdapter, TargetAdapterError
-from targets.adapters.http_evidence import reported_http_evidence
+from targets.adapters.http_evidence import reported_http_evidence, structured_http_tool_calls
 from targets.validator import parse_header_credential_placeholder
 from tools.http import HttpClient, HttpClientError, HttpResponse
 
@@ -185,28 +189,21 @@ class HttpTargetAdapter(BaseTargetAdapter):
 
         events = reported_http_evidence(response.json_body)
         if output_text:
-            dsml = detect_dsml_intent(output_text)
-            if dsml.detected:
+            structured_fps = extract_structured_tool_fingerprints(
+                structured_http_tool_calls(response.json_body)
+            )
+            intent_signal = extract_tool_intent_signals(
+                output_text,
+                structured_events=events,
+                structured_fingerprints=structured_fps,
+            )
+            if intent_signal.detected:
                 response_id = (
                     response.json_body.get("id")
                     if isinstance(response.json_body, dict) and isinstance(response.json_body.get("id"), str)
                     else None
                 )
-                events.append({
-                    "kind": "model_reported_tool_intent",
-                    "source": "response_output_dsml",
-                    "name": "dsml_tool_invocation_markup",
-                    "success": None,
-                    "reference": response_id,
-                    "data": {
-                        "provenance": "model_reported",
-                        "execution_verified": False,
-                        "format": dsml.format,
-                        "tag_count": dsml.tag_count,
-                        "invoke_count": dsml.invoke_count,
-                        "invoked_tool_names": list(dsml.invoked_tool_names),
-                    },
-                })
+                events.append(build_tool_intent_event(intent_signal, reference=response_id))
         resp_complete: bool | None = None
         if response_only_completion and response.body_complete is True and output_text is not None:
             if isinstance(response.json_body, dict) and "choices" in response.json_body:
