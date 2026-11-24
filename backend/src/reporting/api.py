@@ -16,7 +16,7 @@ from werkzeug.exceptions import HTTPException
 
 from reporting.aggregation import _artifact_state
 from reporting.models import ArchivedAssessmentReport, ExecutionReport
-from reporting.exports import batch_download, report_document, canonical
+from reporting.exports import batch_download, report_document, canonical, safe
 from reporting.repository import (ControlledRunInvalid, ControlledRunMissing,
     DatasetError, ReportDataset, load_controlled_run_with_count, load_mcp_run,
     list_saved_runs, load_dataset)
@@ -320,6 +320,33 @@ def create_app(dataset: ReportDataset, *, history_index_path: Path | None = None
         try:
             raw, filename = batch_download(dataset, batch_id, _public, detail_view)
             return download_response(raw, filename, 'application/zip')
+        except ControlledRunMissing:
+            return fail('batch_not_found', 'Batch or linked report is unavailable in the selected reporting root.', 404)
+        except ControlledRunInvalid:
+            return fail('batch_export_rejected', 'Batch must be terminal with intact, correctly linked reports. No export was produced.', 409)
+
+    @app.get('/api/reports/batches/<batch_id>/report.json')
+    def batch_json_export(batch_id):
+        if not re.fullmatch(r'[a-f0-9]{32}', batch_id):
+            return fail('invalid_batch_id', 'Invalid batch identity.', 400)
+        try:
+            raw, zip_name = batch_download(dataset, batch_id, _public, detail_view)
+            import io, zipfile
+            with zipfile.ZipFile(io.BytesIO(raw), 'r') as zf:
+                summary_obj = json.loads(zf.read('summary.json').decode('utf-8'))
+                reports_list = [
+                    json.loads(zf.read(name).decode('utf-8'))
+                    for name in sorted(zf.namelist())
+                    if name.startswith('reports/') and name.endswith('.json')
+                ]
+            document = safe(dict(
+                api_schema_version=API_VERSION,
+                batch_id=batch_id,
+                summary=summary_obj,
+                reports=reports_list,
+            ), _public)
+            json_name = zip_name[:-4] + '.json' if zip_name.endswith('.zip') else f'secagent-batch-{batch_id}.json'
+            return download_response(canonical(document), json_name, 'application/json')
         except ControlledRunMissing:
             return fail('batch_not_found', 'Batch or linked report is unavailable in the selected reporting root.', 404)
         except ControlledRunInvalid:

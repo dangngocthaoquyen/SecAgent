@@ -40,7 +40,11 @@ def real_sources():
     data = Path.home() / "AppData/Local/SecAgent"
     downloads = Path.home() / "Downloads"
     dataset = data / "targets/datasets" / f"{pack.DATASET_ID}.json"
-    if not (source_root.exists() and dataset.exists() and downloads.exists()):
+    batches_present = all(
+        (source_root / "batch-runs" / batch_id / "state.json").is_file()
+        for batch_id in (pack.BATCH_1, pack.BATCH_2)
+    )
+    if not (source_root.exists() and dataset.exists() and downloads.exists() and batches_present):
         pytest.skip("Local historical ASI05 sources are unavailable")
     return source_root, data, downloads
 

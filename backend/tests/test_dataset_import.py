@@ -115,23 +115,47 @@ def test_promptfoo_array_format_normalization():
     assert envelope.testcases[1].description is None
 
 
-def test_rejects_promptfoo_evaluation_report():
+def test_imports_promptfoo_evaluation_report_with_stored_response_and_isolated_historical_verdict():
     report_json = {
         "version": 3,
         "results": {
             "version": 3,
             "timestamp": "2026-11-14T08:00:00.000Z",
             "results": [
-                {"prompt": {"raw": "test"}, "response": {"output": "ok"}, "score": 1}
+                {
+                    "prompt": {"raw": "test prompt"},
+                    "response": {"output": "stored response text", "metadata": {"finishReason": "stop"}},
+                    "score": 1,
+                    "success": True,
+                    "gradingResult": {"pass": True, "score": 1, "reason": "External tool grading reason"},
+                    "testCase": {"metadata": {"pluginId": "excessive-agency"}},
+                }
             ],
             "table": {"head": {"prompts": [], "vars": []}, "body": []},
         },
         "stats": {"successes": 1, "failures": 0},
     }
     raw_bytes = json.dumps(report_json).encode("utf-8")
+    envelope = normalize_dataset(raw_bytes, "report.json")
+    assert envelope.total_testcases == 1
+    assert envelope.source_tool == "promptfoo_report"
+    tc = envelope.testcases[0]
+    assert tc.prompt == "test prompt"
+    assert tc.extra["stored_response"] == "stored response text"
+    assert tc.extra["historical_verdict"]["external_pass"] is True
+    assert "External tool grading reason" not in tc.prompt
+    summary = envelope.to_summary()
+    assert summary.has_stored_responses is True
+    assert summary.supported_modes == ["live", "offline"]
+    assert summary.asi_breakdown == {"ASI02": 1}
+
+    bad_report = {
+        "version": 3,
+        "results": {"version": 3, "results": [{"prompt": {"raw": "test"}}]},
+    }
     with pytest.raises(DatasetValidationError) as exc_info:
-        normalize_dataset(raw_bytes, "report.json")
-    assert exc_info.value.code == "promptfoo_report_not_supported"
+        normalize_dataset(json.dumps(bad_report).encode("utf-8"), "bad_report.json")
+    assert exc_info.value.code == "invalid_stored_report"
 
 
 def test_rejects_empty_file_and_malformed_json():

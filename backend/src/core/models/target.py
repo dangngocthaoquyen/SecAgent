@@ -1,8 +1,10 @@
 """Models describing a target and the interface used to reach it."""
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+CapabilityState = Literal["supported", "unsupported", "unverified"]
 
 
 class TargetInterface(BaseModel):
@@ -25,6 +27,8 @@ class TargetProfile(BaseModel):
     target_type: str
     interface: TargetInterface
     capabilities: list[str] = Field(default_factory=list)
+    capability_states: dict[str, CapabilityState] = Field(default_factory=dict)
     observability: list[str] = Field(default_factory=list)
+    evidence_sources: list[dict[str, Any]] = Field(default_factory=list)
     credential_refs: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)

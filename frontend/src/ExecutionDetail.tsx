@@ -82,7 +82,11 @@ export default function ExecutionDetail({
         </div>
         <Badge
           value={
-            typeof d.security.verdict === "string" ? d.security.verdict : null
+            typeof d.security.verdict === "string"
+              ? d.security.verdict
+              : d.security.historical_status === "ERROR"
+                ? "ERROR"
+                : null
           }
         />
       </div>
@@ -112,6 +116,19 @@ export default function ExecutionDetail({
         <Facts rows={Object.entries(d.imported_provenance).map(([key,item])=>[key.replaceAll('_',' '),item])}/>
         <p>Source taxonomy and assertions are untrusted metadata. A pinned native binding, when shown above, supplies reviewed response rules. Direct chat alone does not establish a fetched-page injection or independently verified tool effect.</p>
       </section>}
+      {(d.imported_provenance?.binding_id==='GENERIC-MCP-AGENT'||d.imported_provenance?.target_composition==='hosted_mcp_agent')&&<section className="panel" aria-label="Hosted MCP Agent trace breakdown">
+        <h2>Hosted MCP Agent trace &amp; action distinction</h2>
+        <Facts rows={[
+          ['Target composition', d.imported_provenance?.target_composition??'hosted_mcp_agent'],
+          ['Agent host runtime', d.imported_provenance?.agent_host??'secagent_python_mcp_runtime'],
+          ['SecAgent blocked before MCP dispatch', d.imported_provenance?.secagent_rejected_count??0],
+          ['Dispatched to MCP server', d.imported_provenance?.dispatched_action_count??0],
+          ['Target MCP server rejected', d.imported_provenance?.target_rejected_count??0],
+          ['Trace completeness', d.imported_provenance?.trace_completeness??'partial'],
+          ['Host / OS side effect verified', 'No (SecAgent request observer + target-reported status only)'],
+        ]}/>
+        <p className="caption">SecAgent distinguishes pre-dispatch SecAgent blocks from dispatched MCP calls, target-reported rejections/successes, and unverified host effects.</p>
+      </section>}
       <section className="panel">
         <h2>Task context · original execution record</h2>
         <Facts
@@ -127,6 +144,42 @@ export default function ExecutionDetail({
           response or later assessment.
         </p>
       </section>
+      <section className="panel">
+        <h2>Submitted payload preview</h2>
+        {d.submitted_payload_preview ? (
+          <Text text={d.submitted_payload_preview} />
+        ) : (
+          <p role="status">Payload preview unavailable in legacy/redacted reporting contract.</p>
+        )}
+      </section>
+      {(d.evidence_classification || d.execution_evaluation) && (
+        <section className="panel">
+          <h2>Evidence level &amp; provenance classification</h2>
+          <Facts
+            rows={[
+              ["Evidence level", d.execution_evaluation?.evidence_level ?? d.evidence_classification?.evidence_level],
+              ["Highest provenance", d.evidence_classification?.highest_provenance ?? d.execution_evaluation?.provenance],
+              ["Provenance tiers", d.evidence_classification?.provenance_tiers?.join(", ") || null],
+              ["Correlation status", d.execution_evaluation?.correlation_status],
+              ["Execution rationale", d.execution_evaluation?.rationale],
+            ]}
+          />
+          {d.execution_evaluation?.unsupported_execution_claims?.length ? (
+            <p className="caption">Unsupported execution claims: {d.execution_evaluation.unsupported_execution_claims.join("; ")}</p>
+          ) : null}
+        </section>
+      )}
+      {d.collector_diagnostics && d.collector_diagnostics.length > 0 && (
+        <section className="panel">
+          <h2>Collector logs &amp; diagnostics</h2>
+          <Facts
+            rows={d.collector_diagnostics.map((c) => [
+              `${c.collector_id} (${c.collector_kind})`,
+              `${c.status} · matched=${c.matched_count} · uncorrelated=${c.uncorrelated_count}${c.reason ? ` · ${c.reason}` : ""}`,
+            ])}
+          />
+        </section>
+      )}
       <section className="panel">
         <h2>Target response preview</h2>
         <p>

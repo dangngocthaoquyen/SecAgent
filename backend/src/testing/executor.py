@@ -7,6 +7,7 @@ from targets.adapters import (
     BaseTargetAdapter,
     HttpTargetAdapter,
     McpJsonRpcTargetAdapter,
+    OfflineStoredTargetAdapter,
     TargetAdapterError,
 )
 from targets.validator import TargetValidationError, validate_target
@@ -23,6 +24,7 @@ class Executor:
             adapters = {
                 "generic_http": HttpTargetAdapter(),
                 "generic_mcp_jsonrpc": McpJsonRpcTargetAdapter(),
+                "offline_stored": OfflineStoredTargetAdapter(),
             }
         self._adapters = dict(adapters)
 

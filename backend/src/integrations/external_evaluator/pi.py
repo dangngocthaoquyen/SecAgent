@@ -1,5 +1,6 @@
 """Stateless Pi CLI connector. No target verdict is produced on process failure."""
 
+import json
 import os
 import re
 import signal
@@ -31,6 +32,7 @@ class PiEvaluatorConfig(BaseModel):
     timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
     max_output_bytes: int = Field(default=65536, gt=0)
     credential_env: tuple[str, ...] = ()
+    use_pi_auth_file: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,10 @@ class ProcessRunner(Protocol):
 
 class PiExecutableMissing(FileNotFoundError):
     """The configured process runner could not find Pi."""
+
+
+class PiAuthUnavailable(RuntimeError):
+    """Configured Pi auth.json file or provider entry is missing or malformed."""
 
 
 def _classify_nonzero_stderr(stderr: bytes, provider: str, model: str) -> ProcessDiagnosticCode:
@@ -180,7 +186,11 @@ class PiEvaluatorProvider(ExternalEvaluatorProvider):
             )
 
         try:
-            bundle = self._bundle_loader.load(request.evaluation_type)
+            scope = request.trusted_context.get("evaluation_scope")
+            if request.evaluation_type == "tool_misuse" and scope == "tool_intent_response":
+                bundle = self._bundle_loader.load(request.evaluation_type, evaluation_scope=scope)
+            else:
+                bundle = self._bundle_loader.load(request.evaluation_type)
         except SkillBundleError:
             return fault(ProviderFaultCode.SKILL_UNAVAILABLE, "Trusted skill bundle unavailable.")
         loaded_skill = bundle.identity
@@ -192,6 +202,12 @@ class PiEvaluatorProvider(ExternalEvaluatorProvider):
             process = self._invoke(bundle.system_prompt, payload)
         except PiExecutableMissing:
             return fault(ProviderFaultCode.EXECUTABLE_MISSING, "Pi executable not found.")
+        except PiAuthUnavailable:
+            return fault(
+                ProviderFaultCode.NONZERO_EXIT,
+                "Configured Pi provider authentication is unavailable.",
+                diagnostic_code=ProcessDiagnosticCode.CREDENTIAL_MISSING,
+            )
         except OSError:
             return fault(ProviderFaultCode.PROCESS_ERROR, "Pi process or isolated workspace could not be started.")
 
@@ -223,6 +239,39 @@ class PiEvaluatorProvider(ExternalEvaluatorProvider):
                 *self._config.credential_env,
             )
             env = {key: os.environ[key] for key in env_keys if key in os.environ}
+            temp_auth: Path | None = None
+            if self._config.use_pi_auth_file:
+                auth_path = Path.home() / ".pi" / "agent" / "auth.json"
+                has_env_cred = any(env.get(name) for name in self._config.credential_env)
+                if not auth_path.is_file():
+                    if not has_env_cred:
+                        raise PiAuthUnavailable("Pi auth.json not found.")
+                else:
+                    try:
+                        auth_obj = json.loads(auth_path.read_text(encoding="utf-8-sig"))
+                    except (OSError, UnicodeError, ValueError) as exc:
+                        if not has_env_cred:
+                            raise PiAuthUnavailable("Pi auth.json unreadable or invalid JSON.") from exc
+                        auth_obj = None
+                    if isinstance(auth_obj, dict) and self._config.provider in auth_obj:
+                        temp_auth = workdir / "auth.json"
+                        payload_auth = json.dumps(
+                            {self._config.provider: auth_obj[self._config.provider]}
+                        ).encode("utf-8")
+                        fd = os.open(temp_auth, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        try:
+                            with os.fdopen(fd, "wb") as stream:
+                                stream.write(payload_auth)
+                        except Exception:
+                            try:
+                                temp_auth.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                            raise
+                        if os.name != "nt":
+                            os.chmod(temp_auth, 0o600)
+                    elif not has_env_cred:
+                        raise PiAuthUnavailable("Provider entry absent from Pi auth.json.")
             env["PI_CODING_AGENT_DIR"] = str(workdir)
             argv = [
                 self._config.executable, "--print", "--no-session", "--no-tools",
@@ -239,3 +288,9 @@ class PiEvaluatorProvider(ExternalEvaluatorProvider):
                 )
             except FileNotFoundError as exc:
                 raise PiExecutableMissing() from exc
+            finally:
+                if temp_auth is not None:
+                    try:
+                        temp_auth.unlink(missing_ok=True)
+                    except OSError:
+                        pass

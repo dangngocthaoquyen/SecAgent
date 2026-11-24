@@ -23,13 +23,21 @@ const privileged=new Set(['/api/testing/managed-targets','/api/testing/managed-t
  '/api/testing/asi03-contracts/drafts','/api/testing/asi03-policies/drafts',
  '/api/testing/asi05-policies/drafts']);
 privileged.add('/api/testing/application-contexts/save');
-privileged.add('/api/testing/managed-targets/archived');
-privileged.add('/api/testing/managed-targets/archive');
-privileged.add('/api/testing/managed-targets/restore');
+privileged.add('/api/testing/managed-targets/delete');
 privileged.add('/api/testing/mcp-actions');
 privileged.add('/api/testing/mcp-actions/run');
+privileged.add('/api/testing/mcp-catalogs');
+privileged.add('/api/testing/mcp-catalogs/drafts');
+privileged.add('/api/testing/agent-bindings');
+privileged.add('/api/testing/agent-bindings/drafts');
+privileged.add('/api/testing/response-policies/drafts');
+privileged.add('/api/testing/generic-runs/preview');
+privileged.add('/api/testing/generic-runs/start');
 const batchRead=/^\/api\/testing\/batches\/[a-f0-9]{32}(?:\/(?:events|results))?$/;
-const discoveryRead=/^\/api\/testing\/discoveries\/[a-f0-9]{32}$/;
+const responsePolicyList=/^\/api\/testing\/response-policies\/target\/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const responsePolicyReview=/^\/api\/testing\/response-policies\/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\/review$/;
+const genericRunRead=/^\/api\/testing\/generic-runs(?:\/(?:[a-f0-9]{32}(?:\/report\.json)?|submission\/[a-f0-9]{32}))?$/;
+const discoveryRead=/^\/api\/testing\/discoveries\/[a-f0-9]{32}(?:\/mcp-tools)?$/;
 const datasetRead=/^\/api\/testing\/datasets\/[a-f0-9]{32}$/;
 const asi03Read=/^\/api\/testing\/asi03-contracts\/(?:[a-f0-9]{32}|lookup\/[a-f0-9]{32}\/import-[a-f0-9]{24}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,127})$/;
 const asi03Review=/^\/api\/testing\/asi03-contracts\/[a-f0-9]{32}\/review$/;
@@ -37,6 +45,10 @@ const asi03PolicyRead=/^\/api\/testing\/asi03-policies\/(?:[a-f0-9]{32}|target\/
 const asi03PolicyReview=/^\/api\/testing\/asi03-policies\/[a-f0-9]{32}\/review$/;
 const asi05PolicyRead=/^\/api\/testing\/asi05-policies\/(?:[a-f0-9]{32}|target\/[A-Za-z0-9][A-Za-z0-9_.-]{0,127})$/;
 const asi05PolicyReview=/^\/api\/testing\/asi05-policies\/[a-f0-9]{32}\/review$/;
+const mcpCatalogRead=/^\/api\/testing\/mcp-catalogs\/(?:[a-f0-9]{32}|target\/[A-Za-z0-9][A-Za-z0-9_.-]{0,127})$/;
+const mcpCatalogReview=/^\/api\/testing\/mcp-catalogs\/[a-f0-9]{32}\/review$/;
+const agentBindingRead=/^\/api\/testing\/agent-bindings\/[a-f0-9]{32}$/;
+const agentBindingReview=/^\/api\/testing\/agent-bindings\/[a-f0-9]{32}\/review$/;
 const evidenceRead=/^\/api\/testing\/(?:evidence-sources\/target\/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}|evidence-captures\/[a-f0-9]{32})$/;
 const applicationContextRead=/^\/api\/testing\/application-contexts\/target\/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const evidenceWrite=/^\/api\/testing\/evidence-sources\/(?:save|collect)$/;
@@ -60,7 +72,7 @@ export default defineConfig({
           }
           if (req.url?.startsWith("/api/")) {
             const workflow = req.url.startsWith('/api/testing/');
-            const workflowAllowed = (req.method === 'GET' && (['/api/testing/health','/api/testing/targets','/api/testing/categories','/api/testing/testcases','/api/testing/managed-targets','/api/testing/managed-targets/archived','/api/testing/datasets','/api/testing/mcp-actions'].includes(req.url)||batchRead.test(req.url)||discoveryRead.test(req.url)||datasetRead.test(req.url)||asi03Read.test(req.url)||asi03PolicyRead.test(req.url)||asi05PolicyRead.test(req.url)||evidenceRead.test(req.url)||applicationContextRead.test(req.url))) || (req.method === 'POST' && (['/api/testing/target-drafts/validate','/api/testing/connection-checks','/api/testing/discovery-probes','/api/testing/managed-targets/validate','/api/testing/managed-targets/create','/api/testing/managed-targets/update','/api/testing/managed-targets/review','/api/testing/managed-targets/archive','/api/testing/managed-targets/restore','/api/testing/discoveries','/api/testing/execution-grants','/api/testing/run-selected','/api/testing/compatibility/preview','/api/testing/plans/preview','/api/testing/readiness/preview','/api/testing/admissions','/api/testing/runs','/api/testing/batches/preview','/api/testing/batches','/api/testing/datasets/validate','/api/testing/datasets/import','/api/testing/asi03-contracts/drafts','/api/testing/asi03-policies/drafts','/api/testing/asi05-policies/drafts','/api/testing/application-contexts/save','/api/testing/mcp-actions/run'].includes(req.url)||batchCancel.test(req.url)||asi03Review.test(req.url)||asi03PolicyReview.test(req.url)||asi05PolicyReview.test(req.url)||evidenceWrite.test(req.url)) && req.headers.origin === `http://${host}`);
+            const workflowAllowed = (req.method === 'GET' && (['/api/testing/health','/api/testing/targets','/api/testing/categories','/api/testing/testcases','/api/testing/managed-targets','/api/testing/datasets','/api/testing/mcp-actions','/api/testing/mcp-catalogs','/api/testing/agent-bindings'].includes(req.url)||batchRead.test(req.url)||discoveryRead.test(req.url)||datasetRead.test(req.url)||asi03Read.test(req.url)||asi03PolicyRead.test(req.url)||asi05PolicyRead.test(req.url)||mcpCatalogRead.test(req.url)||agentBindingRead.test(req.url)||evidenceRead.test(req.url)||applicationContextRead.test(req.url)||responsePolicyList.test(req.url)||genericRunRead.test(req.url))) || (req.method === 'POST' && (['/api/testing/target-drafts/validate','/api/testing/connection-checks','/api/testing/discovery-probes','/api/testing/managed-targets/validate','/api/testing/managed-targets/create','/api/testing/managed-targets/update','/api/testing/managed-targets/review','/api/testing/managed-targets/delete','/api/testing/discoveries','/api/testing/execution-grants','/api/testing/run-selected','/api/testing/compatibility/preview','/api/testing/plans/preview','/api/testing/readiness/preview','/api/testing/admissions','/api/testing/runs','/api/testing/batches/preview','/api/testing/batches','/api/testing/datasets/validate','/api/testing/datasets/import','/api/testing/asi03-contracts/drafts','/api/testing/asi03-policies/drafts','/api/testing/asi05-policies/drafts','/api/testing/mcp-catalogs/drafts','/api/testing/agent-bindings/drafts','/api/testing/application-contexts/save','/api/testing/mcp-actions/run','/api/testing/response-policies/drafts','/api/testing/generic-runs/preview','/api/testing/generic-runs/start'].includes(req.url)||batchCancel.test(req.url)||asi03Review.test(req.url)||asi03PolicyReview.test(req.url)||asi05PolicyReview.test(req.url)||mcpCatalogReview.test(req.url)||agentBindingReview.test(req.url)||evidenceWrite.test(req.url)||responsePolicyReview.test(req.url)) && req.headers.origin === `http://${host}`);
             if (workflow ? !workflowAllowed : (req.method !== "GET" || !req.url.startsWith("/api/reports/"))) {
               res.statusCode = 405;
               res.end("Read-only reporting route required.");
@@ -84,7 +96,7 @@ export default defineConfig({
       "/api/reports/": { target: reportingOrigin, changeOrigin: true },
       "/api/testing/": { target: workflowOrigin, changeOrigin: true,
         configure(proxy){proxy.on('proxyReq',(upstream,req)=>{
-          if(localToken!==undefined&&(privileged.has(req.url??'')||batchRead.test(req.url??'')||batchCancel.test(req.url??'')||discoveryRead.test(req.url??'')||datasetRead.test(req.url??'')||asi03Read.test(req.url??'')||asi03Review.test(req.url??'')||asi03PolicyRead.test(req.url??'')||asi03PolicyReview.test(req.url??'')||asi05PolicyRead.test(req.url??'')||asi05PolicyReview.test(req.url??'')||applicationContextRead.test(req.url??'')||evidenceRead.test(req.url??'')||evidenceWrite.test(req.url??'')))upstream.setHeader('X-SecAgent-Operator',localToken);
+          if(localToken!==undefined&&(privileged.has(req.url??'')||batchRead.test(req.url??'')||batchCancel.test(req.url??'')||discoveryRead.test(req.url??'')||datasetRead.test(req.url??'')||asi03Read.test(req.url??'')||asi03Review.test(req.url??'')||asi03PolicyRead.test(req.url??'')||asi03PolicyReview.test(req.url??'')||asi05PolicyRead.test(req.url??'')||asi05PolicyReview.test(req.url??'')||mcpCatalogRead.test(req.url??'')||mcpCatalogReview.test(req.url??'')||agentBindingRead.test(req.url??'')||agentBindingReview.test(req.url??'')||applicationContextRead.test(req.url??'')||evidenceRead.test(req.url??'')||evidenceWrite.test(req.url??'')||responsePolicyList.test(req.url??'')||responsePolicyReview.test(req.url??'')||genericRunRead.test(req.url??'')))upstream.setHeader('X-SecAgent-Operator',localToken);
         });}},
     },
   },

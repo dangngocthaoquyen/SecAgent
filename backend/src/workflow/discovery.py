@@ -7,6 +7,7 @@ reviewed network policy rather than a permissive URL fetcher.
 """
 
 from datetime import datetime, timezone
+from hashlib import sha256
 import ipaddress
 import json
 import os
@@ -18,6 +19,7 @@ from uuid import uuid4
 import httpx
 from pydantic import Field, model_validator
 
+from targets.runtimes.mcp_agent import validate_restricted_tool_schema
 from workflow.models import ClosedModel, Identifier
 
 
@@ -80,6 +82,11 @@ def _short(value, pattern=SAFE_NAME) -> str | None:
     return value if isinstance(value, str) and pattern.fullmatch(value) else None
 
 
+def _canonical_sha256(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
 class DiscoveryEngine:
     def __init__(self, data_dir: Path, *, transport: httpx.BaseTransport | None = None,
                  evidence_providers=()):
@@ -90,7 +97,7 @@ class DiscoveryEngine:
         self.transport = transport
         self.evidence_providers = tuple(evidence_providers)
 
-    def _read_mcp_tools(self, client: httpx.Client, endpoint: str) -> tuple[str, list[str]]:
+    def _read_mcp_tools(self, client: httpx.Client, endpoint: str) -> tuple[str, list[dict]]:
         # tools/list is the only MCP discovery method. Never invoke a tool here.
         checked_origin, path, checked = canonical_input(endpoint)
         if checked != endpoint or path not in {"/", "/mcp", "/jsonrpc"}:
@@ -123,8 +130,44 @@ class DiscoveryEngine:
                         any(not isinstance(item, dict) or _short(item.get("name")) is None
                             for item in tools)):
                     return "malformed", []
-                names = [item["name"] for item in tools[:20]]
-                return "advertised", list(dict.fromkeys(names))
+                seen: set[str] = set()
+                discovered: list[dict] = []
+                for item in tools[:50]:
+                    name = item["name"]
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    raw_desc = item.get("description")
+                    description = raw_desc[:2048] if isinstance(raw_desc, str) else ""
+                    if "inputSchema" in item:
+                        raw_schema = item.get("inputSchema")
+                    else:
+                        raw_schema = item.get("input_schema")
+                    if raw_schema is None:
+                        input_schema = None
+                        schema_sha256 = None
+                        schema_compatible = False
+                        schema_error = "missing_input_schema"
+                    elif isinstance(raw_schema, dict):
+                        schema_compatible, schema_error = validate_restricted_tool_schema(raw_schema)
+                        input_schema = raw_schema
+                        schema_sha256 = _canonical_sha256(raw_schema)
+                    else:
+                        input_schema = None
+                        schema_sha256 = None
+                        schema_compatible = False
+                        schema_error = "invalid_input_schema"
+                    discovered.append({
+                        "name": name,
+                        "description": description,
+                        "input_schema": input_schema,
+                        "schema_sha256": schema_sha256,
+                        "schema_compatible": schema_compatible,
+                        "schema_error": schema_error,
+                        "source": endpoint,
+                        "classification": "mcp_tools_list",
+                    })
+                return "advertised", discovered
         except httpx.TimeoutException:
             return "timeout", []
         except httpx.RequestError:
@@ -168,6 +211,7 @@ class DiscoveryEngine:
         if request.credential_alias and request.credential_alias not in allowed_aliases:
             raise DiscoveryError("unknown_credential_alias")
         sources, models, agent, advertised_tools, advertised_skills = [], [], None, [], []
+        mcp_tool_entries: list[dict] = []
         openapi_chat_path = None
         adapter_hint = (next((hint for provider in self.evidence_providers
             if (hint := getattr(provider, "preferred_protocol", lambda **_: None)(
@@ -179,7 +223,8 @@ class DiscoveryEngine:
                              follow_redirects=False, trust_env=False)
         try:
             if mcp_mode:
-                status, advertised_tools = self._read_mcp_tools(client, canonical)
+                status, mcp_tool_entries = self._read_mcp_tools(client, canonical)
+                advertised_tools = [entry["name"] for entry in mcp_tool_entries]
                 sources.append({"url": canonical, "status": status,
                     "classification": "mcp_tools_list" if status == "advertised" else "unverified"})
             for path in (() if mcp_mode else METADATA_PATHS):
@@ -289,9 +334,57 @@ class DiscoveryEngine:
                 "reason": ("review_and_runtime_contract_required" if endpoint else "chat_endpoint_unknown")
                           if text_binding else "no_reviewed_execution_binding",
                 "security_verdict": None})
-        record = {"workflow_schema_version": "1.0.0", "discovery_id": uuid4().hex,
-            "discovered_at": datetime.now(timezone.utc).isoformat(),
-            "input_url": canonical, "canonical_endpoint": endpoint,
+        discovered_at = datetime.now(timezone.utc).isoformat()
+        discovery_id = uuid4().hex
+        advertised_tool_manifest_sha256 = (
+            _canonical_sha256([
+                {
+                    "name": entry["name"],
+                    "description": entry["description"],
+                    "input_schema": entry["input_schema"],
+                }
+                for entry in mcp_tool_entries
+            ])
+            if mcp_mode and sources[0]["status"] == "advertised"
+            else None
+        )
+        advertised_tool_rows = (
+            [
+                {
+                    "name": entry["name"],
+                    "source": canonical,
+                    "classification": "mcp_tools_list",
+                    "schema_compatible": entry["schema_compatible"],
+                    "schema_sha256": entry["schema_sha256"],
+                    "schema_error": entry["schema_error"],
+                }
+                for entry in mcp_tool_entries
+            ]
+            if mcp_mode
+            else [
+                {
+                    "name": name,
+                    "source": origin + "/.well-known/agent.json",
+                    "classification": "advertised_metadata",
+                }
+                for name in advertised_tools
+            ]
+        )
+        suggested_details = {
+            "purpose": f"AI Agent service ({agent})" if agent else "",
+            "features": ", ".join(advertised_skills),
+            "available_tools": ", ".join(advertised_tools),
+            "field_provenance": {
+                **({"purpose": "suggested_unverified"} if agent else {}),
+                **({"features": "suggested_unverified"} if advertised_skills else {}),
+                **({"available_tools": "discovered_observed"} if advertised_tools else {}),
+            },
+            "operator_confirmed": False,
+        }
+        record = {"workflow_schema_version": "1.0.0", "discovery_id": discovery_id,
+            "discovered_at": discovered_at,
+            "input_url": canonical, "source_endpoint": canonical,
+            "canonical_endpoint": endpoint,
             "status": status, "connection_status": connection_status,
             "request_count": len(sources), "request_budget": MAX_REQUESTS,
             "metadata_sources": sources, "protocol_candidates": protocol_candidates,
@@ -300,10 +393,11 @@ class DiscoveryEngine:
                                    "classification": "advertised_metadata"} for model in models],
             "advertised_agent": ({"name": agent, "source": origin + "/.well-known/agent.json",
                                   "classification": "advertised_metadata"} if agent else None),
-            "advertised_tools": [{"name": name, "source": canonical if mcp_mode else origin + "/.well-known/agent.json",
-                                  "classification": "mcp_tools_list" if mcp_mode else "advertised_metadata"} for name in advertised_tools],
+            "advertised_tools": advertised_tool_rows,
+            "advertised_tool_manifest_sha256": advertised_tool_manifest_sha256,
             "advertised_skills": [{"name": name, "source": origin + "/.well-known/agent.json",
                                    "classification": "advertised_metadata"} for name in advertised_skills],
+            "suggested_application_details": suggested_details,
             "possible_contracts": ([{"request": "mcp-tools-call-v1", "response": "mcp-jsonrpc-result-v1",
                                     "classification": "tools_list_only_action_unverified"}] if mcp_mode and endpoint else
                 [{"request": "openai-chat-user-message-v1",
@@ -316,6 +410,15 @@ class DiscoveryEngine:
             "adapter_protocol_hint": adapter_hint,
             "security_test_executed": False, "security_verdict": None,
             "profile_revision": None}
+        if advertised_tool_manifest_sha256 is not None:
+            self._save_mcp_capabilities({
+                "workflow_schema_version": "1.0.0",
+                "discovery_id": discovery_id,
+                "source_endpoint": canonical,
+                "discovered_at": discovered_at,
+                "advertised_tool_manifest_sha256": advertised_tool_manifest_sha256,
+                "tools": mcp_tool_entries,
+            })
         self._save(record)
         return record
 
@@ -324,22 +427,39 @@ class DiscoveryEngine:
             raise DiscoveryError("invalid_discovery_id")
         return self.root / (discovery_id + ".json")
 
-    def _save(self, record: dict):
-        path = self._path(record["discovery_id"])
-        temporary = self.root / ("." + record["discovery_id"] + "." + uuid4().hex)
+    def _mcp_capabilities_path(self, discovery_id: str) -> Path:
+        if not re.fullmatch(r"[a-f0-9]{32}", discovery_id):
+            raise DiscoveryError("invalid_discovery_id")
+        return self.root / (discovery_id + ".mcp-tools.json")
+
+    def _write_json_atomic(self, path: Path, payload: dict) -> None:
+        temporary = self.root / ("." + path.name + "." + uuid4().hex)
         try:
             with temporary.open("x", encoding="utf-8") as stream:
-                json.dump(record, stream, sort_keys=True)
+                json.dump(payload, stream, sort_keys=True)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
 
+    def _save(self, record: dict):
+        self._write_json_atomic(self._path(record["discovery_id"]), record)
+
+    def _save_mcp_capabilities(self, manifest: dict) -> None:
+        self._write_json_atomic(self._mcp_capabilities_path(manifest["discovery_id"]), manifest)
+
     def load(self, discovery_id: str) -> dict:
         path = self._path(discovery_id)
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > 32768:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 65536:
             raise DiscoveryError("discovery_record_not_found")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def load_mcp_capabilities(self, discovery_id: str) -> dict:
+        """Load the bounded MCP tools/list metadata manifest recorded during discovery."""
+        path = self._mcp_capabilities_path(discovery_id)
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 131072:
+            raise DiscoveryError("mcp_capabilities_not_found")
         return json.loads(path.read_text(encoding="utf-8"))
 
     def associate(self, discovery_id: str, profile: dict):

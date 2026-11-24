@@ -19,12 +19,17 @@ STATUSES = {"PASS", "FAIL", "INCONCLUSIVE", "ERROR"}
 DETAILS = {"scope", "completeness", "finish_reason", "assistant_content_present", "declared_tool_call_count", "tool_calls_truncated",
     "arguments_sha256", "reported_success", "execution_id", "invocation_id", "effect_sha256",
     "testcase_id", "target_id", "attribution", "evidence_type", "execution_level",
-    "handler_status", "correlation_status", "trace_completeness", "observed_action_count",
+    "handler_status", "correlation_status", "trace_completeness", "request_trace_completeness", "observed_action_count",
+    "target_reported_success", "secagent_rejected_count", "target_rejected_count", "dispatched_action_count",
     "trace_sha256", "source_provenance", "synthetic_mock",
+    "subject", "request_status", "response_status", "result_sha256", "reason", "tool_call_id",
+    "sequence_index", "model_call_index", "provenance", "execution_verified",
     "webFetchAttempted", "webFetchExecuted", "webFetchUrl", "webFetchSource", "error_present", "error_category",
     "httpPostAttempted", "httpPostExecuted", "injectionKind", "destination_id", "run_id", "result_ok", "result_status_code",
     "collector_id", "condition", "correlation_valid", "page_served", "receipt_count", "observation_complete",
-    "manifest_sha256", "log_sha256", "observed_method", "receipt_timestamp", "status"}
+    "manifest_sha256", "log_sha256", "observed_method", "receipt_timestamp", "status",
+    "collector_kind", "correlation_mechanism", "verification_status", "claimed_action",
+    "observed_action", "integrity_reference", "format", "invoke_count", "tag_count", "case_id"}
 
 
 class NormalizationError(ValueError):
@@ -183,6 +188,7 @@ def _execution_assessment(value, r):
         provenance=r.clean(row.get("provenance")),
         correlation_status=r.clean(row.get("correlation_status")),
         trace_completeness=r.clean(row.get("trace_completeness")),
+        request_trace_completeness=row.get("request_trace_completeness"),
         attribution=r.clean(row.get("attribution")),
         policy_violation=_bool(row.get("policy_violation")),
         evidence_references=[r.identifier(item) for item in references],
@@ -316,6 +322,24 @@ def _native(document, source, r):
         observation=observation, judge=judge,
         comparison=_comparison(judge, deterministic.status if deterministic else None),
         execution_evaluation=_execution_assessment(e.get("execution_evaluation"), r),
+        submitted_payload_preview=r.clean(e.get("submitted_prompt_preview"), limit=2048),
+        evidence_classification=({
+            "evidence_level": r.clean(str(e["evidence_classification"].get("evidence_level") or "")),
+            "highest_provenance": r.clean(str(e["evidence_classification"].get("highest_provenance") or "")),
+            "provenance_tiers": [r.clean(str(t)) for t in e["evidence_classification"].get("provenance_tiers", []) if isinstance(t, str)],
+            "verified_execution_present": bool(e["evidence_classification"].get("verified_execution_present", False)),
+        } if isinstance(e.get("evidence_classification"), dict) else None),
+        collector_diagnostics=([
+            {
+                "collector_id": r.clean(str(row.get("collector_id") or "")),
+                "collector_kind": r.clean(str(row.get("collector_kind") or "")),
+                "status": r.clean(str(row.get("status") or "")),
+                "matched_count": int(row.get("matched_count", 0)) if isinstance(row.get("matched_count"), int) else 0,
+                "uncorrelated_count": int(row.get("uncorrelated_count", 0)) if isinstance(row.get("uncorrelated_count"), int) else 0,
+                "reason": r.clean(str(row.get("reason") or "")),
+            }
+            for row in e.get("collector_diagnostics", []) if isinstance(row, dict)
+        ] if isinstance(e.get("collector_diagnostics"), list) else []),
         human_reference=_human(document.get("human_reference"), r),
         technical_errors=errors, limitations=_limitations(e.get("evidence_limitations"), r), normalization_notes=notes)
 

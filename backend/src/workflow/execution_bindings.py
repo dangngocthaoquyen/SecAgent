@@ -24,6 +24,7 @@ class NativeExecutionBinding:
     prerequisites: tuple[str, ...]
     request_budget: int
     execute: ExecutorFunction
+    allow_variable_request_budget: bool = False
 
     def __post_init__(self):
         if (not self.testcase_id or not self.protocol or not self.adapter_family
@@ -41,15 +42,21 @@ class ExecutionBindingRegistry:
     def get(self, testcase_id: str) -> NativeExecutionBinding | None:
         return self._bindings.get(testcase_id)
 
+    @staticmethod
+    def _budget_valid(binding: NativeExecutionBinding, case: BatchCase) -> bool:
+        if binding.allow_variable_request_budget:
+            return 1 <= case.request_budget <= binding.request_budget
+        return case.request_budget == binding.request_budget
+
     def execute(self, selection, case: BatchCase, execution_id: str, stage) -> CaseResult:
         binding = self.get(case.testcase_id)
-        if binding is None or case.request_budget != binding.request_budget:
+        if binding is None or not self._budget_valid(binding, case):
             raise ValueError("Native execution binding is unavailable or changed.")
         return binding.execute(selection, case, execution_id, stage)
 
     def execute_binding(self, binding_id: str, selection, case: BatchCase, execution_id: str, stage) -> CaseResult:
         """Resolve a server-selected delivery contract independently of source IDs."""
         binding = self.get(binding_id)
-        if binding is None or case.request_budget != binding.request_budget:
+        if binding is None or not self._budget_valid(binding, case):
             raise ValueError("Native delivery binding is unavailable or changed.")
         return binding.execute(selection, case, execution_id, stage)

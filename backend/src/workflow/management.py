@@ -65,32 +65,10 @@ class ReviewRecord(ClosedModel):
     reviewed_at: datetime = Field(strict=False)
 
 
-class ArchiveTarget(ClosedModel):
+class DeleteTargetRequest(ClosedModel):
     target_id: Identifier
     profile_revision: str = Field(pattern=r"^[a-f0-9]{64}$")
-
-
-class ArchiveTargetsRequest(ClosedModel):
-    targets: list[ArchiveTarget] = Field(min_length=1, max_length=50)
-    archive_confirmed: Literal[True]
-
-    @model_validator(mode="after")
-    def unique(self):
-        if len({item.target_id for item in self.targets}) != len(self.targets):
-            raise ValueError("Duplicate archive target.")
-        return self
-
-
-class RestoreTargetRequest(ClosedModel):
-    target_id: Identifier
-    profile_revision: str = Field(pattern=r"^[a-f0-9]{64}$")
-    restore_confirmed: Literal[True]
-
-
-class ArchivedTarget(ClosedModel):
-    target_id: Identifier
-    profile_revision: str = Field(pattern=r"^[a-f0-9]{64}$")
-    archived_at: datetime = Field(strict=False)
+    delete_confirmed: Literal[True]
 
 
 class ManagedState(ClosedModel):
@@ -98,7 +76,6 @@ class ManagedState(ClosedModel):
     catalog: CatalogConfig
     reviews: list[ReviewRecord] = Field(default_factory=list, max_length=50)
     revision_names: dict[Identifier, str] = Field(default_factory=dict)
-    archived: list[ArchivedTarget] = Field(default_factory=list, max_length=50)
     platform_sources: dict[Identifier, Literal["seed_configured", "discovery_suggested", "operator_declared"]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -111,10 +88,8 @@ class ManagedState(ClosedModel):
         if any(target_id not in target_ids or not re.fullmatch(r"[A-Za-z0-9 ._-]{1,100}", name)
                for target_id, name in self.revision_names.items()):
             raise ValueError("Invalid display-name revision basis.")
-        if (len({row.target_id for row in self.archived}) != len(self.archived)
-                or any(row.target_id not in target_ids for row in self.archived)
-                or any(target_id not in target_ids for target_id in self.platform_sources)):
-            raise ValueError("Invalid archived target or platform provenance.")
+        if any(target_id not in target_ids for target_id in self.platform_sources):
+            raise ValueError("Invalid platform provenance.")
         return self
 
 
@@ -155,20 +130,64 @@ class ManagedTargetCatalog(TargetCatalog):
         self.local_single_user = local_single_user
         self.data_dir = _data_root(Path(data_dir))
         self.state_file = self.data_dir / "target-catalog.json"
+        self.legacy_backup_file = self.data_dir / "target-catalog.legacy-archived.backup.json"
         self.probe_transport = probe_transport
-        if self.state_file.is_symlink():
+        if self.state_file.is_symlink() or self.legacy_backup_file.is_symlink():
             raise CatalogError("Linked target catalog is unsupported.")
         if self.state_file.exists():
             if not self.state_file.is_file() or self.state_file.stat().st_size > 262144:
                 raise CatalogError("Invalid stored target catalog.")
-            state = ManagedState.model_validate(read_json(self.state_file.read_bytes()))
+            raw_bytes = self.state_file.read_bytes()
+            raw_state = read_json(raw_bytes)
+            migrated_legacy_archive = False
+            if isinstance(raw_state, dict) and "archived" in raw_state:
+                archived_rows = raw_state.get("archived")
+                legacy_archived_ids = {
+                    row.get("target_id")
+                    for row in (archived_rows if isinstance(archived_rows, list) else [])
+                    if isinstance(row, dict) and isinstance(row.get("target_id"), str)
+                }
+                raw_state = {k: v for k, v in raw_state.items() if k != "archived"}
+                if legacy_archived_ids:
+                    if not self.legacy_backup_file.exists():
+                        self.legacy_backup_file.write_bytes(raw_bytes)
+                    if isinstance(raw_state.get("reviews"), list):
+                        raw_state["reviews"] = [
+                            r for r in raw_state["reviews"]
+                            if not (isinstance(r, dict) and r.get("target_id") in legacy_archived_ids)
+                        ]
+                    rev_names = dict(raw_state.get("revision_names") or {})
+                    cat_obj = dict(raw_state.get("catalog") or {})
+                    updated_targets = []
+                    suffix = " - Legacy Archived"
+                    for preset_row in cat_obj.get("targets") or []:
+                        if isinstance(preset_row, dict) and preset_row.get("id") in legacy_archived_ids:
+                            tid = preset_row["id"]
+                            orig_name = str(preset_row.get("name") or tid)
+                            rev_names.setdefault(tid, orig_name)
+                            if not orig_name.endswith(suffix):
+                                max_base = 100 - len(suffix)
+                                preset_row = {
+                                    **preset_row,
+                                    "name": f"{orig_name[:max_base].rstrip()}{suffix}",
+                                }
+                        updated_targets.append(preset_row)
+                    cat_obj["targets"] = updated_targets
+                    raw_state["catalog"] = cat_obj
+                    raw_state["revision_names"] = rev_names
+                migrated_legacy_archive = True
+            state = ManagedState.model_validate(raw_state)
             if state.catalog.policy_ref != seed.policy_ref or state.catalog.credential_aliases != seed.credential_aliases:
                 raise CatalogError("Stored catalog policy or credential bindings differ from startup configuration.")
+            if migrated_legacy_archive:
+                self._save(state)
+            else:
+                self._install(state)
         else:
             unreviewed = [p.model_copy(update={"reviewed": False}) for p in seed.targets]
             state = ManagedState(catalog=seed.model_copy(update={"targets": unreviewed}),
                 platform_sources={p.id: "seed_configured" for p in seed.targets})
-        self._install(state)
+            self._install(state)
 
     def _install(self, state: ManagedState):
         revisions = {p.id: _revision(state.catalog, p, state.revision_names.get(p.id))
@@ -179,13 +198,8 @@ class ManagedTargetCatalog(TargetCatalog):
             if (preset is None or review.profile_revision != revisions[target_id]
                     or review.policy_ref != state.catalog.policy_ref or review.endpoint != preset.endpoint):
                 raise CatalogError("Stored review does not match the exact profile revision and policy.")
-        archived_ids = {row.target_id for row in state.archived}
-        for row in state.archived:
-            if row.profile_revision != revisions[row.target_id]:
-                raise CatalogError("Archived target revision changed.")
         effective = state.catalog.model_copy(update={"targets": [
-            p.model_copy(update={"reviewed": p.id in reviews}) for p in state.catalog.targets
-            if p.id not in archived_ids]})
+            p.model_copy(update={"reviewed": p.id in reviews}) for p in state.catalog.targets]})
         prepared = TargetCatalog(effective)
         self._state = state
         self._config, self._targets, self._revisions = prepared._config, prepared._targets, revisions
@@ -231,48 +245,124 @@ class ManagedTargetCatalog(TargetCatalog):
                     if preset.protocol == "mcp-jsonrpc" else
                     ["Configured chat capability is not runtime verification.",
                      "Target review does not create a testcase execution grant."])
+                if preset.name.endswith(" - Legacy Archived"):
+                    row["limitations"].append(
+                        "Migrated from legacy archived state with review revoked; review to re-authorize or Delete Permanently to purge."
+                    )
                 review = next((r for r in self._state.reviews if r.target_id == row["id"]), None)
                 row["reviewed_at"] = review.reviewed_at.isoformat() if review else None
                 row["platform_provenance"] = self._state.platform_sources.get(row["id"], "legacy_unknown")
             return rows
 
-    def archived_targets(self):
-        with self._lock:
-            records = {row.target_id: row for row in self._state.archived}
-            return [{"id": p.id, "name": p.name, "platform_id": p.platform_id,
-                     "platform_name": p.platform_name, "endpoint": p.endpoint,
-                     "protocol": p.protocol, "profile_revision": records[p.id].profile_revision,
-                     "archived_at": records[p.id].archived_at.isoformat()}
-                    for p in self._state.catalog.targets if p.id in records]
+    def _validate_and_prepare_legacy_backup_purge(self, target_id: str) -> tuple[str, bytes | None]:
+        if not self.legacy_backup_file.exists() and not self.legacy_backup_file.is_symlink():
+            return "noop", None
+        try:
+            if (
+                self.legacy_backup_file.is_symlink()
+                or not self.legacy_backup_file.is_file()
+                or self.legacy_backup_file.stat().st_size > 262144
+            ):
+                raise CatalogError("legacy_backup_corrupted")
+            raw_backup = read_json(self.legacy_backup_file.read_bytes())
+        except CatalogError:
+            raise
+        except Exception as exc:
+            raise CatalogError("legacy_backup_corrupted") from exc
 
-    def archive_targets(self, request: ArchiveTargetsRequest):
-        with self._lock:
-            for item in request.targets:
-                if (item.target_id not in self._targets
-                        or self._revisions.get(item.target_id) != item.profile_revision):
-                    raise ValueError("Archive target is missing, stale or already archived.")
-            now = datetime.now(timezone.utc)
-            archived = [*self._state.archived,
-                *(ArchivedTarget(target_id=item.target_id,
-                    profile_revision=item.profile_revision, archived_at=now)
-                  for item in request.targets)]
-            self._save(self._state.model_copy(update={"archived": archived}))
-            return self.archived_targets()
+        if not isinstance(raw_backup, dict):
+            raise CatalogError("legacy_backup_corrupted")
+        cat_obj = raw_backup.get("catalog")
+        if (
+            not isinstance(cat_obj, dict)
+            or not isinstance(cat_obj.get("targets"), list)
+            or any(not isinstance(t, dict) or not isinstance(t.get("id"), str) for t in cat_obj["targets"])
+        ):
+            raise CatalogError("legacy_backup_corrupted")
+        archived_list = raw_backup.get("archived")
+        if (
+            not isinstance(archived_list, list)
+            or any(not isinstance(a, dict) or not isinstance(a.get("target_id"), str) for a in archived_list)
+        ):
+            raise CatalogError("legacy_backup_corrupted")
+        reviews_list = raw_backup.get("reviews", [])
+        if (
+            not isinstance(reviews_list, list)
+            or any(not isinstance(r, dict) or not isinstance(r.get("target_id"), str) for r in reviews_list)
+        ):
+            raise CatalogError("legacy_backup_corrupted")
+        rev_names = raw_backup.get("revision_names", {})
+        if (
+            not isinstance(rev_names, dict)
+            or any(not isinstance(k, str) or not isinstance(v, str) for k, v in rev_names.items())
+        ):
+            raise CatalogError("legacy_backup_corrupted")
+        plat_sources = raw_backup.get("platform_sources", {})
+        if (
+            not isinstance(plat_sources, dict)
+            or any(not isinstance(k, str) or not isinstance(v, str) for k, v in plat_sources.items())
+        ):
+            raise CatalogError("legacy_backup_corrupted")
 
-    def restore_target(self, request: RestoreTargetRequest):
+        updated_backup = dict(raw_backup)
+        remaining_targets = [t for t in cat_obj["targets"] if t.get("id") != target_id]
+        updated_backup["catalog"] = {**cat_obj, "targets": remaining_targets}
+        remaining_archived = [a for a in archived_list if a.get("target_id") != target_id]
+        updated_backup["archived"] = remaining_archived
+        if "reviews" in updated_backup:
+            updated_backup["reviews"] = [r for r in reviews_list if r.get("target_id") != target_id]
+        if "revision_names" in updated_backup:
+            updated_backup["revision_names"] = {k: v for k, v in rev_names.items() if k != target_id}
+        if "platform_sources" in updated_backup:
+            updated_backup["platform_sources"] = {k: v for k, v in plat_sources.items() if k != target_id}
+
+        if not remaining_targets and not remaining_archived and not updated_backup.get("reviews"):
+            return "unlink", None
+        encoded = (json.dumps(updated_backup, sort_keys=True, indent=2) + "\n").encode("utf-8")
+        if len(encoded) > 262144:
+            raise CatalogError("legacy_backup_corrupted")
+        return "write", encoded
+
+    def _apply_legacy_backup_purge(self, action: str, encoded: bytes | None) -> None:
+        if action == "noop":
+            return
+        if action == "unlink":
+            self.legacy_backup_file.unlink(missing_ok=True)
+            return
+        if action == "write" and encoded is not None:
+            temporary = self.data_dir / (".target-catalog-backup-" + secrets.token_hex(16) + ".tmp")
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(encoded)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, self.legacy_backup_file)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+
+    def delete_target(self, request: DeleteTargetRequest):
         with self._lock:
-            record = next((row for row in self._state.archived
-                if row.target_id == request.target_id), None)
-            preset = next((p for p in self._state.catalog.targets
-                if p.id == request.target_id), None)
-            if record is None or preset is None or record.profile_revision != request.profile_revision:
-                raise ValueError("Restore target is missing or stale.")
-            if any(p.endpoint == preset.endpoint and p.protocol == preset.protocol
-                   for p in self._targets.values()):
-                raise ValueError("Active target already uses the archived endpoint.")
-            self._save(self._state.model_copy(update={"archived": [row
-                for row in self._state.archived if row.target_id != request.target_id]}))
-            return next(row for row in self.public_targets() if row["id"] == request.target_id)
+            target_id = request.target_id
+            if (target_id not in self._targets
+                    or self._revisions.get(target_id) != request.profile_revision):
+                raise ValueError("Delete target is missing or stale.")
+            backup_action, backup_bytes = self._validate_and_prepare_legacy_backup_purge(target_id)
+            remaining_targets = [p for p in self._state.catalog.targets if p.id != target_id]
+            remaining_reviews = [r for r in self._state.reviews if r.target_id != target_id]
+            remaining_rev_names = {k: v for k, v in self._state.revision_names.items() if k != target_id}
+            remaining_platforms = {k: v for k, v in self._state.platform_sources.items() if k != target_id}
+            config = CatalogConfig.model_validate(self._state.catalog.model_dump() | {
+                "targets": [p.model_dump() for p in remaining_targets]})
+            self._save(ManagedState(
+                catalog=config,
+                reviews=remaining_reviews,
+                revision_names=remaining_rev_names,
+                platform_sources=remaining_platforms,
+            ))
+            self._apply_legacy_backup_purge(backup_action, backup_bytes)
+            return self.public_targets()
 
     @staticmethod
     def _probe_supported(preset: Preset) -> bool:
@@ -356,7 +446,6 @@ class ManagedTargetCatalog(TargetCatalog):
                     else "discovery_suggested")
             self._save(ManagedState(catalog=config, reviews=reviews,
                                     revision_names=revision_names,
-                                    archived=list(self._state.archived),
                                     platform_sources=platform_sources))
             return next(r for r in self.public_targets() if r["id"] == profile.id)
 
@@ -374,7 +463,6 @@ class ManagedTargetCatalog(TargetCatalog):
             reviews = [r for r in self._state.reviews if r.target_id != p.id] + [record]
             self._save(ManagedState(catalog=self._state.catalog, reviews=reviews,
                                     revision_names=self._state.revision_names,
-                                    archived=list(self._state.archived),
                                     platform_sources=dict(self._state.platform_sources)))
             return next(r for r in self.public_targets() if r["id"] == p.id)
 

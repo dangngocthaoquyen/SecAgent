@@ -1,15 +1,20 @@
 import {useRef,useState} from 'react';
-import {testingApi,type DiscoveryResult,type ManagedProfile} from './testingApi';
+import {testingApi,type DiscoveryResult,type ManagedProfile,type McpCapabilityManifest} from './testingApi';
 
 export default function DiscoveryPanel({nonce,secret,onUse,onReset}:{nonce:string;secret:string;
  onUse:(profile:ManagedProfile,discoveryId:string,result:DiscoveryResult)=>Promise<void>;onReset:()=>void}){
  const [url,setUrl]=useState(''),[agentName,setAgentName]=useState(''),[hint,setHint]=useState(''),[confirmed,setConfirmed]=useState(false);
  const [busy,setBusy]=useState(false),[error,setError]=useState('');
  const [result,setResult]=useState<DiscoveryResult|null>(null);
+ const [mcpManifest,setMcpManifest]=useState<McpCapabilityManifest|null>(null);
  const sequence=useRef(0);
- function reset(){sequence.current++;setBusy(false);setConfirmed(false);setResult(null);setError('');onReset();}
- async function discover(){if(!confirmed||busy)return;const token=++sequence.current;setBusy(true);setError('');setResult(null);onReset();
+ function reset(){sequence.current++;setBusy(false);setConfirmed(false);setResult(null);setMcpManifest(null);setError('');onReset();}
+ async function discover(){if(!confirmed||busy)return;const token=++sequence.current;setBusy(true);setError('');setResult(null);setMcpManifest(null);onReset();
   try{const row=await testingApi.discover(url,nonce,secret,hint||undefined);if(token!==sequence.current)return;setResult(row);
+   if(row.proposed_profile?.protocol==='mcp-jsonrpc'){
+    const cap=await testingApi.getDiscoveryMcpTools(row.discovery_id,secret,nonce).catch(()=>null);
+    if(token===sequence.current&&cap)setMcpManifest(cap);
+   }
    if(row.proposed_profile)await onUse({...row.proposed_profile,name:agentName.trim()||row.proposed_profile.name},row.discovery_id,row);
    if(token===sequence.current)setConfirmed(false);
   }catch(e){if(token===sequence.current)setError(e instanceof Error?e.message:'Discovery unavailable.');}
@@ -28,6 +33,11 @@ export default function DiscoveryPanel({nonce,secret,onUse,onReset}:{nonce:strin
   {result&&<div className="discovery-result" role="status">
    <p><strong>{result.proposed_profile?'Configuration detected':'Configuration unverified'}</strong>: {result.canonical_endpoint??result.input_url}</p>
    <p>{result.proposed_profile?'Review the detected configuration below. A connection check runs automatically when the model is known.':'No supported endpoint was verified. Check the URL or configure a target manually.'}</p>
+   {mcpManifest&&<section className="panel discovery-mcp-manifest" aria-label="Discovered MCP tools">
+    <h4>Discovered MCP Tools &amp; Schemas ({mcpManifest.tools.length})</h4>
+    <p className="caption">Source: <code>{mcpManifest.source_endpoint}</code> · Manifest SHA-256: <code>{mcpManifest.advertised_tool_manifest_sha256.slice(0,16)}...</code> · Discovery ID: <code>{mcpManifest.discovery_id}</code></p>
+    <ul>{mcpManifest.tools.map(t=><li key={t.name}><strong>{t.name}</strong> · <span className={`batch-cell-pill ${t.schema_compatible?'ready':'blocked'}`}>{t.schema_compatible?'Schema compatible':`Incompatible (${t.schema_error??'unsupported'})`}</span>{t.description&&<p>{t.description}</p>}{t.input_schema&&<details><summary>Inspect JSON Schema</summary><pre>{JSON.stringify(t.input_schema,null,2)}</pre></details>}</li>)}</ul>
+   </section>}
    <details className="target-advanced"><summary>Advanced Details</summary>
     <p>Metadata service: {result.connection_status??'unverified'}; requests: {result.request_count}/{result.request_budget}; security tests: none.</p>
     <p>Input: <code>{result.input_url}</code>. Operator hint: {result.protocol_hint??'none'}.</p>

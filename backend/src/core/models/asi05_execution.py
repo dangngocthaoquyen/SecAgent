@@ -33,6 +33,41 @@ class ProhibitedAction(ActionSignature):
     minimum_level: ExecutionLevel
 
 
+PredicateMatchKind = Literal[
+    "exact_string",
+    "exact_prefix",
+    "contains_shell_operator",
+    "command_binary_in",
+    "path_within_allowed_prefixes",
+    "path_outside_allowed_prefixes",
+]
+
+
+class ToolArgumentPredicate(ClosedModel):
+    schema_version: Literal["1.0"] = "1.0"
+    predicate_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    tool_name: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
+    argument_key: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    match_kind: PredicateMatchKind
+    values: list[str] = Field(min_length=1, max_length=32)
+    minimum_level: ExecutionLevel = "tool_invocation"
+
+    @model_validator(mode="after")
+    def validate_bounded_values(self):
+        for val in self.values:
+            if not val or len(val) > 256 or "\x00" in val:
+                raise ValueError("Predicate match values must be non-empty bounded strings.")
+            if self.match_kind == "command_binary_in" and (
+                any(ch.isspace() for ch in val) or "*" in val or "?" in val
+            ):
+                raise ValueError("command_binary_in requires explicit executable names without whitespace or wildcards.")
+            if self.match_kind in {"path_within_allowed_prefixes", "path_outside_allowed_prefixes"} and (
+                "*" in val or "?" in val or ".." in val.replace("\\", "/").split("/")
+            ):
+                raise ValueError("Path prefix predicates must use explicit non-traversal prefixes without wildcards.")
+        return self
+
+
 class Asi05ExecutionPolicy(ClosedModel):
     schema_version: Literal["1.0"] = "1.0"
     policy_id: str = Field(min_length=1, max_length=128)
@@ -44,6 +79,8 @@ class Asi05ExecutionPolicy(ClosedModel):
     subject: Literal["agent_run", "tool_service"]
     authorized_actions: list[ActionSignature] = Field(default_factory=list)
     prohibited_actions: list[ProhibitedAction] = Field(default_factory=list)
+    authorized_predicates: list[ToolArgumentPredicate] = Field(default_factory=list, max_length=32)
+    prohibited_predicates: list[ToolArgumentPredicate] = Field(default_factory=list, max_length=32)
 
     @model_validator(mode="after")
     def verify_binding_and_revision(self):
@@ -51,7 +88,17 @@ class Asi05ExecutionPolicy(ClosedModel):
         prohibited = {(a.tool_name, a.arguments_sha256) for a in self.prohibited_actions}
         if allowed & prohibited or len(allowed) != len(self.authorized_actions) or len(prohibited) != len(self.prohibited_actions):
             raise ValueError("Execution policy action signatures conflict.")
+        auth_ids = {p.predicate_id for p in self.authorized_predicates}
+        prohib_ids = {p.predicate_id for p in self.prohibited_predicates}
+        if (len(auth_ids) != len(self.authorized_predicates)
+                or len(prohib_ids) != len(self.prohibited_predicates)
+                or (auth_ids & prohib_ids)):
+            raise ValueError("Execution policy predicate identifiers conflict.")
         material = self.model_dump(exclude={"revision_sha256"})
+        if not self.authorized_predicates:
+            material.pop("authorized_predicates", None)
+        if not self.prohibited_predicates:
+            material.pop("prohibited_predicates", None)
         digest = sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         if digest != self.revision_sha256:
             raise ValueError("Execution policy revision does not match its content.")
@@ -71,6 +118,10 @@ class ObservedAction(ClosedModel):
     handler_status: HandlerStatus
     effect_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     evidence_reference: str = Field(min_length=1, max_length=256)
+    target_reported_success: bool | None = None
+    predicate_verdict: Literal["prohibited", "authorized", "unmatched"] | None = None
+    matched_predicate_id: str | None = None
+    matched_predicate_level: ExecutionLevel | None = None
 
     @model_validator(mode="after")
     def level_consistent_with_handler(self):
@@ -120,6 +171,7 @@ class Asi05ExecutionRequest(ClosedModel):
     source_provenance: Literal["synthetic_mock", "live_mcp_request", "instrumented_target_lab"]
     correlation_status: Literal["verified"]
     trace_completeness: Literal["complete", "partial"]
+    request_trace_completeness: Literal["complete", "partial", "unknown"] | None = None
     attribution: Attribution
     actions: list[ObservedAction]
     evidence_references: list[str]
@@ -138,6 +190,7 @@ class Asi05ExecutionDecision(ClosedModel):
     provenance: str | None = None
     correlation_status: str
     trace_completeness: str
+    request_trace_completeness: Literal["complete", "partial", "unknown"] | None = None
     attribution: str | None = None
     policy_violation: bool | None = None
     evidence_references: list[str] = Field(default_factory=list)

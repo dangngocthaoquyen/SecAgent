@@ -1,6 +1,6 @@
 """Versioned historical projections, deliberately independent of evaluator models."""
 from enum import Enum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter, model_validator
 
@@ -301,12 +301,18 @@ class ImportedProvenance(Model):
     source_plugin_id: str | None = None
     target_profile_id: Identifier
     target_profile_revision_sha256: SHA256
-    binding_id: Literal["GENERIC-DIRECT-CHAT", "GH-C01", "GH-001", "GH-002"]
-    adapter: Literal["generic_http"]
-    delivery_surface: Literal["direct_chat"]
-    evaluation_readiness: Literal["unavailable", "reviewed_native_rules", "reviewed_asi03_response_semantic", "reviewed_asi05_response_semantic"]
+    binding_id: Literal["GENERIC-DIRECT-CHAT", "GENERIC-MCP-AGENT", "GH-C01", "GH-001", "GH-002"]
+    adapter: Literal["generic_http", "mcp_agent_runtime"]
+    delivery_surface: Literal["direct_chat", "mcp_agent_loop"]
+    evaluation_readiness: Literal[
+        "unavailable",
+        "reviewed_native_rules",
+        "reviewed_asi03_response_semantic",
+        "reviewed_asi05_response_semantic",
+        "reviewed_asi05_execution_action",
+    ]
     evaluation_mode: Literal["rule_only", "hybrid"]
-    evidence_contract: Literal["response_only_inconclusive", "complete_response_text"]
+    evidence_contract: Literal["response_only_inconclusive", "complete_response_text", "trusted_agent_runtime_trace"]
     native_testcase_sha256: SHA256 | None = None
     evaluation_sha256: SHA256 | None = None
     submission_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")]
@@ -314,19 +320,47 @@ class ImportedProvenance(Model):
     batch_run_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")]
     batch_execution_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")]
     authorization_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")]
-    target_request_count: Annotated[int, Field(ge=0, le=1)]
+    target_request_count: Annotated[int, Field(ge=0, le=7)]
     evidence_provenance: Literal["synthetic_mock", "target_observation"]
     execution_mode: Literal["offline_mock", "live_local_http"] | None = None
     connection_probe_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")] | None = None
     target_endpoint: Text | None = None
     target_model: Text | None = None
-    evaluation_scope: Literal["identity_claim_response", "response_command_artifact"] | None = None
+    evaluation_scope: Literal["identity_claim_response", "response_command_artifact", "execution_action"] | None = None
     asi03_contract_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")] | None = None
     asi03_contract_revision_sha256: SHA256 | None = None
     asi03_policy_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")] | None = None
     asi03_policy_revision_sha256: SHA256 | None = None
     asi05_policy_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")] | None = None
     asi05_policy_revision_sha256: SHA256 | None = None
+    llm_target_id: Identifier | None = None
+    llm_profile_revision: SHA256 | None = None
+    model: Text | None = None
+    system_prompt_sha256: SHA256 | None = None
+    mcp_target_id: Identifier | None = None
+    mcp_profile_revision: SHA256 | None = None
+    tool_catalog_sha256: SHA256 | None = None
+    agent_binding_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")] | None = None
+    agent_binding_revision_sha256: SHA256 | None = None
+    model_call_budget: Annotated[int, Field(ge=1, le=4)] | None = None
+    tool_call_budget: Annotated[int, Field(ge=0, le=3)] | None = None
+    model_call_count: Annotated[int, Field(ge=0, le=4)] | None = None
+    tool_call_count: Annotated[int, Field(ge=0, le=3)] | None = None
+    attribution: Literal["agent_selected", "direct_request"] | None = None
+    evidence_source: Text | None = None
+    trace_completeness: Literal["complete", "partial", "unknown"] | None = None
+    request_trace_completeness: Literal["complete", "partial", "unknown"] | None = None
+    target_composition: Literal["hosted_mcp_agent", "promptfoo_node_hosted_agent"] | None = None
+    agent_host: Literal["secagent_python_mcp_runtime", "promptfoo_node_bridge"] | None = None
+    secagent_rejected_count: Annotated[int, Field(ge=0, le=100)] | None = None
+    target_rejected_count: Annotated[int, Field(ge=0, le=100)] | None = None
+    dispatched_action_count: Annotated[int, Field(ge=0, le=100)] | None = None
+
+    @model_validator(mode="after")
+    def verify_binding_bounds(self):
+        if self.binding_id != "GENERIC-MCP-AGENT" and self.target_request_count > 1:
+            raise ValueError("Direct-chat imported provenance cannot exceed one target request.")
+        return self
 
 
 class ExecutionAssessment(Model):
@@ -344,6 +378,7 @@ class ExecutionAssessment(Model):
     provenance: Text | None = None
     correlation_status: Text
     trace_completeness: Text
+    request_trace_completeness: Literal["complete", "partial", "unknown"] | None = None
     attribution: Text | None = None
     policy_violation: bool | None = None
     evidence_references: list[Identifier] = Field(default_factory=list)
@@ -364,6 +399,9 @@ class ExecutionReport(BaseReport):
     comparison: Comparison
     imported_provenance: ImportedProvenance | None = None
     execution_evaluation: ExecutionAssessment | None = None
+    submitted_payload_preview: Text | None = None
+    evidence_classification: dict[str, Any] | None = None
+    collector_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ParentExecution(Model):

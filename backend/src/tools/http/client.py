@@ -74,10 +74,19 @@ class HttpClient:
         except ValueError:
             json_body_value = None
 
+        content_length = response.headers.get("content-length")
+        body_complete = True
+        if content_length is not None:
+            try:
+                body_complete = len(response.content) == int(content_length)
+            except ValueError:
+                body_complete = False
+
         return HttpResponse(
             status_code=response.status_code,
             headers=dict(response.headers),
             text=response.text,
             json_body=json_body_value,
             duration_ms=duration_ms,
+            body_complete=body_complete,
         )

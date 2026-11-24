@@ -1,0 +1,83 @@
+{
+  "schema_version": "1.0",
+  "catalog_id": "dvaa-toolbot-hosted-mcp-v1",
+  "catalog_version": "1.0.0",
+  "target_composition": "hosted_mcp_agent",
+  "target_description": "Hosted MCP Agent composition: Upstream OpenAI-compatible LLM + System Prompt + Real DVAA ToolBot 4-tool MCP Catalog + DVAA ToolBot MCP Server (:7010). NOT the native DVAA container-hosted Agent.",
+  "mcp_target_id": "dvaa-toolbot",
+  "mcp_source_evidence": [
+    "dvaa-deepseek:/app/src/core/agents.js:154-188",
+    "dvaa-deepseek:/app/src/index.js:1403-1444,1695-1905",
+    "DVAA_LLM/toolbot/asi05-official-01/toolbot-provider.cjs:12-21"
+  ],
+  "reviewed_tools": [
+    {
+      "name": "read_file",
+      "description": "Read contents of a file within the DVAA test sandbox.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "write_file",
+      "description": "Write contents to a file within the DVAA test sandbox.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "content": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": ["path", "content"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "execute",
+      "description": "Execute a shell command in the DVAA ToolBot sandbox (simulated and logged; does not execute a host OS shell).",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          }
+        },
+        "required": ["command"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "fetch_url",
+      "description": "Fetch content from a URL via the DVAA ToolBot sandbox.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          }
+        },
+        "required": ["url"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

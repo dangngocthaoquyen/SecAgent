@@ -2,6 +2,7 @@ import { useCallback,useEffect,useRef,useState } from 'react';
 import { testingApi,draftFor,type TargetPreset,type ValidationResult,type EvaluationMode,type Asi01TextTarget } from './testingApi';
 import PlanWizard from './PlanWizard';
 import TargetManager,{targetKey,type ConnectionState} from './TargetManager';
+import AgentOnboardingPanel from './AgentOnboardingPanel';
 import { Facts,value } from './EvidenceViews';
 const LEGACY_PLATFORM = '__legacy_platform__';
 function platformOf(target:TargetPreset){return target.platform_id??LEGACY_PLATFORM;}
@@ -49,6 +50,10 @@ export default function TargetConfiguration({initialTargetId='',onSelectDataset}
    </div>} existingTargetIds={catalog.map(t=>t.id)} existingProfiles={catalog} evidenceEnabled={evidenceEnabled} enabled={managementEnabled} localSingleUser={localSingleUser} toolbotLabEnabled={toolbotLabBatchEnabled} nonce={nonce} target={target} settingsMatch={settingsMatch} configurationInvalid={!!result&&result.configuration_status==='invalid'&&!approvalRequired} onConnectionChange={updateConnection} onDiscoveryFlowChange={active=>{setDiscoveryFlowActive(active);if(active){invalidate();setConnection(null);}}} onChanged={id=>{invalidate();desiredTarget.current=id;setRevision(n=>n+1);}}/>
    {!discoveryFlowActive&&catalog.length===0&&<div className="target-empty"><h2>No targets yet</h2><p>{managementEnabled?'Add a target or discover from an authorized URL.':'Target management is unavailable in this service.'}</p></div>}
   </section>}
+  {catalog&&managementEnabled&&catalog.some(t=>t.protocol==='mcp-jsonrpc')&&<details className="panel target-fold" open={!discoveryFlowActive&&target?.protocol==='mcp-jsonrpc'}>
+   <summary><span>Hosted MCP Agent Onboarding</span><span className="target-pill">Tool Catalog &amp; Binding</span></summary>
+   <AgentOnboardingPanel targets={catalog} nonce={nonce} secret="" onChanged={()=>{invalidate();setRevision(n=>n+1);}}/>
+  </details>}
   {target&&!discoveryFlowActive&&<>
    {!evidenceEnabled&&<details className="panel target-fold" key={`evidence-${targetKey(target)}`}>
     <summary><span>Evidence Sources</span><span className="target-pill">Optional / {responseScope?'Response only':'Action evidence needs review'}</span></summary>

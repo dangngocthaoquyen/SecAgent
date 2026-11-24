@@ -1,8 +1,9 @@
 import {useEffect,useRef,useState} from 'react';
 
-export default function DownloadReport({kind,id}:{kind:'batches'|'runs'|'mcp-runs'|'executions';id:string}){
+export default function DownloadReport({kind,id,format}:{kind:'batches'|'runs'|'mcp-runs'|'executions';id:string;format?:'zip'|'json'}){
  const [busy,setBusy]=useState(false),[error,setError]=useState('');
- const request=useRef<AbortController|null>(null),identity=`${kind}/${id}`,current=useRef(identity);
+ const wantsJson=kind!=='batches'||format==='json';
+ const request=useRef<AbortController|null>(null),identity=`${kind}/${id}/${format??'default'}`,current=useRef(identity);
  current.current=identity;
  useEffect(()=>{setBusy(false);setError('');return()=>{request.current?.abort();request.current=null;};},[identity]);
  async function download(){
@@ -11,11 +12,12 @@ export default function DownloadReport({kind,id}:{kind:'batches'|'runs'|'mcp-run
   const controller=new AbortController(),key=identity;request.current=controller;setBusy(true);setError('');
   const timeout=setTimeout(()=>controller.abort(),60000);
   try{
-   const response=await fetch(`/api/reports/${kind}/${encodeURIComponent(id)}/download`,{method:'GET',credentials:'omit',cache:'no-store',signal:controller.signal});
+   const suffix=kind==='batches'&&format==='json'?'report.json':'download';
+   const response=await fetch(`/api/reports/${kind}/${encodeURIComponent(id)}/${suffix}`,{method:'GET',credentials:'omit',cache:'no-store',signal:controller.signal});
    if(!response.ok)throw Error(response.status===404?'Report or batch is not available in this reporting workspace.':response.status===409?'Export rejected: batch is still active or saved report integrity could not be confirmed.':response.status===403?'Download access denied. Use the authorized local reporting session.':'Report download failed. Try again after checking the reporting service.');
    const filename=/^attachment; filename="([A-Za-z0-9_-]+\.(?:zip|json))"$/.exec(response.headers.get('Content-Disposition')??'')?.[1];
-   const mime=kind==='batches'?'application/zip':'application/json';
-   if(!filename||!filename.endsWith(kind==='batches'?'.zip':'.json')||response.headers.get('X-SecAgent-Export-Schema')!=='1.0.0'||!response.headers.get('Content-Type')?.startsWith(mime))throw Error('Unsupported export response. No file was saved.');
+   const mime=wantsJson?'application/json':'application/zip';
+   if(!filename||!filename.endsWith(wantsJson?'.json':'.zip')||response.headers.get('X-SecAgent-Export-Schema')!=='1.0.0'||!response.headers.get('Content-Type')?.startsWith(mime))throw Error('Unsupported export response. No file was saved.');
    const blob=await response.blob();
    if(controller.signal.aborted||current.current!==key)return;
    if(blob.size>70*1024*1024)throw Error('Export exceeds the download size limit.');

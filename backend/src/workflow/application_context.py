@@ -6,32 +6,48 @@ import os
 from pathlib import Path
 import re
 import secrets
+from typing import Literal
 
 from pydantic import Field, model_validator
 
 from workflow.models import ClosedModel, Identifier
 
+FieldProvenance = Literal["discovered_observed", "suggested_unverified", "operator_confirmed"]
+
 
 class ApplicationContextDraft(ClosedModel):
     target_id: Identifier
     target_revision: str = Field(pattern=r"^[a-f0-9]{64}$")
+    # A. Core Application Details
     purpose: str = Field(default="", max_length=1000)
     features: str = Field(default="", max_length=1000)
+    domain_industry: str = Field(default="", max_length=1000)
+    operational_constraints: str = Field(default="", max_length=1000)
+    # B. Access & Permissions
     available_tools: str = Field(default="", max_length=1000)
     users: str = Field(default="", max_length=1000)
     allowed_resources: str = Field(default="", max_length=1000)
     prohibited_resources: str = Field(default="", max_length=1000)
+    authorized_actions: str = Field(default="", max_length=1000)
+    authorization_required: str = Field(default="", max_length=1000)
+    trust_boundaries: str = Field(default="", max_length=1000)
+    # C. Data & Content
     sensitive_data_categories: str = Field(default="", max_length=1000)
     protected_assets: str = Field(default="", max_length=1000)
     high_risk_actions: str = Field(default="", max_length=1000)
+    data_handling_restrictions: str = Field(default="", max_length=1000)
+    # D. Business Context
     required_instructions: str = Field(default="", max_length=1000)
-    authorization_required: str = Field(default="", max_length=1000)
-    trust_boundaries: str = Field(default="", max_length=1000)
+    business_restrictions: str = Field(default="", max_length=1000)
+    # E. Red Team User
+    redteam_personas: str = Field(default="", max_length=1000)
+    # Provenance per field (discovered_observed / suggested_unverified / operator_confirmed)
+    field_provenance: dict[str, FieldProvenance] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def reject_obvious_credentials(self):
         for key, value in self.model_dump().items():
-            if key in {"target_id", "target_revision"}:
+            if key in {"target_id", "target_revision", "field_provenance"} or not isinstance(value, str):
                 continue
             if re.search(r"-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:api[_-]?key|password|secret|token)\s*[:=]\s*\S+", value, re.I):
                 raise ValueError("Application Context must not contain credential values.")

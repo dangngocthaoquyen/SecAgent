@@ -10,10 +10,35 @@ SUPPORTED_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 SUPPORTED_INTERFACE_ADAPTERS = {
     "http": "generic_http",
     "mcp": "generic_mcp_jsonrpc",
+    "agent": "mcp_agent_runtime",
+    "offline": "offline_stored",
 }
 ENV_CREDENTIAL_PATTERN = re.compile(
     r"\{\{credential:([A-Za-z_][A-Za-z0-9_]*)\}\}"
 )
+HEADER_CREDENTIAL_PATTERN = re.compile(
+    r"^(?:(Bearer )?\{\{credential:([A-Za-z_][A-Za-z0-9_]*)\}\})$"
+)
+
+
+def parse_header_credential_placeholder(value: str) -> tuple[str, str] | None:
+    """Parse strictly allowed header credential templates:
+
+    - ``{{credential:ENV_NAME}}`` -> ``("", "ENV_NAME")``
+    - ``Bearer {{credential:ENV_NAME}}`` -> ``("Bearer ", "ENV_NAME")``
+
+    Any other string containing ``{{`` or ``}}`` is rejected fail-closed so
+    arbitrary template interpolation in headers is never permitted.
+    """
+    match = HEADER_CREDENTIAL_PATTERN.fullmatch(value)
+    if match is not None:
+        return (match.group(1) or "", match.group(2))
+    if "{{" in value or "}}" in value:
+        raise ValueError(
+            "HTTP header contains an unsupported credential placeholder format. "
+            "Only '{{credential:ENV_NAME}}' or 'Bearer {{credential:ENV_NAME}}' is allowed."
+        )
+    return None
 
 
 class TargetValidationError(Exception):
@@ -40,7 +65,7 @@ def validate_target(target: TargetProfile) -> None:
         )
 
     url = interface.config.get("url")
-    if not isinstance(url, str) or not url.strip():
+    if interface.type != "offline" and (not isinstance(url, str) or not url.strip()):
         raise TargetValidationError(
             "HTTP target configuration requires a non-empty string 'url'."
         )
@@ -73,10 +98,13 @@ def validate_target(target: TargetProfile) -> None:
             )
 
         for value in headers.values():
-            match = ENV_CREDENTIAL_PATTERN.fullmatch(value)
-            if match is None:
+            try:
+                parsed = parse_header_credential_placeholder(value)
+            except ValueError as exc:
+                raise TargetValidationError(str(exc)) from exc
+            if parsed is None:
                 continue
-            credential_ref = match.group(1)
+            _, credential_ref = parsed
             if credential_ref not in target.credential_refs:
                 raise TargetValidationError(
                     f"HTTP header references undeclared credential {credential_ref!r}."

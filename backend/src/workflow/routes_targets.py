@@ -1,20 +1,22 @@
 """Target, discovery, application-context, and evidence-source routes for Workflow API."""
 
 from contextlib import nullcontext
-from typing import Literal
+import json
+from pathlib import Path
+import shutil
+from typing import Any, Literal
 
 from flask import jsonify, request
 from pydantic import Field, ValidationError
 
 from workflow.application_context import SaveApplicationContext
 from workflow.asi01_batch import TEXT_CASES
-from workflow.catalog import read_json
+from workflow.catalog import CatalogError, read_json
 from workflow.discovery import DiscoveryError, DiscoveryRequest
 from workflow.evidence_sources import CollectEvidenceSource, EvidenceSourceError, SaveEvidenceSource
 from workflow.management import (
-    ArchiveTargetsRequest,
+    DeleteTargetRequest,
     ManagedProfile,
-    RestoreTargetRequest,
     ReviewProfile,
     SaveProfile,
 )
@@ -207,42 +209,374 @@ def register_target_routes(app, ctx) -> None:
                 row["connection_verification"] = imported_service.connection_state(catalog._targets[row["id"]])
         return jsonify(workflow_schema_version="1.0.0", targets=rows, policy_ref=catalog._config.policy_ref)
 
-    @app.get("/api/testing/managed-targets/archived")
-    def managed_archived_targets():
-        denied = managed_auth()
-        if denied:
-            return denied
-        return jsonify(workflow_schema_version="1.0.0", targets=catalog.archived_targets())
+    def _collect_target_artifacts(target_id: str) -> tuple[list[tuple[str, Path]], dict[str, int]]:
+        """Identify all target-scoped files and directories across managed stores."""
+        data_dir = Path(catalog.data_dir)
+        targets_to_purge: list[tuple[str, Path]] = []
+        counts = {
+            "application_contexts": 0,
+            "discoveries": 0,
+            "evidence_sources": 0,
+            "policies_and_contracts": 0,
+            "scan_runs": 0,
+        }
 
-    @app.post("/api/testing/managed-targets/archive")
-    def managed_archive_targets():
+        # 1. ApplicationContext
+        app_ctx_file = data_dir / "application-contexts" / f"{target_id}.json"
+        if app_ctx_file.is_file():
+            targets_to_purge.append(("file", app_ctx_file))
+            counts["application_contexts"] += 1
+
+        # 2. Discoveries associated with target_id
+        disc_dir = data_dir / "discoveries"
+        if disc_dir.is_dir():
+            for p in sorted(disc_dir.glob("*.json")):
+                if p.name.endswith(".mcp-tools.json"):
+                    continue
+                try:
+                    doc = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                proposed = doc.get("proposed_profile") if isinstance(doc, dict) else None
+                if isinstance(doc, dict) and (
+                    doc.get("saved_target_id") == target_id
+                    or (doc.get("saved_target_id") is None and isinstance(proposed, dict) and proposed.get("id") == target_id)
+                ):
+                    targets_to_purge.append(("file", p))
+                    counts["discoveries"] += 1
+                    mcp_tools = disc_dir / f"{p.stem}.mcp-tools.json"
+                    if mcp_tools.is_file():
+                        targets_to_purge.append(("file", mcp_tools))
+
+        # 3. Evidence Sources & Captures
+        ev_root = data_dir / "evidence-sources-v1"
+        if ev_root.is_dir():
+            source_ids: set[str] = set()
+            prof_dir = ev_root / "profiles"
+            if prof_dir.is_dir():
+                for p in sorted(prof_dir.glob("*.json")):
+                    try:
+                        doc = json.loads(p.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    if isinstance(doc, dict) and doc.get("target_id") == target_id:
+                        source_ids.add(p.stem)
+                        targets_to_purge.append(("file", p))
+                        counts["evidence_sources"] += 1
+            if source_ids:
+                rev_dir = ev_root / "revisions"
+                if rev_dir.is_dir():
+                    for p in sorted(rev_dir.glob("*.json")):
+                        if any(p.name.startswith(f"{sid}-") for sid in source_ids):
+                            targets_to_purge.append(("file", p))
+                for p in sorted(ev_root.glob("*-status.json")):
+                    if any(p.name.startswith(f"{sid}-") for sid in source_ids):
+                        targets_to_purge.append(("file", p))
+                cap_dir = ev_root / "captures"
+                if cap_dir.is_dir():
+                    for p in sorted(cap_dir.glob("*.json")):
+                        try:
+                            doc = json.loads(p.read_text(encoding="utf-8"))
+                        except Exception:
+                            continue
+                        if isinstance(doc, dict) and (
+                            doc.get("target_id") == target_id or doc.get("source_id") in source_ids
+                        ):
+                            targets_to_purge.append(("file", p))
+
+        # 4. Target-specific policies, contracts, and MCP catalogs/bindings
+        for subdir, field_path in (
+            ("asi03-target-policies", ("draft", "target_id")),
+            ("asi05-response-policies", ("draft", "target_id")),
+            ("asi03-contracts", ("draft", "target_id")),
+            ("mcp-tool-catalogs", ("draft", "mcp_target_id")),
+            ("mcp-agent-bindings", ("draft", "llm_target_id")),
+            ("mcp-agent-bindings", ("draft", "mcp_target_id")),
+            ("response_policies", ("target_id",)),
+        ):
+            folder = data_dir / subdir
+            if not folder.is_dir():
+                continue
+            for p in sorted(folder.glob("*.json")):
+                if any(existing_p == p for _, existing_p in targets_to_purge):
+                    continue
+                try:
+                    doc = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                cur: Any = doc
+                for k in field_path:
+                    cur = cur.get(k) if isinstance(cur, dict) else None
+                if cur == target_id:
+                    targets_to_purge.append(("file", p))
+                    counts["policies_and_contracts"] += 1
+
+        # Also check generic_run_service.policy_store._root (whether inside or outside data_dir)
+        gen_svc = getattr(ctx, "generic_run_service", None)
+        pol_store = getattr(gen_svc, "policy_store", None)
+        pol_root = getattr(pol_store, "_root", None)
+        if isinstance(pol_root, Path) and pol_root.is_dir():
+            for p in sorted(pol_root.glob("*.json")):
+                if any(existing_p == p for _, existing_p in targets_to_purge):
+                    continue
+                try:
+                    doc = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if isinstance(doc, dict) and (
+                    doc.get("target_id") == target_id
+                    or (isinstance(doc.get("draft"), dict) and doc["draft"].get("target_id") == target_id)
+                ):
+                    targets_to_purge.append(("file", p))
+                    counts["policies_and_contracts"] += 1
+
+        # 5. Scan history, execution results, batch runs, grants, claims, and controlled runs bound to target_id
+        purged_run_ids: set[str] = set()
+        purged_grant_ids: set[str] = set()
+
+        runs_root = getattr(gen_svc, "runs_root", None)
+        if isinstance(runs_root, Path) and runs_root.is_dir():
+            for run_dir in sorted(runs_root.iterdir()):
+                if not run_dir.is_dir():
+                    continue
+                rec_file = run_dir / "generic-run.json"
+                if rec_file.is_file():
+                    try:
+                        doc = json.loads(rec_file.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    if isinstance(doc, dict) and doc.get("target_id") == target_id:
+                        targets_to_purge.append(("dir", run_dir))
+                        counts["scan_runs"] += 1
+                        for case_row in doc.get("cases") or []:
+                            if isinstance(case_row, dict) and isinstance(case_row.get("run_id"), str):
+                                purged_run_ids.add(case_row["run_id"])
+
+        ctrl_roots: list[Path] = []
+        for candidate_root in (
+            getattr(gen_svc, "controlled_runs_root", None),
+            getattr(dispatcher, "output_root", None),
+            getattr(getattr(ctx, "mcp_action_service", None), "output_root", None),
+        ):
+            if isinstance(candidate_root, Path) and candidate_root not in ctrl_roots:
+                ctrl_roots.append(candidate_root)
+
+        for c_root in ctrl_roots:
+            if not c_root.is_dir():
+                continue
+            batch_root = c_root / "batch-runs"
+            if batch_root.is_dir():
+                for b_entry in sorted(batch_root.iterdir()):
+                    if any(existing_p == b_entry for _, existing_p in targets_to_purge):
+                        continue
+                    if b_entry.is_dir():
+                        state_file = b_entry / "state.json"
+                        if state_file.is_file():
+                            try:
+                                b_doc = json.loads(state_file.read_text(encoding="utf-8"))
+                            except Exception:
+                                continue
+                            snap = b_doc.get("snapshot") if isinstance(b_doc, dict) else None
+                            prov = snap.get("imported_provenance") if isinstance(snap, dict) else None
+                            if isinstance(snap, dict) and (
+                                snap.get("target_id") == target_id
+                                or (isinstance(prov, dict) and prov.get("mcp_target_id") == target_id)
+                            ):
+                                targets_to_purge.append(("dir", b_entry))
+                                counts["scan_runs"] += 1
+                                for r_row in b_doc.get("results") or []:
+                                    if isinstance(r_row, dict) and isinstance(r_row.get("report_run_id"), str):
+                                        purged_run_ids.add(r_row["report_run_id"])
+                    elif b_entry.is_file():
+                        try:
+                            b_doc = json.loads(b_entry.read_text(encoding="utf-8"))
+                        except Exception:
+                            continue
+                        if isinstance(b_doc, dict) and (
+                            b_doc.get("target_id") == target_id
+                            or b_doc.get("mcp_target_id") == target_id
+                            or (isinstance(b_doc.get("target"), dict) and b_doc["target"].get("target_id") == target_id)
+                        ):
+                            targets_to_purge.append(("file", b_entry))
+                            counts["scan_runs"] += 1
+                            if isinstance(b_doc.get("grant_id"), str):
+                                purged_grant_ids.add(b_doc["grant_id"])
+
+            for entry in sorted(c_root.iterdir()):
+                if entry.name == "batch-runs" or any(existing_p == entry for _, existing_p in targets_to_purge):
+                    continue
+                if entry.is_dir():
+                    sum_file = entry / "run-summary.json"
+                    if sum_file.is_file():
+                        try:
+                            doc = json.loads(sum_file.read_text(encoding="utf-8"))
+                        except Exception:
+                            continue
+                        if isinstance(doc, dict) and (
+                            doc.get("target_id") == target_id or entry.name in purged_run_ids
+                        ):
+                            targets_to_purge.append(("dir", entry))
+                            counts["scan_runs"] += 1
+                            purged_run_ids.add(entry.name)
+                            if isinstance(doc.get("run_id"), str):
+                                purged_run_ids.add(doc["run_id"])
+                elif entry.is_file() and entry.suffix == ".json":
+                    try:
+                        doc = json.loads(entry.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    if isinstance(doc, dict) and (
+                        doc.get("target_id") == target_id
+                        or (isinstance(doc.get("target"), dict) and doc["target"].get("target_id") == target_id)
+                    ):
+                        targets_to_purge.append(("file", entry))
+                        counts["scan_runs"] += 1
+                        if isinstance(doc.get("grant_id"), str):
+                            purged_grant_ids.add(doc["grant_id"])
+
+            if purged_run_ids or purged_grant_ids:
+                claim_names = {f"claim-auth-{gid}" for gid in purged_grant_ids}
+                for claim_entry in sorted(c_root.glob("claim-*")):
+                    if not claim_entry.is_file() or any(existing_p == claim_entry for _, existing_p in targets_to_purge):
+                        continue
+                    matched_claim = claim_entry.name in claim_names
+                    if not matched_claim:
+                        try:
+                            c_doc = json.loads(claim_entry.read_text(encoding="utf-8"))
+                            matched_claim = isinstance(c_doc, dict) and c_doc.get("run_id") in purged_run_ids
+                        except Exception:
+                            matched_claim = False
+                    if matched_claim:
+                        targets_to_purge.append(("file", claim_entry))
+
+        return targets_to_purge, counts
+
+    def _remove_artifact_entry(kind: str, path: Path) -> None:
+        if kind == "file":
+            if path.exists():
+                path.unlink()
+        elif kind == "dir":
+            if path.exists():
+                shutil.rmtree(path)
+
+    @app.post("/api/testing/managed-targets/delete")
+    def managed_delete_target():
         denied = managed_auth()
         if denied:
             return denied
         try:
-            item = ArchiveTargetsRequest.model_validate(read_json(request.get_data()))
-            with admin_lock, dispatcher._lock if dispatcher else nullcontext():
-                if dispatcher and dispatcher._active:
-                    return fail("run_active", 409)
-                archived = catalog.archive_targets(item)
-        except (ValueError, TypeError, ValidationError, OSError):
-            return fail("archive_target_rejected", 409)
-        return jsonify(workflow_schema_version="1.0.0", archived=archived, active_targets=catalog.public_targets())
+            item = DeleteTargetRequest.model_validate(read_json(request.get_data()))
+        except (ValueError, TypeError, ValidationError):
+            return fail("delete_target_rejected", 409)
 
-    @app.post("/api/testing/managed-targets/restore")
-    def managed_restore_target():
-        denied = managed_auth()
-        if denied:
-            return denied
-        try:
-            item = RestoreTargetRequest.model_validate(read_json(request.get_data()))
-            with admin_lock, dispatcher._lock if dispatcher else nullcontext():
-                if dispatcher and dispatcher._active:
+        gen_svc = getattr(ctx, "generic_run_service", None)
+        mcp_act_svc = getattr(ctx, "mcp_action_service", None)
+        gen_lock = getattr(gen_svc, "_lock", None)
+        with (
+            admin_lock,
+            dispatcher._lock if dispatcher else nullcontext(),
+            catalog._lock,
+            gen_lock if gen_lock is not None else nullcontext(),
+        ):
+            if dispatcher and dispatcher._active:
+                return fail("run_active", 409)
+            if gen_svc is not None and gen_svc.is_active_for_target(item.target_id):
+                return fail("run_active", 409)
+            if mcp_act_svc is not None and getattr(mcp_act_svc, "_lock", None) is not None and mcp_act_svc._lock.locked():
+                return fail("run_active", 409)
+            for svc in (ctx.services or {}).values():
+                active_batch = getattr(svc, "_active", None)
+                if isinstance(active_batch, dict) and active_batch.get("target_id") == item.target_id:
                     return fail("run_active", 409)
-                profile = catalog.restore_target(item)
-        except (ValueError, TypeError, ValidationError, OSError):
-            return fail("restore_target_rejected", 409)
-        return jsonify(workflow_schema_version="1.0.0", profile=profile)
+                if getattr(svc, "active_target_id", None) == item.target_id:
+                    return fail("run_active", 409)
+                orch = getattr(svc, "orchestrator", None)
+                if getattr(orch, "_active", False):
+                    return fail("run_active", 409)
+
+            if (
+                item.target_id not in catalog._targets
+                or catalog._revisions.get(item.target_id) != item.profile_revision
+            ):
+                return fail("delete_target_rejected", 409)
+
+            prev_state = catalog._state
+            prev_state_bytes = catalog.state_file.read_bytes() if catalog.state_file.exists() else None
+            legacy_backup_path = getattr(catalog, "legacy_backup_file", None)
+            prev_legacy_backup_bytes = (
+                legacy_backup_path.read_bytes()
+                if isinstance(legacy_backup_path, Path) and legacy_backup_path.exists()
+                else None
+            )
+            prev_conn_proof = (
+                imported_service._connection_proofs.get(item.target_id)
+                if imported_service is not None and hasattr(imported_service, "_connection_proofs")
+                else None
+            )
+            prev_conn_legacy = (
+                imported_service._connections.get(item.target_id)
+                if imported_service is not None and hasattr(imported_service, "_connections")
+                else None
+            )
+            prev_dispatcher_policy = getattr(dispatcher, "policy", None) if dispatcher is not None else None
+            artifacts, purged_counts = _collect_target_artifacts(item.target_id)
+
+            # Snapshot every file to be deleted in memory for best-effort in-process exception rollback
+            file_backups: list[tuple[Path, bytes]] = []
+            for kind, path in artifacts:
+                if kind == "file" and path.is_file():
+                    file_backups.append((path, path.read_bytes()))
+                elif kind == "dir" and path.is_dir():
+                    for sub in sorted(path.rglob("*")):
+                        if sub.is_file():
+                            file_backups.append((sub, sub.read_bytes()))
+
+            try:
+                active_targets = catalog.delete_target(item)
+                for kind, path in artifacts:
+                    _remove_artifact_entry(kind, path)
+                if imported_service is not None:
+                    if hasattr(imported_service, "_connection_proofs"):
+                        imported_service._connection_proofs.pop(item.target_id, None)
+                    if hasattr(imported_service, "_connections"):
+                        imported_service._connections.pop(item.target_id, None)
+                if dispatcher is not None and getattr(dispatcher, "policy", None) is not None:
+                    surviving_grants = [
+                        g for g in dispatcher.policy.grants if getattr(g, "target_id", None) != item.target_id
+                    ]
+                    if len(surviving_grants) != len(dispatcher.policy.grants):
+                        dispatcher.policy = dispatcher.policy.model_copy(update={"grants": surviving_grants})
+            except Exception as exc:
+                # Best-effort in-process rollback: restore catalog state, legacy backup, in-memory state, and backed-up artifacts
+                if prev_state_bytes is not None:
+                    catalog.state_file.write_bytes(prev_state_bytes)
+                elif catalog.state_file.exists():
+                    catalog.state_file.unlink()
+                if isinstance(legacy_backup_path, Path):
+                    if prev_legacy_backup_bytes is not None:
+                        legacy_backup_path.write_bytes(prev_legacy_backup_bytes)
+                    elif legacy_backup_path.exists():
+                        legacy_backup_path.unlink()
+                catalog._install(prev_state)
+                if imported_service is not None:
+                    if prev_conn_proof is not None and hasattr(imported_service, "_connection_proofs"):
+                        imported_service._connection_proofs[item.target_id] = prev_conn_proof
+                    if prev_conn_legacy is not None and hasattr(imported_service, "_connections"):
+                        imported_service._connections[item.target_id] = prev_conn_legacy
+                if dispatcher is not None and prev_dispatcher_policy is not None:
+                    dispatcher.policy = prev_dispatcher_policy
+                for path, raw_bytes in file_backups:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(raw_bytes)
+                err_code = "legacy_backup_corrupted" if isinstance(exc, CatalogError) and str(exc) == "legacy_backup_corrupted" else "delete_target_rejected"
+                return fail(err_code, 409)
+
+        return jsonify(
+            workflow_schema_version="1.0.0",
+            deleted_target_id=item.target_id,
+            purged_counts=purged_counts,
+            active_targets=active_targets,
+        )
 
     @app.get("/api/testing/application-contexts/target/<target_id>")
     def read_application_context(target_id):
@@ -313,6 +647,16 @@ def register_target_routes(app, ctx) -> None:
             return denied
         try:
             return jsonify(discovery.load(discovery_id))
+        except DiscoveryError as exc:
+            return fail(exc.code, 404)
+
+    @app.get("/api/testing/discoveries/<discovery_id>/mcp-tools")
+    def read_discovery_mcp_tools(discovery_id):
+        denied = managed_auth()
+        if denied:
+            return denied
+        try:
+            return jsonify(discovery.load_mcp_capabilities(discovery_id))
         except DiscoveryError as exc:
             return fail(exc.code, 404)
 

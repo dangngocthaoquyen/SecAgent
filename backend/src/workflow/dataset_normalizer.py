@@ -65,32 +65,175 @@ def normalize_dataset(raw_bytes: bytes, filename: str = "dataset.json") -> Datas
                     raise DatasetValidationError("duplicate_json_key", "Duplicate JSON object key.")
                 result[key] = value
             return result
-        data = json.loads(decoded, object_pairs_hook=pairs,
-                          parse_constant=lambda _: (_ for _ in ()).throw(DatasetValidationError("malformed_json", "Nonfinite JSON number.")))
+        lower_name = filename.lower()
+        if lower_name.endswith((".yaml", ".yml")):
+            import yaml
+            data = yaml.safe_load(decoded)
+        elif lower_name.endswith(".jsonl"):
+            lines = [ln for ln in decoded.splitlines() if ln.strip()]
+            if not lines:
+                raise DatasetValidationError("empty_testcases", "JSONL dataset contains no records.")
+            data = [
+                json.loads(
+                    ln,
+                    object_pairs_hook=pairs,
+                    parse_constant=lambda _: (_ for _ in ()).throw(
+                        DatasetValidationError("malformed_json", "Nonfinite JSON number.")
+                    ),
+                )
+                for ln in lines
+            ]
+        else:
+            data = json.loads(
+                decoded,
+                object_pairs_hook=pairs,
+                parse_constant=lambda _: (_ for _ in ()).throw(
+                    DatasetValidationError("malformed_json", "Nonfinite JSON number.")
+                ),
+            )
     except json.JSONDecodeError as exc:
         raise DatasetValidationError("malformed_json", f"Invalid JSON syntax at line {exc.lineno}, column {exc.colno}.") from exc
+    except Exception as exc:
+        if isinstance(exc, DatasetValidationError):
+            raise
+        raise DatasetValidationError("malformed_json", f"Invalid dataset syntax: {exc}") from exc
 
     _check_nesting_depth(data, current_depth=0, max_depth=10)
-
-    # Detect Promptfoo evaluation report JSON
-    if isinstance(data, dict):
-        if "results" in data and ("table" in data or "evalId" in data or "stats" in data):
-            raise DatasetValidationError(
-                "promptfoo_report_not_supported",
-                "Promptfoo evaluation reports cannot be imported as testcase datasets. Upload a testcase definition file instead."
-            )
-        if "version" in data and "results" in data and isinstance(data["results"], dict) and "results" in data["results"]:
-            raise DatasetValidationError(
-                "promptfoo_report_not_supported",
-                "Promptfoo evaluation reports cannot be imported as testcase datasets. Upload a testcase definition file instead."
-            )
 
     file_hash = sha256(raw_bytes).hexdigest()
     clean_name = re.sub(r"[^\w\s.-]", "", filename).strip()[:120] or "custom-dataset.json"
 
+    # Format P: Promptfoo evaluation report JSON (`results.results[]`) or canonical stored-response records (`records[]` / `cases[]`)
+    is_promptfoo_report = (
+        isinstance(data, dict)
+        and (
+            ("results" in data and ("table" in data or "evalId" in data or "stats" in data))
+            or ("version" in data and "results" in data and isinstance(data.get("results"), dict) and "results" in data["results"])
+        )
+    )
+    is_stored_records_envelope = (
+        isinstance(data, dict)
+        and "testcases" not in data
+        and any(isinstance(data.get(k), list) for k in ("records", "cases"))
+    )
+
+    if is_promptfoo_report or is_stored_records_envelope:
+        from testing.archived_crosscheck import ArchiveError
+        from testing.offline_stored_import import (
+            CanonicalStoredRecordsAdapter,
+            ImportContext,
+            PromptfooReportAdapter,
+        )
+
+        adapter = PromptfooReportAdapter() if is_promptfoo_report else CanonicalStoredRecordsAdapter()
+        if not adapter.supports(data):
+            raise DatasetValidationError("invalid_envelope", "Stored response report structure is invalid.")
+        try:
+            adapted_records = adapter.extract(
+                data,
+                ImportContext(
+                    source_filename=clean_name,
+                    category=data.get("category") if isinstance(data.get("category"), str) else None,
+                    target_id=data.get("target_id") if isinstance(data.get("target_id"), str) else None,
+                ),
+            )
+        except ArchiveError as exc:
+            raise DatasetValidationError("invalid_stored_report", str(exc)) from exc
+
+        if not adapted_records:
+            raise DatasetValidationError("empty_testcases", "Dataset must contain at least one testcase.")
+        if len(adapted_records) > MAX_CASES:
+            raise DatasetValidationError(
+                "too_many_testcases",
+                f"Dataset contains {len(adapted_records)} testcases, exceeding maximum limit of {MAX_CASES}.",
+            )
+
+        normalized_cases: list[ImportedTestcase] = []
+        seen_ids: set[str] = set()
+        for idx, rec in enumerate(adapted_records):
+            case_id = rec.case_id or f"TC{idx + 1:04d}"
+            if case_id in seen_ids:
+                raise DatasetValidationError(
+                    "duplicate_testcase_id",
+                    f"Duplicate testcase ID {case_id!r} detected in dataset.",
+                )
+            seen_ids.add(case_id)
+            if not rec.prompt:
+                raise DatasetValidationError("empty_prompt", f"Prompt in testcase {case_id} must not be empty.")
+            prompt_hash = sha256(rec.prompt.encode("utf-8")).hexdigest()
+            meta: dict[str, Any] = {**rec.target_metadata}
+            if rec.category:
+                meta["asi_category"] = rec.category
+            if rec.plugin_id:
+                meta.setdefault("pluginId", rec.plugin_id)
+            resolved_rec_source = (
+                "canonical_stored_jsonl"
+                if lower_name.endswith(".jsonl") and not is_promptfoo_report and not (isinstance(data, dict) and data.get("source_tool"))
+                else rec.source_tool
+            )
+            extra_obj: dict[str, Any] = {
+                "stored_response": rec.stored_response,
+                "finish_reason": rec.finish_reason,
+                "response_complete": rec.response_complete,
+                "tool_calls": rec.tool_calls,
+                "response_id": rec.response_id,
+                "target_model": rec.target_model,
+                "provider_label": rec.provider_label,
+                "source_tool": resolved_rec_source,
+                "source_eval_id": rec.source_eval_id,
+                "source_timestamp": rec.source_timestamp,
+            }
+            if rec.historical_verdict is not None:
+                extra_obj["historical_verdict"] = rec.historical_verdict.model_dump(mode="json")
+
+            normalized_cases.append(
+                ImportedTestcase(
+                    internal_id="import-" + sha256(f"{file_hash}:{idx}".encode()).hexdigest()[:24],
+                    source_case={"case_id": case_id, "prompt": rec.prompt},
+                    testcase_id=case_id,
+                    description=None,
+                    plugin_id=rec.plugin_id,
+                    strategy_id=None,
+                    prompt=rec.prompt,
+                    prompt_sha256=prompt_hash,
+                    assertions=[],
+                    metadata=meta,
+                    options={},
+                    extra=extra_obj,
+                    index=idx,
+                )
+            )
+
+        dataset_id = sha256(f"{file_hash}:{len(normalized_cases)}".encode("utf-8")).hexdigest()[:32]
+        now = datetime.now(timezone.utc).isoformat()
+        envelope = DatasetEnvelope(
+            content_sha256="0" * 64,
+            dataset_id=dataset_id,
+            name=clean_name,
+            schema_version="1.0",
+            source_tool="promptfoo_report" if is_promptfoo_report else str(data.get("source_tool") or "canonical_stored_json"),
+            platform=str(data.get("platform")) if data.get("platform") is not None else None,
+            bot=str(data.get("bot")) if data.get("bot") is not None else None,
+            run_id=str(data.get("evalId") or data.get("run_id"))[:64] if (data.get("evalId") or data.get("run_id")) else None,
+            imported_at=now,
+            file_sha256=file_hash,
+            total_testcases=len(normalized_cases),
+            testcases=normalized_cases,
+            source_metadata={
+                "dataset_kind": "stored_response_report",
+                "has_stored_responses": True,
+                "adapter_name": adapter.name,
+            },
+        )
+        envelope.content_sha256 = envelope.computed_content_sha256()
+        envelope._source_bytes = raw_bytes
+        return envelope
+
     # Format A: Object Envelope
     if isinstance(data, dict):
         raw_cases = data.get("testcases")
+        if not isinstance(raw_cases, list) and isinstance(data.get("tests"), list):
+            raw_cases = data["tests"]
         if not isinstance(raw_cases, list):
             raise DatasetValidationError("invalid_envelope", "Object dataset must contain a 'testcases' list.")
         source_tool = str(data.get("source_tool") or "custom")

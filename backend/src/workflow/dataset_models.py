@@ -55,6 +55,16 @@ class DatasetEnvelope(BaseModel):
         return sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()).hexdigest()
 
     def to_summary(self) -> "DatasetSummary":
+        has_stored = any(
+            isinstance(tc.extra, dict)
+            and isinstance(tc.extra.get("stored_response") or tc.extra.get("response_text"), str)
+            for tc in self.testcases
+        )
+        modes = ["live", "offline"] if has_stored else ["live"]
+        asi_counts: dict[str, int] = {}
+        for tc in self.testcases:
+            cat = infer_testcase_asi_code(tc, fallback_run_id=self.run_id)
+            asi_counts[cat] = asi_counts.get(cat, 0) + 1
         return DatasetSummary(
             dataset_id=self.dataset_id,
             name=self.name,
@@ -66,7 +76,69 @@ class DatasetEnvelope(BaseModel):
             imported_at=self.imported_at,
             file_sha256=self.file_sha256,
             total_testcases=self.total_testcases,
+            has_stored_responses=has_stored,
+            supported_modes=modes,
+            asi_breakdown=asi_counts,
         )
+
+
+_PLUGIN_TO_ASI_CODE: dict[str, str] = {
+    "prompt-injection": "ASI01",
+    "indirect-prompt-injection": "ASI01",
+    "hijacking": "ASI01",
+    "goal-hijacking": "ASI01",
+    "goal_hijacking": "ASI01",
+    "asi01": "ASI01",
+    "excessive-agency": "ASI02",
+    "tool-misuse": "ASI02",
+    "tool_misuse": "ASI02",
+    "mcp": "ASI02",
+    "asi02": "ASI02",
+    "rbac": "ASI03",
+    "bola": "ASI03",
+    "bfla": "ASI03",
+    "imitation": "ASI03",
+    "identity-privilege-abuse": "ASI03",
+    "identity_privilege_abuse": "ASI03",
+    "asi03": "ASI03",
+    "code-execution": "ASI05",
+    "shell-injection": "ASI05",
+    "sql-injection": "ASI05",
+    "ssrf": "ASI05",
+    "unexpected-code-execution": "ASI05",
+    "unexpected_code_execution": "ASI05",
+    "asi05": "ASI05",
+}
+
+
+def infer_testcase_asi_code(tc: ImportedTestcase, *, fallback_run_id: str | None = None) -> str:
+    """Deterministically resolve ASI category code (ASI01/ASI02/ASI03/ASI05) or 'unmapped'."""
+    meta = tc.metadata if isinstance(tc.metadata, dict) else {}
+    for candidate in (
+        meta.get("asi_category"),
+        meta.get("category"),
+        meta.get("owasp_asi"),
+        tc.plugin_id,
+        meta.get("pluginId"),
+        fallback_run_id,
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            key = candidate.strip().lower()
+            if key.startswith("promptfoo:redteam:"):
+                key = key.split(":")[-1]
+            if key in _PLUGIN_TO_ASI_CODE:
+                return _PLUGIN_TO_ASI_CODE[key]
+            upper = candidate.strip().upper()
+            if upper in {"ASI01", "ASI02", "ASI03", "ASI05"}:
+                return upper
+    for assertion in tc.assertions or []:
+        if isinstance(assertion, dict):
+            atype = assertion.get("type")
+            if isinstance(atype, str) and ":" in atype:
+                tail = atype.split(":")[-1].strip().lower()
+                if tail in _PLUGIN_TO_ASI_CODE:
+                    return _PLUGIN_TO_ASI_CODE[tail]
+    return "unmapped"
 
 
 class DatasetSummary(BaseModel):
@@ -82,3 +154,6 @@ class DatasetSummary(BaseModel):
     imported_at: str
     file_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     total_testcases: int
+    has_stored_responses: bool = False
+    supported_modes: list[str] = Field(default_factory=lambda: ["live"])
+    asi_breakdown: dict[str, int] = Field(default_factory=dict)

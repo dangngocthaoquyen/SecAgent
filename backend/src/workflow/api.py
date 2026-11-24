@@ -36,9 +36,14 @@ from testing import RunnerEvaluationConfig
 from testing.evaluation_config import LiveJudgeConfigurationError, validate_live_pi_config
 from workflow.plans import ROOT
 from workflow.lab_attachment import LabAttemptPreparer, ReviewedImages
+from workflow.mcp_agent_runtime_binding import McpAgentRuntimeBindingStore
+from workflow.mcp_tool_catalog import McpToolCatalogStore
+from workflow.routes_agent_onboarding import register_agent_onboarding_routes
 from workflow.routes_datasets_policies import register_dataset_policy_routes
 from workflow.routes_execution import (OperatorGrantRequest, RunSelectedRequest,
     register_execution_routes)
+from workflow.response_policies import ResponsePolicyStore
+from workflow.routes_generic_runner import GenericRunService, register_generic_runner_routes
 from workflow.routes_targets import (DiscoveryProbeRequest, LocalProbeRequest,
     register_target_routes)
 
@@ -65,10 +70,13 @@ class WorkflowApiContext:
     asi05_policies: object
     application_contexts: object
     evidence_sources: object
+    mcp_tool_catalogs: object
+    mcp_agent_bindings: object
     mcp_action_service: object
     lab_preparer: object
     fail: object
     operator_authorized: object
+    generic_run_service: object | None = None
 
 
 def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=None,
@@ -77,7 +85,10 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
                batch_services: dict[str, object] | None = None,
                discovery_transport=None, dataset_repository: DatasetRepository | None = None,
                evidence_policy=None, evidence_transport=None,
-               mcp_action_service: McpActionWorkflow | None = None):
+               mcp_action_service: McpActionWorkflow | None = None,
+               response_policy_dir: Path | None = None,
+               generic_runs_dir: Path | None = None,
+               generic_run_service: GenericRunService | None = None):
     if lab_preparer is not None and dispatcher is None and (not isinstance(operator_secret,str) or len(operator_secret)<32):
         raise ValueError('Lab preparation requires a separate operator secret.')
     managed = isinstance(catalog, ManagedTargetCatalog)
@@ -132,6 +143,15 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
     application_contexts = ApplicationContextStore(catalog) if managed else None
     evidence_sources = EvidenceSourceStore(catalog, policy=evidence_policy,
         transport=evidence_transport) if managed else None
+    mcp_tool_catalogs = McpToolCatalogStore(catalog, discovery=discovery) if managed else None
+    if managed:
+        if imported_service is not None and imported_service.agent_bindings is not None:
+            mcp_agent_bindings = imported_service.agent_bindings
+            mcp_agent_bindings.tool_catalog_store = mcp_tool_catalogs
+        else:
+            mcp_agent_bindings = McpAgentRuntimeBindingStore(catalog, tool_catalog_store=mcp_tool_catalogs)
+    else:
+        mcp_agent_bindings = None
 
     def fail(code, status):
         preview_messages = {
@@ -223,6 +243,21 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
             "asi05_policy_unavailable": "The ASI05 target policy is unavailable or failed integrity validation.",
             "asi05_policy_fields_required": "Provide prohibited command behavior, allowed benign context and expected response boundary.",
             "asi05_hybrid_mode_required": "Select Hybrid Judge to evaluate ASI05 response artifacts.",
+            "mcp_agent_binding_unavailable": "Review and configure an MCP Agent runtime binding pairing the LLM and MCP targets first.",
+            "mcp_agent_binding_not_reviewed": "Approve the current MCP Agent runtime binding revision before starting execution.",
+            "mcp_agent_binding_stale": "Target profiles or runtime settings changed. Create and review a new MCP Agent runtime binding.",
+            "mcp_agent_llm_not_reviewed": "Review the selected LLM target profile before running the MCP Agent path.",
+            "mcp_agent_mcp_not_reviewed": "Review the selected MCP target profile before running the MCP Agent path.",
+            "mcp_agent_mcp_target_required": "Select a reviewed MCP JSON-RPC target for the MCP Agent runtime path.",
+            "mcp_agent_mcp_endpoint_required": "MCP Agent live local execution requires a loopback MCP JSON-RPC URL.",
+            "legacy_backup_corrupted": "Legacy archived target backup is unreadable or corrupted; inspect the local backup file before deleting targets.",
+            "generic_no_executable_cases": "No ready executable testcases remain after filtering unsupported or blocked cases.",
+            "generic_collector_root_not_allowed": "Requested evidence collector directory is outside the server's approved collector roots.",
+            "generic_submission_conflict": "This submission ID was already used with different scan parameters. Generate a new preview before starting a different scan.",
+            "generic_submission_in_progress": "A scan request with this submission ID is already initializing on the server. Verify its submission status without resending.",
+            "generic_submission_init_failed": "The initial submission failed before creating a Run record; verify status and preview again before retrying.",
+            "generic_submission_record_unavailable": "The submission mapping exists on disk, but the Run record is temporarily unavailable. Retry GET verification without starting a duplicate scan.",
+            "judge_provider_unavailable": "Hybrid LLM Judge is unavailable or missing credentials. Configure Judge credentials on the server or switch to Deterministic Rules / Evidence Only.",
         }
         message = preview_messages.get(code) or ("Controlled run request rejected; inspect the local run record before retrying."
                    if request.path == "/api/testing/runs" else
@@ -251,9 +286,7 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
                   "/api/testing/managed-targets/create": "POST",
                   "/api/testing/managed-targets/update": "POST",
                   "/api/testing/managed-targets/review": "POST",
-                  "/api/testing/managed-targets/archived": "GET",
-                  "/api/testing/managed-targets/archive": "POST",
-                  "/api/testing/managed-targets/restore": "POST",
+                  "/api/testing/managed-targets/delete": "POST",
                   "/api/testing/discoveries": "POST",
                   "/api/testing/discovery-probes": "POST",
                   "/api/testing/application-contexts/save": "POST",
@@ -278,6 +311,14 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
         routes["/api/testing/asi05-policies/drafts"] = "POST"
         routes['/api/testing/evidence-sources/save'] = 'POST'
         routes['/api/testing/evidence-sources/collect'] = 'POST'
+        routes["/api/testing/mcp-catalogs"] = "GET"
+        routes["/api/testing/mcp-catalogs/drafts"] = "POST"
+        routes["/api/testing/agent-bindings"] = "GET"
+        routes["/api/testing/agent-bindings/drafts"] = "POST"
+        routes["/api/testing/response-policies/drafts"] = "POST"
+        routes["/api/testing/generic-runs"] = "GET"
+        routes["/api/testing/generic-runs/preview"] = "POST"
+        routes["/api/testing/generic-runs/start"] = "POST"
         if re.fullmatch(r'/api/testing/evidence-sources/target/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', request.path):
             routes[request.path] = 'GET'
         if re.fullmatch(r'/api/testing/application-contexts/target/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', request.path):
@@ -286,7 +327,7 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
             routes[request.path] = 'GET'
         if re.fullmatch(r"/api/testing/batches/[a-f0-9]{32}(?:/(?:events|results|cancel))?", request.path):
             routes[request.path] = ("POST" if request.path.endswith("/cancel") else "GET")
-        if re.fullmatch(r"/api/testing/discoveries/[a-f0-9]{32}", request.path):
+        if re.fullmatch(r"/api/testing/discoveries/[a-f0-9]{32}(?:/mcp-tools)?", request.path):
             routes[request.path] = "GET"
         if re.fullmatch(r"/api/testing/datasets/[a-f0-9]{32}", request.path):
             routes[request.path] = "GET"
@@ -302,13 +343,36 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
             routes[request.path] = "POST" if request.path.endswith("/review") else "GET"
         if re.fullmatch(r"/api/testing/asi05-policies/target/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", request.path):
             routes[request.path] = "GET"
+        if re.fullmatch(r"/api/testing/mcp-catalogs/[a-f0-9]{32}(?:/review)?", request.path):
+            routes[request.path] = "POST" if request.path.endswith("/review") else "GET"
+        if re.fullmatch(r"/api/testing/mcp-catalogs/target/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", request.path):
+            routes[request.path] = "GET"
+        if re.fullmatch(r"/api/testing/agent-bindings/[a-f0-9]{32}(?:/review)?", request.path):
+            routes[request.path] = "POST" if request.path.endswith("/review") else "GET"
+        if re.fullmatch(r"/api/testing/response-policies/target/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", request.path):
+            routes[request.path] = "GET"
+        if re.fullmatch(r"/api/testing/response-policies/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}/review", request.path):
+            routes[request.path] = "POST"
+        if re.fullmatch(r"/api/testing/generic-runs/[a-f0-9]{32}(?:/report\.json)?", request.path):
+            routes[request.path] = "GET"
+        if re.fullmatch(r"/api/testing/generic-runs/submission/[a-f0-9]{32}", request.path):
+            routes[request.path] = "GET"
         if request.path not in routes:
             return fail("not_found", 404)
         if request.method != routes[request.path]:
             return fail("method_not_allowed", 405)
         if request.method == "GET" and request.content_length:
             return fail("body_not_allowed", 400)
-        if request.content_length and request.content_length > 8192 and not request.path.startswith("/api/testing/datasets"):
+        large_onboarding = (
+            request.path.startswith("/api/testing/mcp-catalogs")
+            or request.path.startswith("/api/testing/agent-bindings")
+        )
+        max_body = (
+            5 * 1024 * 1024
+            if (request.path.startswith("/api/testing/datasets") or request.path.startswith("/api/testing/generic-runs"))
+            else 65536 if large_onboarding else 8192
+        )
+        if request.content_length and request.content_length > max_body:
             return fail("payload_too_large", 413)
         if request.method == "POST":
             if origin != "http://" + request.host:
@@ -332,6 +396,33 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
         return fail("request_rejected" if isinstance(exc, HTTPException) else "internal_error",
                     exc.code if isinstance(exc, HTTPException) else 500)
 
+    if generic_run_service is None:
+        default_policy_dir = response_policy_dir or (
+            (catalog.data_dir / "response_policies") if managed else (ROOT / "data" / "response_policies")
+        )
+        default_runs_dir = generic_runs_dir or (
+            (catalog.data_dir / "generic-runs") if managed else (ROOT / "results" / "generic-runs")
+        )
+        controlled_root = getattr(dispatcher, "output_root", None) or (
+            (catalog.data_dir / "runs") if managed else None
+        )
+        pi_cfg = (
+            dispatcher.hybrid_config.pi
+            if (dispatcher is not None and getattr(dispatcher, "hybrid_config", None) is not None)
+            else None
+        )
+        generic_run_service = GenericRunService(
+            catalog=catalog,
+            dataset_repo=dataset_repo,
+            inventory=inventory,
+            policy_store=ResponsePolicyStore(default_policy_dir),
+            runs_root=default_runs_dir,
+            controlled_runs_root=controlled_root,
+            pi_config=pi_cfg,
+            application_contexts=application_contexts,
+            evidence_source_store=evidence_sources,
+        )
+
     @app.get("/api/testing/health")
     def health():
         # Anti-CSRF capability only; NOT operator auth or an execution token.
@@ -339,6 +430,16 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
         controlled = isinstance(dispatcher, ControlledDispatcher)
         hybrid_available = controlled and dispatcher.hybrid_config is not None
         custom_imported = imported_service is not None
+        j_stat = generic_run_service.judge_status()
+        pi_ready = bool(j_stat.get("judge_ready"))
+        if os.environ.get('SECAGENT_JUDGE_SETUP_REASON') == 'credential_missing' or j_stat.get("reason") == "credential_missing":
+            setup_reason = 'credential_missing'
+        elif j_stat.get("reason") == "executable_missing" and not pi_ready:
+            setup_reason = 'executable_missing'
+        elif pi_ready or hybrid_available:
+            setup_reason = 'ready_to_validate_at_run'
+        else:
+            setup_reason = 'judge_configuration_missing'
         return jsonify(workflow_schema_version="1.0.0", status="ok",
                        mode="controlled_execution_enabled" if controlled else "offline_configuration_only",
                        target_network_access=controlled and 'toolbot_lab' not in services
@@ -346,9 +447,8 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
                                and imported_service.mock_live_transport is None)),
                        evaluation_modes=['rule_only','hybrid'] if hybrid_available else ['rule_only'],
                        judge_configuration='configured_unverified' if hybrid_available else 'unavailable',
-                       judge_setup_reason=('ready_to_validate_at_run' if hybrid_available else
-                           'credential_missing' if os.environ.get('SECAGENT_JUDGE_SETUP_REASON') == 'credential_missing'
-                           else 'judge_configuration_missing'),
+                       judge_setup_reason=setup_reason,
+                       judge_status=j_stat,
                        mcp_action_setup_reason='configured' if mcp_action_service else 'catalog_missing',
                        lab_preparation_enabled=lab_preparer is not None,
                        offline_batch_enabled='offline' in services,
@@ -359,6 +459,8 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
                        custom_imported_batch_enabled=custom_imported,
                        imported_live_local_enabled=custom_imported and imported_service.execution_mode in {"live_local_http", "both"},
                        imported_live_local_mocked=custom_imported and imported_service.mock_live_transport is not None,
+                       generic_runner_enabled=True,
+                       pi_judge_ready=pi_ready,
                        registered_workflows=list(services) + (['mcp_actions'] if mcp_action_service else []),
                        target_management_enabled=managed,
                        evidence_sources_enabled=managed,
@@ -391,14 +493,19 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
         asi05_policies=asi05_policies,
         application_contexts=application_contexts,
         evidence_sources=evidence_sources,
+        mcp_tool_catalogs=mcp_tool_catalogs,
+        mcp_agent_bindings=mcp_agent_bindings,
         mcp_action_service=mcp_action_service,
         lab_preparer=lab_preparer,
         fail=fail,
         operator_authorized=operator_authorized,
+        generic_run_service=generic_run_service,
     )
     register_target_routes(app, ctx)
     register_dataset_policy_routes(app, ctx)
     register_execution_routes(app, ctx)
+    register_agent_onboarding_routes(app, ctx)
+    register_generic_runner_routes(app, ctx)
 
     return app
 
@@ -578,7 +685,8 @@ def main(argv=None):
                          local_single_user=local_single_user,batch_service=batch_service,
                          batch_services=batch_services,
                          evidence_policy=evidence_policy,
-                         mcp_action_service=mcp_action_service)
+                         mcp_action_service=mcp_action_service,
+                         response_policy_dir=ROOT / "configs" / "response_policies")
     except LiveJudgeConfigurationError as error:
         print(f'Judge preflight failed: {error}', file=sys.stderr)
         return 2

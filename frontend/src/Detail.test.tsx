@@ -220,7 +220,9 @@ describe("Execution detail and evidence semantics", () => {
                     ? detail
                     : String(url).includes("/saved-runs")
                       ? { api_schema_version: "1.0.0", page: 1, page_size: 25, total: 0, invalid_artifact_count: 0, items: [] }
-                      : page,
+                      : String(url).includes("/api/testing/generic-runs")
+                        ? { workflow_schema_version: "1.0.0", runs: [] }
+                        : page,
             ),
           ),
       );
@@ -238,7 +240,7 @@ describe("Execution detail and evidence semantics", () => {
     expect(screen.getByLabelText("Security verdict")).toHaveValue("FAIL");
     expect(
       fetcher.mock.calls.every(([url]) =>
-        String(url).startsWith("/api/reports/"),
+        String(url).startsWith("/api/reports/") || String(url) === "/api/testing/generic-runs",
       ),
     ).toBe(true);
   });

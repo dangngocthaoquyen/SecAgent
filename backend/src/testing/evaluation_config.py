@@ -1,4 +1,5 @@
 """Opt-in Runner composition and a shared, fail-closed provider call budget."""
+import json
 import os
 from pathlib import Path
 import re
@@ -36,6 +37,17 @@ class LiveJudgeConfigurationError(ValueError):
     """Fixed, credential-free preflight diagnostic for a live Pi configuration."""
 
 
+def _has_pi_auth_provider(provider: str) -> bool:
+    auth_path = Path.home() / ".pi" / "agent" / "auth.json"
+    if not auth_path.is_file():
+        return False
+    try:
+        data = json.loads(auth_path.read_text(encoding="utf-8-sig"))
+        return isinstance(data, dict) and bool(data.get(provider))
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
 def validate_live_pi_config(config: RunnerEvaluationConfig, *,
                             environ: Mapping[str, str] | None = None) -> None:
     """Preflight one shared live Pi config without reading or reporting secrets."""
@@ -44,12 +56,16 @@ def validate_live_pi_config(config: RunnerEvaluationConfig, *,
             or config.max_judge_calls != 1):
         raise LiveJudgeConfigurationError("Live Judge requires one bounded Hybrid Pi attempt per testcase.")
     names = config.pi.credential_env
-    if (not names or len(names) > 4 or any(
-            not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", name) for name in names)):
-        raise LiveJudgeConfigurationError("Live Judge credential environment names are invalid.")
-    source = os.environ if environ is None else environ
-    if any(not source.get(name) for name in names):
-        raise LiveJudgeConfigurationError("Configured Judge credential is unavailable in this process.")
+    if config.pi.use_pi_auth_file and not names:
+        if not _has_pi_auth_provider(config.pi.provider):
+            raise LiveJudgeConfigurationError("Configured Pi auth.json provider credential is unavailable.")
+    else:
+        if (not names or len(names) > 4 or any(
+                not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", name) for name in names)):
+            raise LiveJudgeConfigurationError("Live Judge credential environment names are invalid.")
+        source = os.environ if environ is None else environ
+        if any(not source.get(name) for name in names):
+            raise LiveJudgeConfigurationError("Configured Judge credential is unavailable in this process.")
     executable = config.pi.executable
     if not (Path(executable).is_file() or shutil.which(executable)):
         raise LiveJudgeConfigurationError("Configured Pi executable is unavailable.")

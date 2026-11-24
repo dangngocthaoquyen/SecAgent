@@ -88,6 +88,34 @@ export type Detail = {
   linked_archived_assessments: Archive[];
   limitations: string[];
   technical_errors: Fields[];
+  submitted_payload_preview?: string | null;
+  evidence_classification?: {
+    evidence_level?: string;
+    highest_provenance?: string;
+    provenance_tiers?: string[];
+    verified_execution_present?: boolean;
+  } | null;
+  collector_diagnostics?: {
+    collector_id: string;
+    collector_kind: string;
+    status: string;
+    matched_count: number;
+    uncorrelated_count: number;
+    reason: string;
+  }[];
+  execution_evaluation?: {
+    evaluation_scope: string;
+    verdict: string;
+    rationale: string;
+    evidence_level: string;
+    provenance?: string | null;
+    correlation_status: string;
+    trace_completeness: string;
+    attribution?: string | null;
+    policy_violation?: boolean | null;
+    evidence_references: string[];
+    unsupported_execution_claims: string[];
+  } | null;
 };
 export type DetailResponse = { snapshot_sha256: string; execution: Detail; target_request_count?: number|null };
 export type Comparison = {

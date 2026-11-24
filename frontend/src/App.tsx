@@ -9,9 +9,10 @@ import Comparisons from "./Comparisons";
 import TargetConfiguration from './TargetConfiguration';
 import BatchProgress from './BatchProgress';
 import DatasetLibrary from './DatasetLibrary';
+import SecurityScanWizard from './SecurityScanWizard';
 function route() {
   const hash = location.hash.slice(1);
-  return hash === 'targets' || hash === 'datasets' || hash === "executions" ||
+  return hash === 'scan' || hash.startsWith('scan/') || hash === 'targets' || hash === 'datasets' || hash === "executions" ||
     hash === "comparisons" ||
     hash.startsWith("execution/") || hash.startsWith("run/") || hash.startsWith("mcp-run/") || hash.startsWith("batch/")
     ? hash
@@ -20,6 +21,8 @@ function route() {
 export default function App() {
   const [view, setView] = useState(route());
   const [selectedTargetId,setSelectedTargetId]=useState('');
+  const scanView = view === 'scan' || view.startsWith('scan/');
+  const scanRunId = view.startsWith('scan/') ? view.slice('scan/'.length) : undefined;
   const targetsView = view === 'targets';
   const datasetsView = view === 'datasets';
   const batchView = view.startsWith('batch/');
@@ -36,7 +39,7 @@ export default function App() {
     return () => window.removeEventListener("hashchange", listener);
   }, []);
   useEffect(() => {
-    if (targetsView || batchView || datasetsView) return;
+    if (scanView || targetsView || batchView || datasetsView) return;
     const controller = new AbortController();
     setLoading(true);
     setSummary(null);
@@ -67,7 +70,7 @@ export default function App() {
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [revision, targetsView, batchView, datasetsView]);
+  }, [revision, scanView, targetsView, batchView, datasetsView]);
   const connection = useCallback((ok: boolean) => setConnected(ok), []);
   function navigate(next: string) {
     location.hash = next;
@@ -91,20 +94,20 @@ export default function App() {
             SecAgent<small>RESEARCH CONSOLE</small>
           </span>
         </a>
-        <div className="nav-label">SECURITY TESTING</div>
+        <div className="nav-label">SECURITY TESTING WORKFLOW</div>
         <nav aria-label="Security testing navigation">
-          <a href="#targets" aria-current={targetsView?'page':undefined} onClick={()=>navigate('targets')}>Targets</a>
-          <a href="#datasets" aria-current={datasetsView?'page':undefined} onClick={()=>navigate('datasets')}>Datasets</a>
-        </nav>
-        <div className="nav-label">EVALUATION REPORTS</div>
-        <nav aria-label="Main navigation">
-          <a
-            href="#overview"
-            aria-current={view === "overview" ? "page" : undefined}
-            onClick={() => navigate("overview")}
-          >
-            <span aria-hidden="true">◫</span> Evaluation Overview
+          <a href="#targets" aria-current={targetsView?'page':undefined} onClick={()=>navigate('targets')}>
+            <span aria-hidden="true">◎</span> Targets
           </a>
+          <a href="#datasets" aria-current={datasetsView?'page':undefined} onClick={()=>navigate('datasets')}>
+            <span aria-hidden="true">▤</span> Datasets
+          </a>
+          <a href="#scan" aria-current={scanView?'page':undefined} onClick={()=>navigate('scan')}>
+            <span aria-hidden="true">▶</span> New Scan
+          </a>
+        </nav>
+        <div className="nav-label">RESULTS &amp; REPORTS</div>
+        <nav aria-label="Main navigation">
           <a
             href="#executions"
             aria-current={
@@ -117,11 +120,18 @@ export default function App() {
             <span aria-hidden="true">☷</span> Execution Results
           </a>
           <a
+            href="#overview"
+            aria-current={view === "overview" ? "page" : undefined}
+            onClick={() => navigate("overview")}
+          >
+            <span aria-hidden="true">◫</span> Evaluation Overview
+          </a>
+          <a
             href="#comparisons"
             aria-current={view === "comparisons" ? "page" : undefined}
             onClick={() => navigate("comparisons")}
           >
-            Rule / Pi comparison
+            <span aria-hidden="true">⇄</span> Rule / Pi comparison
           </a>
         </nav>
         <div className="sidebar-foot">
@@ -136,9 +146,9 @@ export default function App() {
       <div className="workspace">
         <header>
           <div className="breadcrumb">
-            {targetsView||batchView||datasetsView?'Security Testing':'Evaluation'} <span>/</span>{" "}
+            {scanView||targetsView||batchView||datasetsView?'Security Testing':'Evaluation'} <span>/</span>{" "}
             <b>
-              {targetsView ? 'Targets' : datasetsView ? 'Dataset Library' : batchView ? 'Batch Progress' : view === "overview"
+              {scanView ? 'New Security Scan' : targetsView ? 'Targets' : datasetsView ? 'Dataset Library' : batchView ? 'Batch Progress' : view === "overview"
                 ? "Overview"
                 : view === "comparisons"
                   ? "Rule / Pi comparison"
@@ -149,21 +159,21 @@ export default function App() {
           </div>
           <div className="header-actions">
             <span
-              className={`connection ${connected && !targetsView && !datasetsView ? "online" : ""}`}
+              className={`connection ${connected && !scanView && !targetsView && !datasetsView ? "online" : ""}`}
               role="status"
             >
               <span className="dot" />
-              {targetsView||batchView||datasetsView ? 'Target workflow service' : loading
+              {scanView||targetsView||batchView||datasetsView ? 'Target workflow service' : loading
                 ? "Connecting to API"
                 : connected
                   ? "Reporting API connected"
                   : "Reporting API unavailable"}
             </span>
-            <span className="readonly">{targetsView||batchView||datasetsView?'Operator controlled':'Read-only'}</span>
+            <span className="readonly">{scanView||targetsView||batchView||datasetsView?'Operator controlled':'Read-only'}</span>
           </div>
         </header>
         <main id="main" tabIndex={-1}>
-          {targetsView ? <TargetConfiguration initialTargetId={selectedTargetId} onSelectDataset={setSelectedTargetId}/> : datasetsView ? <DatasetLibrary initialTargetId={selectedTargetId}/> : batchView ? <BatchProgress id={view.slice('batch/'.length)}/> : <>
+          {scanView ? <SecurityScanWizard initialRunId={scanRunId} initialTargetId={selectedTargetId}/> : targetsView ? <TargetConfiguration initialTargetId={selectedTargetId} onSelectDataset={setSelectedTargetId}/> : datasetsView ? <DatasetLibrary initialTargetId={selectedTargetId}/> : batchView ? <BatchProgress id={view.slice('batch/'.length)}/> : <>
           <div className="dataset-line">
             <span>
               Selected reporting dataset{" "}
@@ -182,43 +192,51 @@ export default function App() {
             snapshot; restart the reporting service to change the selected
             files.
           </p>
-          {loading ? (
-            <div className="loading" role="status">
-              <div className="skeleton" />
-              Loading selected reporting dataset…
+          {(view === "executions" || view.startsWith("execution/")) && (
+            <div hidden={view !== "executions"}>
+              <Executions
+                summary={summary}
+                snapshotLoading={loading}
+                snapshotError={error}
+                onRetrySnapshot={() => setRevision((n) => n + 1)}
+                onConnection={connection}
+              />
             </div>
-          ) : error ? (
-            <Notice error={error} retry={() => setRevision((n) => n + 1)} />
-          ) : (
-            summary && (
-              <>
-                {view === "overview" && (
-                  <Overview
-                    summary={summary}
-                    openResults={() => navigate("executions")}
-                  />
-                )}
-                {(view === "executions" || view.startsWith("execution/")) && (
-                  <div hidden={view !== "executions"}>
-                    <Executions summary={summary} onConnection={connection} />
-                  </div>
-                )}
-                {(view.startsWith("execution/") || view.startsWith("run/")) && (
-                  <ExecutionDetail
-                    id={view.slice(view.startsWith("run/") ? "run/".length : "execution/".length)}
-                    snapshot={summary.snapshot_sha256}
-                    onConnection={connection}
-                    run={view.startsWith("run/")}
-                  />
-                )}
-                {view.startsWith('mcp-run/')&&<McpRunDetail id={view.slice('mcp-run/'.length)}/>}
-                {view === "comparisons" && (
-                  <Comparisons
-                    snapshot={summary.snapshot_sha256}
-                    onConnection={connection}
-                  />
-                )}
-              </>
+          )}
+          {view !== "executions" && (
+            loading ? (
+              <div className="loading" role="status">
+                <div className="skeleton" />
+                Loading selected reporting dataset…
+              </div>
+            ) : error ? (
+              <Notice error={error} retry={() => setRevision((n) => n + 1)} />
+            ) : (
+              summary && (
+                <>
+                  {view === "overview" && (
+                    <Overview
+                      summary={summary}
+                      openResults={() => navigate("executions")}
+                    />
+                  )}
+                  {(view.startsWith("execution/") || view.startsWith("run/")) && (
+                    <ExecutionDetail
+                      id={view.slice(view.startsWith("run/") ? "run/".length : "execution/".length)}
+                      snapshot={summary.snapshot_sha256}
+                      onConnection={connection}
+                      run={view.startsWith("run/")}
+                    />
+                  )}
+                  {view.startsWith('mcp-run/')&&<McpRunDetail id={view.slice('mcp-run/'.length)}/>}
+                  {view === "comparisons" && (
+                    <Comparisons
+                      snapshot={summary.snapshot_sha256}
+                      onConnection={connection}
+                    />
+                  )}
+                </>
+              )
             )
           )}
           </>}

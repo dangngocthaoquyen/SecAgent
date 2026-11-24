@@ -15,6 +15,10 @@ BASE = "http://127.0.0.1:8092"
 
 EXPECTED_URL_MAP = (
     ("/api/testing/admissions", ("OPTIONS", "POST"), "readiness"),
+    ("/api/testing/agent-bindings", ("GET", "HEAD", "OPTIONS"), "agent_binding_list"),
+    ("/api/testing/agent-bindings/<binding_id>", ("GET", "HEAD", "OPTIONS"), "agent_binding_read"),
+    ("/api/testing/agent-bindings/<binding_id>/review", ("OPTIONS", "POST"), "agent_binding_review"),
+    ("/api/testing/agent-bindings/drafts", ("OPTIONS", "POST"), "agent_binding_draft"),
     ("/api/testing/application-contexts/save", ("OPTIONS", "POST"), "save_application_context"),
     ("/api/testing/application-contexts/target/<target_id>", ("GET", "HEAD", "OPTIONS"), "read_application_context"),
     ("/api/testing/asi03-contracts/<contract_id>", ("GET", "HEAD", "OPTIONS"), "asi03_read"),
@@ -44,28 +48,41 @@ EXPECTED_URL_MAP = (
     ("/api/testing/datasets/validate", ("OPTIONS", "POST"), "validate_dataset"),
     ("/api/testing/discoveries", ("OPTIONS", "POST"), "discover_target"),
     ("/api/testing/discoveries/<discovery_id>", ("GET", "HEAD", "OPTIONS"), "read_discovery"),
+    ("/api/testing/discoveries/<discovery_id>/mcp-tools", ("GET", "HEAD", "OPTIONS"), "read_discovery_mcp_tools"),
     ("/api/testing/discovery-probes", ("OPTIONS", "POST"), "probe_discovery_candidate"),
     ("/api/testing/evidence-captures/<capture_id>", ("GET", "HEAD", "OPTIONS"), "evidence_capture"),
     ("/api/testing/evidence-sources/collect", ("OPTIONS", "POST"), "evidence_collect"),
     ("/api/testing/evidence-sources/save", ("OPTIONS", "POST"), "evidence_save"),
     ("/api/testing/evidence-sources/target/<target_id>", ("GET", "HEAD", "OPTIONS"), "evidence_list"),
     ("/api/testing/execution-grants", ("OPTIONS", "POST"), "execution_grant"),
+    ("/api/testing/generic-runs", ("GET", "HEAD", "OPTIONS"), "generic_run_list"),
+    ("/api/testing/generic-runs/<run_id>", ("GET", "HEAD", "OPTIONS"), "generic_run_read"),
+    ("/api/testing/generic-runs/<run_id>/report.json", ("GET", "HEAD", "OPTIONS"), "generic_run_export"),
+    ("/api/testing/generic-runs/preview", ("OPTIONS", "POST"), "generic_run_preview"),
+    ("/api/testing/generic-runs/start", ("OPTIONS", "POST"), "generic_run_start"),
+    ("/api/testing/generic-runs/submission/<submission_id>", ("GET", "HEAD", "OPTIONS"), "generic_run_by_submission"),
     ("/api/testing/health", ("GET", "HEAD", "OPTIONS"), "health"),
     ("/api/testing/lab-attempts/preflight", ("OPTIONS", "POST"), "lab_preflight"),
     ("/api/testing/lab-attempts/prepare", ("OPTIONS", "POST"), "lab_prepare"),
     ("/api/testing/lab-attempts/preview", ("OPTIONS", "POST"), "lab_preview"),
     ("/api/testing/managed-targets", ("GET", "HEAD", "OPTIONS"), "managed_targets"),
-    ("/api/testing/managed-targets/archive", ("OPTIONS", "POST"), "managed_archive_targets"),
-    ("/api/testing/managed-targets/archived", ("GET", "HEAD", "OPTIONS"), "managed_archived_targets"),
     ("/api/testing/managed-targets/create", ("OPTIONS", "POST"), "managed_create"),
-    ("/api/testing/managed-targets/restore", ("OPTIONS", "POST"), "managed_restore_target"),
+    ("/api/testing/managed-targets/delete", ("OPTIONS", "POST"), "managed_delete_target"),
     ("/api/testing/managed-targets/review", ("OPTIONS", "POST"), "managed_review"),
     ("/api/testing/managed-targets/update", ("OPTIONS", "POST"), "managed_update"),
     ("/api/testing/managed-targets/validate", ("OPTIONS", "POST"), "managed_validate"),
     ("/api/testing/mcp-actions", ("GET", "HEAD", "OPTIONS"), "mcp_actions"),
     ("/api/testing/mcp-actions/run", ("OPTIONS", "POST"), "run_mcp_action"),
+    ("/api/testing/mcp-catalogs", ("GET", "HEAD", "OPTIONS"), "mcp_catalog_list"),
+    ("/api/testing/mcp-catalogs/<catalog_id>", ("GET", "HEAD", "OPTIONS"), "mcp_catalog_read"),
+    ("/api/testing/mcp-catalogs/<catalog_id>/review", ("OPTIONS", "POST"), "mcp_catalog_review"),
+    ("/api/testing/mcp-catalogs/drafts", ("OPTIONS", "POST"), "mcp_catalog_draft"),
+    ("/api/testing/mcp-catalogs/target/<target_id>", ("GET", "HEAD", "OPTIONS"), "mcp_catalog_for_target"),
     ("/api/testing/plans/preview", ("OPTIONS", "POST"), "preview"),
     ("/api/testing/readiness/preview", ("OPTIONS", "POST"), "readiness"),
+    ("/api/testing/response-policies/<policy_id>/review", ("OPTIONS", "POST"), "generic_policy_review"),
+    ("/api/testing/response-policies/drafts", ("OPTIONS", "POST"), "generic_policy_draft"),
+    ("/api/testing/response-policies/target/<target_id>", ("GET", "HEAD", "OPTIONS"), "generic_policy_list"),
     ("/api/testing/run-selected", ("OPTIONS", "POST"), "run_selected"),
     ("/api/testing/runs", ("OPTIONS", "POST"), "run"),
     ("/api/testing/target-drafts/validate", ("OPTIONS", "POST"), "validate"),
@@ -96,8 +113,8 @@ def test_url_map_and_endpoints_match_frozen_contract(tmp_path):
         if rule.endpoint != "static"
     ))
     assert actual == EXPECTED_URL_MAP
-    assert len(actual) == 57
-    assert len({ep for _, _, ep in actual}) == 55
+    assert len(actual) == 74
+    assert len({ep for _, _, ep in actual}) == 72
 
 
 def test_security_boundary_hooks_and_error_shapes_preserved(tmp_path):

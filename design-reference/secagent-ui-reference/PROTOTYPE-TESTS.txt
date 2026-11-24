@@ -1,0 +1,7 @@
+7 reference screenshots rendered without horizontal page overflow at 1440px
+Verdict/evidence filters, search, detail tabs, pagination, JSON export PASS
+Configuration, authorization, simulated progress, reconnect, completion PASS
+History tabs, expandable cases PASS
+All 7 views: no page-level horizontal overflow at 1280, 1920 and 390px
+No JavaScript errors or external HTTP(S) requests observed; inline local HTML rendering only
+These are offline prototype tests, not production SecAgent tests.

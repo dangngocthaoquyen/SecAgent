@@ -48,16 +48,21 @@ def make_profile(preset, model, timeout, credential_env=None):
                 host = ipaddress.ip_address(parts.hostname or "")
                 safe = (parts.scheme in {"http", "https"} and parts.port is not None
                     and host.is_loopback and parts.path in {"/", "/mcp", "/jsonrpc"}
-                    and parts.username is None and parts.password is None
-                    and credential_env is None)
+                    and parts.username is None and parts.password is None)
             except ValueError:
                 safe = False
             if not safe:
                 raise ValueError("Generic MCP profile requires an exact loopback JSON-RPC endpoint.")
+        headers = {"Content-Type": "application/json"}
+        credential_refs = []
+        if credential_env is not None:
+            headers["Authorization"] = f"Bearer {{{{credential:{credential_env}}}}}"
+            credential_refs.append(credential_env)
         profile = TargetProfile(id=preset.id, name=preset.name, target_type="ai_agent",
             interface={"type": "mcp", "adapter": "generic_mcp_jsonrpc", "config": {
-                "url": endpoint, "timeout": timeout, "headers": {"Content-Type": "application/json"}}},
+                "url": endpoint, "timeout": timeout, "headers": headers}},
             capabilities=["tool_call"], observability=["tool_result"],
+            credential_refs=credential_refs,
             metadata={"configuration_source": "operator_reviewed_offline_lab" if preset.id == "dvaa-toolbot-lab" else "operator_configured",
                       "protocol": "mcp-jsonrpc"})
     else:

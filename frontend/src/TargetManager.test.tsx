@@ -6,34 +6,34 @@ import { preset } from './test/targetFixtures';
 
 afterEach(()=>vi.restoreAllMocks());
 
-it('lists targets across protocols, filters by endpoint, and archives only confirmed selection',async()=>{
+it('lists targets across protocols, filters by endpoint, and permanently deletes only the confirmed target ID',async()=>{
  const http={...preset,id:'codebot',name:'CodeBot',platform_id:'dvaa',platform_name:'DVAA',endpoint:'http://127.0.0.1:7004/v1/chat/completions'};
  const mcp={...preset,id:'toolbot',name:'ToolBot',platform_id:'dvaa',platform_name:'DVAA',protocol:'mcp-jsonrpc' as const,
   endpoint:'http://127.0.0.1:7010/',default_model:'mcp-service'};
- const archive=vi.spyOn(testingApi,'archiveTargets').mockResolvedValue({archived:[],active:[http]});
- vi.spyOn(testingApi,'archivedTargets').mockResolvedValue([]);
+ const del=vi.spyOn(testingApi,'deleteTarget').mockResolvedValue({workflow_schema_version:'1.0.0',deleted_target_id:'toolbot',purged_counts:{application_contexts:1,discoveries:0,evidence_sources:0,policies_and_contracts:0,scan_runs:1},active_targets:[http]});
  const changed=vi.fn();
- render(<TargetManager enabled localSingleUser nonce={'n'.repeat(43)} target={http} existingProfiles={[http,mcp]} onChanged={changed}/>);
+ render(<TargetManager enabled localSingleUser nonce={'n'.repeat(43)} target={mcp} existingProfiles={[http,mcp]} onChanged={changed}/>);
  expect(screen.getByRole('heading',{name:'DVAA'})).toBeInTheDocument();
  expect(screen.getByRole('button',{name:/ToolBot.*7010/})).toBeInTheDocument();
+ expect(screen.queryByRole('button',{name:/Archive/i})).not.toBeInTheDocument();
  fireEvent.change(screen.getByLabelText('Search targets'),{target:{value:'7010'}});
  expect(screen.queryByRole('button',{name:/CodeBot.*7004/})).not.toBeInTheDocument();
  fireEvent.change(screen.getByLabelText('Search targets'),{target:{value:''}});
- fireEvent.click(screen.getByLabelText('Select ToolBot for bulk archive'));
- fireEvent.click(screen.getByRole('button',{name:'Archive selected (1)'}));
- const dialog=screen.getByRole('dialog',{name:'Confirm target archive'});
+ fireEvent.click(screen.getAllByRole('button',{name:'Delete'})[1]);
+ const dialog=screen.getByRole('dialog',{name:'Confirm permanent target deletion'});
  expect(dialog).toHaveTextContent('ToolBot');
+ expect(dialog).toHaveTextContent('toolbot');
+ expect(dialog).toHaveTextContent('http://127.0.0.1:7010/');
+ expect(dialog).toHaveTextContent(/This action is permanent and cannot be undone/i);
  expect(dialog).not.toHaveTextContent('CodeBot');
- expect(screen.getByRole('button',{name:'Archive targets'})).toBeDisabled();
- fireEvent.click(screen.getByLabelText('I confirm the exact targets above should be archived.'));
- fireEvent.click(screen.getByRole('button',{name:'Archive targets'}));
- await waitFor(()=>expect(archive).toHaveBeenCalledWith([{target_id:'toolbot',profile_revision:mcp.profile_revision}],'','n'.repeat(43)));
+ fireEvent.click(screen.getByRole('button',{name:'Delete Permanently'}));
+ await waitFor(()=>expect(del).toHaveBeenCalledWith({target_id:'toolbot',profile_revision:mcp.profile_revision},'','n'.repeat(43)));
+ expect(changed).toHaveBeenCalledWith('');
 });
 
 it('requires explicit platform confirmation while preserving target identity on rename',async()=>{
  const selected={...preset,id:'local-agent-7010',name:'ToolBot',platform_id:'local-agent',platform_name:'Local Agent',
   protocol:'mcp-jsonrpc' as const,endpoint:'http://127.0.0.1:7010/',default_model:'mcp-service'};
- vi.spyOn(testingApi,'archivedTargets').mockResolvedValue([]);
  const validate=vi.spyOn(testingApi,'validateManaged').mockResolvedValue(true);
  const save=vi.spyOn(testingApi,'saveManaged').mockResolvedValue(selected);
  render(<TargetManager enabled localSingleUser nonce={'n'.repeat(43)} target={selected} existingProfiles={[selected]} onChanged={vi.fn()}/>);
@@ -327,4 +327,41 @@ it('suggests the existing target when endpoint, protocol and service are already
  expect(screen.getByRole('button',{name:'Save Target'})).toBeDisabled();
  fireEvent.click(screen.getByRole('button',{name:'Use Saved ToolBot'}));
  expect(changed).toHaveBeenCalledWith('saved-toolbot');
+});
+
+it('renders Promptfoo-style Application Context sections and confirms provenance on save',async()=>{
+ const getCtx=vi.spyOn(testingApi,'getApplicationContext').mockResolvedValue({context:null,binding_status:'current'});
+ const saveCtx=vi.spyOn(testingApi,'saveApplicationContext').mockImplementation(async draft=>({
+  schema_version:'1.0.0',
+  provenance:'operator_declared',
+  revision_sha256:'f'.repeat(64),
+  updated_at:'2026-11-22T10:00:00Z',
+  draft,
+ }));
+ render(<TargetManager enabled localSingleUser nonce={'n'.repeat(43)} target={preset} existingProfiles={[preset]} onChanged={vi.fn()}/>);
+ await waitFor(()=>expect(getCtx).toHaveBeenCalledWith(preset.id,'','n'.repeat(43)));
+ expect(screen.getByText('A. Core Application Details')).toBeInTheDocument();
+ expect(screen.getByText('B. Access & Permissions')).toBeInTheDocument();
+ expect(screen.getByText('C. Data & Content')).toBeInTheDocument();
+ expect(screen.getByText('D. Business Context')).toBeInTheDocument();
+ expect(screen.getByText('E. Red Team User')).toBeInTheDocument();
+
+ fireEvent.change(screen.getByLabelText(/Purpose/),{target:{value:'Internal developer assistant'}});
+ fireEvent.change(screen.getByLabelText(/Industry \/ Domain/),{target:{value:'FinTech'}});
+ fireEvent.change(screen.getByLabelText(/Red Team User & Personas/),{target:{value:'Malicious contractor attempting privilege escalation'}});
+ fireEvent.click(screen.getByLabelText(/I confirm this operator-declared description contains no real credentials/));
+ fireEvent.click(screen.getByRole('button',{name:'Save Application Context'}));
+
+ await waitFor(()=>expect(saveCtx).toHaveBeenCalledTimes(1));
+ expect(saveCtx.mock.calls[0][0]).toMatchObject({
+  target_id:preset.id,
+  purpose:'Internal developer assistant',
+  domain_industry:'FinTech',
+  redteam_personas:'Malicious contractor attempting privilege escalation',
+  field_provenance:{
+   purpose:'operator_confirmed',
+   domain_industry:'operator_confirmed',
+   redteam_personas:'operator_confirmed',
+  },
+ });
 });

@@ -1,10 +1,11 @@
 import {useEffect,useState,useRef,type ChangeEvent} from 'react';
-import {testingApi,type DatasetSummary,type DatasetEnvelope,type ImportedTestcase,type TargetPreset,draftFor} from './testingApi';
+import {testingApi,saveScanHandoff,type DatasetSummary,type DatasetEnvelope,type HostedMcpAgentBinding,type ImportedTestcase,type TargetPreset,draftFor} from './testingApi';
 import BatchLaunch from './BatchLaunch';
 import Asi03Review from './Asi03Review';
 import Asi03TargetPolicy from './Asi03TargetPolicy';
 import Asi05PolicyReview from './Asi05Policy';
 import McpActionPanel from './McpActionPanel';
+import AgentOnboardingPanel from './AgentOnboardingPanel';
 
 export default function DatasetLibrary({nonce:propNonce,secret:propSecret='',targets:propTargets,initialTargetId=''}:{nonce?:string;secret?:string;targets?:TargetPreset[];initialTargetId?:string}={}){
  const [nonce,setNonce]=useState(propNonce||'');
@@ -22,7 +23,9 @@ export default function DatasetLibrary({nonce:propNonce,secret:propSecret='',tar
  const [evaluationMode,setEvaluationMode]=useState<'rule_only'|'hybrid'>('rule_only');
  const [selectedAsi,setSelectedAsi]=useState<'unclassified'|'ASI01'|'ASI02'|'ASI03'|'ASI05'>('unclassified');
  const [asi05Scope,setAsi05Scope]=useState<'response_command_artifact'|'execution_action'>('response_command_artifact');
- const [assessmentKind,setAssessmentKind]=useState<'chat'|'mcp'>('chat');
+ const [assessmentKind,setAssessmentKind]=useState<'chat'|'mcp'|'hosted_agent'>('chat');
+ const [agentBindings,setAgentBindings]=useState<HostedMcpAgentBinding[]>([]);
+ const [selectedBindingId,setSelectedBindingId]=useState('');
  const [legacyCaseReview,setLegacyCaseReview]=useState(false);
  const [transportMode,setTransportMode]=useState<'offline_mock'|'live_local_http'>('offline_mock');
  const [previewEnvelope,setPreviewEnvelope]=useState<DatasetEnvelope|null>(null);
@@ -41,8 +44,8 @@ export default function DatasetLibrary({nonce:propNonce,secret:propSecret='',tar
     setNonce(h.nonce);
     setExecutionEnabled(h.customImportedBatchEnabled);
     setLiveLocalEnabled(h.importedLiveLocalEnabled);
-    setHybridAvailable(h.evaluationModes.includes('hybrid'));
-    setJudgeSetupReason(h.judgeSetupReason);
+    setHybridAvailable(h.piJudgeReady===true&&h.judgeSetupReason!=='credential_missing');
+    setJudgeSetupReason(h.piJudgeReady===true&&h.judgeSetupReason!=='credential_missing'?'ready_to_validate_at_run':h.judgeSetupReason);
     setMcpSetupReason(h.mcpActionSetupReason);
     setTargets(t.targets);
     setSelectedTargetId(current=>t.targets.some(target=>target.id===current)?current:(t.targets[0]?.id??''));
@@ -65,6 +68,18 @@ export default function DatasetLibrary({nonce:propNonce,secret:propSecret='',tar
  useEffect(()=>{
   if(nonce)reloadDatasets();
  },[nonce,secret]);
+
+ function reloadAgentBindings(){
+  if(!nonce)return;
+  testingApi.listAgentBindings(secret,nonce).then(items=>{
+   setAgentBindings(items);
+   setSelectedBindingId(curr=>items.some(b=>b.binding_id===curr)?curr:(items.find(b=>b.runtime_binding_ready)?.binding_id??items[items.length-1]?.binding_id??''));
+  }).catch(()=>{});
+ }
+
+ useEffect(()=>{
+  if(nonce&&assessmentKind==='hosted_agent')reloadAgentBindings();
+ },[nonce,secret,assessmentKind]);
 
  async function handleFile(file:File){
   setError('');
@@ -123,11 +138,16 @@ export default function DatasetLibrary({nonce:propNonce,secret:propSecret='',tar
   }
  }
 
- const activeTarget=targets.find(t=>t.id===selectedTargetId)??targets[0];
- const targetDraft=activeTarget?draftFor(activeTarget,activeTarget.default_model,activeTarget.timeout_default):null;
- const evaluationCategory=selectedAsi==='ASI03'||selectedAsi==='ASI05'?selectedAsi:'unclassified';
- const scopeSupported=selectedAsi==='unclassified'||selectedAsi==='ASI03'||selectedAsi==='ASI05'&&asi05Scope==='response_command_artifact';
- const targetCompatible=activeTarget?.protocol==='openai-chat';
+ const isHostedAgent=assessmentKind==='hosted_agent';
+ const selectedBinding=agentBindings.find(b=>b.binding_id===selectedBindingId)??agentBindings[0]??null;
+ const bindingLlmTarget=selectedBinding?targets.find(t=>t.id===selectedBinding.draft.llm_target_id):undefined;
+ const bindingMcpTarget=selectedBinding?targets.find(t=>t.id===selectedBinding.draft.mcp_target_id):undefined;
+ const activeTarget=isHostedAgent?bindingLlmTarget:(targets.find(t=>t.id===selectedTargetId)??targets[0]);
+ const targetDraft=activeTarget?draftFor(activeTarget,isHostedAgent&&selectedBinding?selectedBinding.draft.model:activeTarget.default_model,activeTarget.timeout_default):null;
+ const mcpTargetDraft=isHostedAgent&&bindingMcpTarget?draftFor(bindingMcpTarget,bindingMcpTarget.default_model,bindingMcpTarget.timeout_default):undefined;
+ const evaluationCategory=isHostedAgent?'ASI05':(selectedAsi==='ASI03'||selectedAsi==='ASI05'?selectedAsi:'unclassified');
+ const scopeSupported=isHostedAgent?(Boolean(selectedBinding?.runtime_binding_ready)&&Boolean(targetDraft)&&Boolean(mcpTargetDraft)):(selectedAsi==='unclassified'||selectedAsi==='ASI03'||selectedAsi==='ASI05'&&asi05Scope==='response_command_artifact');
+ const targetCompatible=isHostedAgent?(Boolean(targetDraft)&&Boolean(mcpTargetDraft)):(activeTarget?.protocol==='openai-chat');
 
  return (
   <div className="detail-page dataset-library">
@@ -147,9 +167,14 @@ export default function DatasetLibrary({nonce:propNonce,secret:propSecret='',tar
 
    <div className="assessment-kind-tabs" role="group" aria-label="Assessment transport">
     <button aria-pressed={assessmentKind==='chat'} onClick={()=>setAssessmentKind('chat')}>Chat prompt assessment</button>
+    <button aria-pressed={assessmentKind==='hosted_agent'} onClick={()=>setAssessmentKind('hosted_agent')}>Hosted MCP Agent assessment</button>
     <button aria-pressed={assessmentKind==='mcp'} onClick={()=>setAssessmentKind('mcp')}>MCP tool-action assessment</button>
    </div>
    {assessmentKind==='mcp'?<McpActionPanel targets={targets} nonce={nonce} secret={secret}/>:<>
+   {isHostedAgent&&<details className="panel" open={agentBindings.length===0}>
+    <summary><strong>Configure Hosted MCP Agent Tool Catalog &amp; Binding</strong> ({agentBindings.filter(b=>b.runtime_binding_ready).length} ready)</summary>
+    <AgentOnboardingPanel targets={targets} nonce={nonce} secret={secret} onChanged={()=>{reloadAgentBindings();setContractRevision(v=>v+1);}}/>
+   </details>}
 
    <section className="panel upload-panel">
     <h2>Import JSON Testcases</h2>
@@ -157,12 +182,13 @@ export default function DatasetLibrary({nonce:propNonce,secret:propSecret='',tar
     <div className="upload-controls">
      <input
       type="file"
-      accept=".json,application/json"
+      accept=".json,.jsonl,.yaml,.yml,application/json"
       ref={fileInputRef}
+      disabled={busy||!nonce}
       style={{display:'none'}}
       onChange={onFileInputChange}
      />
-     <button className="primary" disabled={busy} onClick={()=>fileInputRef.current?.click()}>
+     <button className="primary" disabled={busy||!nonce} onClick={()=>fileInputRef.current?.click()}>
       {busy?'Processing...':'Choose JSON File'}
      </button>
     </div>
@@ -171,6 +197,10 @@ export default function DatasetLibrary({nonce:propNonce,secret:propSecret='',tar
      <h3>Validation Preview: {previewEnvelope.name}</h3>
      <p>
       Source tool: <strong>{previewEnvelope.source_tool}</strong> · Platform: <strong>{previewEnvelope.platform||'N/A'}</strong> · Bot: <strong>{previewEnvelope.bot||'N/A'}</strong> · Cases: <strong>{previewEnvelope.total_testcases}</strong>
+     </p>
+     <p>
+      Supported Scan Modes: <span className="batch-cell-pill ready">Live Test</span>{' '}
+      {(previewEnvelope.has_stored_responses===true||previewEnvelope.source_metadata?.has_stored_responses===true)&&<span className="batch-cell-pill ready">Offline Evaluation (Stored Responses)</span>}
      </p>
      <p><small>SHA-256: <code>{previewEnvelope.file_sha256}</code></small></p>
      <button className="primary" disabled={busy} onClick={savePreview}>
@@ -209,7 +239,23 @@ export default function DatasetLibrary({nonce:propNonce,secret:propSecret='',tar
           <td>
            <button onClick={()=>openDataset(d.dataset_id)}>
             {selectedDataset?.dataset_id===d.dataset_id?'Selected':'Inspect & Select'}
-           </button>
+           </button>{' '}
+           <a
+            className="button-link"
+            href="#scan"
+            onClick={()=>{
+             const selectedTestcaseIds=selectedDataset?.dataset_id===d.dataset_id
+              ?selectedDataset.testcases.filter(tc=>selectedCaseIds.includes(tc.internal_id)).map(tc=>tc.testcase_id)
+              :undefined;
+             saveScanHandoff({
+              dataset_id:d.dataset_id,
+              target_id:activeTarget?.id,
+              testcase_ids:selectedTestcaseIds,
+             });
+            }}
+           >
+            Scan →
+           </a>
           </td>
          </tr>
         ))}
@@ -229,7 +275,19 @@ export default function DatasetLibrary({nonce:propNonce,secret:propSecret='',tar
      <strong>{selectedCaseIds.length} of {selectedDataset.total_testcases} selected</strong>
     </div>
 
-    {targets.length>0&&<div className="target-selection-box panel" aria-label="Evaluation Setup">
+    {isHostedAgent&&<div className="target-selection-box panel" aria-label="Hosted MCP Agent Setup">
+     <span className="eyebrow">HOSTED MCP AGENT SETUP</span><h3>Select reviewed agent binding</h3>
+     {agentBindings.length===0?<p className="notice" role="status">No Hosted MCP Agent Bindings found. Configure and approve a Tool Catalog + Agent Binding above.</p>:(
+      <label htmlFor="hosted-agent-binding-select">Hosted MCP Agent Binding
+       <select id="hosted-agent-binding-select" value={selectedBinding?.binding_id??''} onChange={e=>{setSelectedBindingId(e.target.value);setContractRevision(v=>v+1);}}>
+        {agentBindings.map(b=><option key={b.binding_id} value={b.binding_id}>{b.draft.llm_target_id} + {b.draft.mcp_target_id} ({b.draft.model}) · {b.review_status.toUpperCase()} {b.runtime_binding_ready?'[Ready]':'[Blocked]'}</option>)}
+       </select>
+      </label>
+     )}
+     {selectedBinding&&!selectedBinding.runtime_binding_ready&&<p className="notice" role="status"><strong>Agent binding not ready:</strong> {selectedBinding.readiness_blockers.join(', ')}.</p>}
+    </div>}
+
+    {!isHostedAgent&&targets.length>0&&<div className="target-selection-box panel" aria-label="Evaluation Setup">
      <span className="eyebrow">EVALUATION SETUP</span><h3>Target, scope and policy</h3>
      <p>Choose the target and evaluation scope before reviewing cases. Imported source labels are taxonomy only; they do not review a Security Policy.</p>
      <div className="evaluation-setup-grid">
@@ -313,20 +371,43 @@ export default function DatasetLibrary({nonce:propNonce,secret:propSecret='',tar
      </table>
     </div>
 
-    {!executionEnabled&&<p>Imported execution requires the custom-import startup mode.</p>}
-    {executionEnabled&&scopeSupported&&targetCompatible&&targetDraft&&selectedCaseIds.length>0&&(
+    {!isHostedAgent&&selectedCaseIds.length>0&&(
+     <div className="scan-step-actions" style={{marginTop:'1rem'}}>
+      <a
+       className="button-link primary"
+       href="#scan"
+       onClick={()=>{
+        const selectedTestcaseIds=selectedDataset.testcases
+         .filter(tc=>selectedCaseIds.includes(tc.internal_id))
+         .map(tc=>tc.testcase_id);
+        saveScanHandoff({
+         dataset_id:selectedDataset.dataset_id,
+         target_id:activeTarget?.id,
+         testcase_ids:selectedTestcaseIds,
+        });
+       }}
+      >
+       Open Selected in New Scan ({selectedCaseIds.length} cases) →
+      </a>
+     </div>
+    )}
+    {isHostedAgent&&!executionEnabled&&<p>Imported execution requires the custom-import startup mode.</p>}
+    {isHostedAgent&&executionEnabled&&scopeSupported&&targetCompatible&&targetDraft&&selectedCaseIds.length>0&&(
      <BatchLaunch
-      key={`${selectedDataset.dataset_id}-${activeTarget?.id}-${activeTarget?.profile_revision}-${selectedAsi}-${asi05Scope}-${transportMode}-${evaluationMode}-${contractRevision}`}
+      key={`${assessmentKind}-${selectedDataset.dataset_id}-${activeTarget?.id}-${activeTarget?.profile_revision}-${mcpTargetDraft?.target_id}-${selectedBinding?.revision_sha256}-${selectedAsi}-${asi05Scope}-${transportMode}-${evaluationMode}-${contractRevision}`}
       target={targetDraft}
       ids={selectedCaseIds}
       nonce={nonce}
       synthetic={false}
       customImported={true}
-     workflowId="imported"
+      workflowId="imported"
       datasetId={selectedDataset.dataset_id}
-      transportMode={transportMode}
-      evaluationMode={evaluationMode}
+      transportMode={isHostedAgent?'live_local_http':transportMode}
+      evaluationMode={isHostedAgent?'rule_only':evaluationMode}
       evaluationCategory={evaluationCategory}
+      executionPath={isHostedAgent?'mcp_agent_runtime':'direct_chat'}
+      mcpTarget={mcpTargetDraft}
+      agentBudgetMultiplier={selectedBinding?.binding.case_request_budget}
      />
     )}
    </section>}

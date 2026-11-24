@@ -6,8 +6,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from core.models import ExecutionResult, TargetProfile, TestInput
+from core.models.dsml import detect_dsml_intent
 from targets.adapters.base import BaseTargetAdapter, TargetAdapterError
 from targets.adapters.http_evidence import reported_http_evidence
+from targets.validator import parse_header_credential_placeholder
 from tools.http import HttpClient, HttpClientError, HttpResponse
 
 
@@ -85,12 +87,15 @@ class HttpTargetAdapter(BaseTargetAdapter):
 
         headers: dict[str, str] = {}
         for key, item in value.items():
-            match = ENV_CREDENTIAL_PATTERN.fullmatch(item)
-            if match is None:
+            try:
+                parsed = parse_header_credential_placeholder(item)
+            except ValueError as exc:
+                raise TargetAdapterError(str(exc)) from exc
+            if parsed is None:
                 headers[key] = item
                 continue
 
-            credential_ref = match.group(1)
+            prefix, credential_ref = parsed
             if credential_ref not in credential_refs:
                 raise TargetAdapterError(
                     f"HTTP header references undeclared credential {credential_ref!r}."
@@ -102,7 +107,13 @@ class HttpTargetAdapter(BaseTargetAdapter):
                     f"Required credential environment variable {credential_ref!r} "
                     "is missing or empty."
                 )
-            headers[key] = resolved_value
+            clean_secret = resolved_value.strip() if prefix else resolved_value
+            if "\r" in clean_secret or "\n" in clean_secret:
+                raise TargetAdapterError(
+                    f"Required credential environment variable {credential_ref!r} "
+                    "contains invalid control characters."
+                )
+            headers[key] = f"{prefix}{clean_secret}"
 
         return headers
 
@@ -172,22 +183,50 @@ class HttpTargetAdapter(BaseTargetAdapter):
                 events=reported_http_evidence(response.json_body),
             )
 
+        events = reported_http_evidence(response.json_body)
+        if output_text:
+            dsml = detect_dsml_intent(output_text)
+            if dsml.detected:
+                response_id = (
+                    response.json_body.get("id")
+                    if isinstance(response.json_body, dict) and isinstance(response.json_body.get("id"), str)
+                    else None
+                )
+                events.append({
+                    "kind": "model_reported_tool_intent",
+                    "source": "response_output_dsml",
+                    "name": "dsml_tool_invocation_markup",
+                    "success": None,
+                    "reference": response_id,
+                    "data": {
+                        "provenance": "model_reported",
+                        "execution_verified": False,
+                        "format": dsml.format,
+                        "tag_count": dsml.tag_count,
+                        "invoke_count": dsml.invoke_count,
+                        "invoked_tool_names": list(dsml.invoked_tool_names),
+                    },
+                })
+        resp_complete: bool | None = None
+        if response_only_completion and response.body_complete is True and output_text is not None:
+            if isinstance(response.json_body, dict) and "choices" in response.json_body:
+                choices = response.json_body.get("choices")
+                if (isinstance(choices, list) and bool(choices)
+                        and isinstance(choices[0], dict)
+                        and choices[0].get("finish_reason") == "stop"):
+                    resp_complete = True
+            elif isinstance(response.json_body, dict):
+                resp_complete = True
         return ExecutionResult(
             success=True,
             status_code=response.status_code,
             output_text=output_text,
-            response_complete=(True if response_only_completion and response.body_complete is True
-                and output_text is not None and isinstance(response.json_body, dict)
-                and isinstance(response.json_body.get("choices"), list)
-                and bool(response.json_body["choices"])
-                and isinstance(response.json_body["choices"][0], dict)
-                and response.json_body["choices"][0].get("finish_reason") == "stop"
-                else None),
+            response_complete=resp_complete,
             raw_output=raw_output,
             headers=response.headers,
             duration_ms=response.duration_ms,
             error=None,
-            events=reported_http_evidence(response.json_body),
+            events=events,
         )
 
     @classmethod

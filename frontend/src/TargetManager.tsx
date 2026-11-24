@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
-import { testingApi, type ArchivedTarget, type DiscoveryResult, type ManagedProfile, type ProbeResult, type TargetPreset } from './testingApi';
+import { testingApi, type DiscoveryResult, type ManagedProfile, type ProbeResult, type TargetPreset } from './testingApi';
 import DiscoveryPanel from './DiscoveryPanel';
 import EvidenceSources from './EvidenceSources';
 import ApplicationContext from './ApplicationContext';
@@ -29,11 +29,11 @@ export default function TargetManager({enabled,nonce,target,onChanged,onDiscover
  const [quickProbe,setQuickProbe]=useState<ProbeResult|null>(null),[quickConfirmed,setQuickConfirmed]=useState(false);
  const [quickError,setQuickError]=useState(''),[quickSavedProbe,setQuickSavedProbe]=useState(false);
  const [awaitingSelection,setAwaitingSelection]=useState(false);
- const [query,setQuery]=useState(''),[selectedArchiveIds,setSelectedArchiveIds]=useState<string[]>([]);
- const [archiveCandidates,setArchiveCandidates]=useState<TargetPreset[]>([]);
- const [archiveConfirmed,setArchiveConfirmed]=useState(false),[archivedTargets,setArchivedTargets]=useState<ArchivedTarget[]>([]);
+ const [query,setQuery]=useState('');
+ const [deleteCandidate,setDeleteCandidate]=useState<TargetPreset|null>(null);
  const [editingOriginal,setEditingOriginal]=useState<TargetPreset|null>(null),[platformConfirmed,setPlatformConfirmed]=useState(false);
  const carryProbe=useRef<{id:string;revision:string;result:ProbeResult|null}|null>(null);
+ const carryMessage=useRef<string>('');
  const [checking,setChecking]=useState(false),[probeFailed,setProbeFailed]=useState(false);
  const [probeKey,setProbeKey]=useState('');
  const identity=targetKey(target),current=useRef(identity+nonce),generation=useRef(0);
@@ -42,13 +42,11 @@ export default function TargetManager({enabled,nonce,target,onChanged,onDiscover
   if(carry&&target?.id===carry.id&&target.profile_revision===carry.revision){
    setProbe(carry.result);setProbeKey(identity+nonce);setQuickSavedProbe(true);carryProbe.current=null;
   }else{setProbe(null);setQuickSavedProbe(false);}
-  setConfirmed(false);setProbeFailed(false);setChecking(false);setBusy(false);setQuickConfirmed(false);setAwaitingSelection(false);setMessage('');setError('');
+  const nextMsg=carryMessage.current;carryMessage.current='';
+  setConfirmed(false);setProbeFailed(false);setChecking(false);setBusy(false);setQuickConfirmed(false);setAwaitingSelection(false);setMessage(nextMsg);setError('');
  },[identity,nonce]);
  useEffect(()=>()=>{generation.current++;},[]);
  useEffect(()=>{setConfirmed(false);},[settingsMatch]);
- useEffect(()=>{if(!enabled||!(localSingleUser||unlocked)||!nonce)return;
-  testingApi.archivedTargets(secret,nonce).then(setArchivedTargets).catch(()=>setArchivedTargets([]));
- },[enabled,localSingleUser,unlocked,secret,nonce]);
  useEffect(()=>{if(['stale','expired'].includes(target?.connection_verification?.status??''))setProbe(null);},[target?.connection_verification?.status]);
  const ownProbe=probeKey===identity+nonce?probe:null;
  const connection:ConnectionState=!settingsMatch?'Not checked':probeKey===identity+nonce&&checking?'Checking':probeKey===identity+nonce&&probeFailed?'Connection failed':ownProbe?
@@ -73,7 +71,6 @@ export default function TargetManager({enabled,nonce,target,onChanged,onDiscover
   setQuickProbe(null);setQuickConfirmed(false);setQuickError('');}
  const discoveryBindingValid=!discoveryId||(form.endpoint===discoveryEndpoint&&form.protocol===discoveryProtocol);
  const existingEndpoint=mode==='create'?existingProfiles.find(item=>item.endpoint===form.endpoint&&item.protocol===form.protocol):undefined;
- const archivedEndpoint=mode==='create'?archivedTargets.find(item=>item.endpoint===form.endpoint&&item.protocol===form.protocol):undefined;
  const platformChanged=mode==='edit'&&!!editingOriginal&&(editingOriginal.platform_id!==form.platform_id||editingOriginal.platform_name!==form.platform_name);
  const discoveredPlatformChanged=mode==='create'&&!!discoveryId&&!!discoveryResult?.proposed_profile&&
   (discoveryResult.proposed_profile.platform_id!==form.platform_id||discoveryResult.proposed_profile.platform_name!==form.platform_name);
@@ -87,20 +84,18 @@ export default function TargetManager({enabled,nonce,target,onChanged,onDiscover
  }
  const matchingProfiles=existingProfiles.filter(item=>`${item.name} ${item.endpoint} ${item.platform_name??''}`.toLowerCase().includes(query.trim().toLowerCase()));
  const platformGroups=Array.from(new Map(matchingProfiles.map(item=>[item.platform_id??'unknown',item.platform_name??'Unknown platform'])).entries());
- async function archiveSelected(){if(!archiveConfirmed||!archiveCandidates.length||busy)return;
+ async function deleteTargetPermanently(){if(!deleteCandidate||busy)return;
+  const candidate=deleteCandidate;
   const token=++generation.current;setBusy(true);setError('');
-  try{await testingApi.archiveTargets(archiveCandidates.map(item=>({target_id:item.id,profile_revision:item.profile_revision})),secret,nonce);
+  try{await testingApi.deleteTarget({target_id:candidate.id,profile_revision:candidate.profile_revision},secret,nonce);
    if(token!==generation.current)return;
-   setArchiveCandidates([]);setArchiveConfirmed(false);setSelectedArchiveIds([]);
-   setArchivedTargets(await testingApi.archivedTargets(secret,nonce));
-   setMessage('Selected targets archived. Historical reports and policy records were retained.');
-   onChanged(archiveCandidates.some(item=>item.id===target?.id)?'':target?.id??'');
-  }catch(e){if(token===generation.current)setError(e instanceof Error?e.message:'Archive rejected. Reload targets.');}
+   setDeleteCandidate(null);
+   const msg=`Target "${candidate.name}" (${candidate.id}) and its associated target data were permanently deleted.`;
+   carryMessage.current=msg;
+   setMessage(msg);
+   onChanged(candidate.id===target?.id?'':target?.id??'');
+  }catch(e){if(token===generation.current)setError(e instanceof Error?e.message:'Delete rejected. Check if a scan is currently running and reload targets.');}
   finally{if(token===generation.current)setBusy(false);}
- }
- async function restoreArchived(item:ArchivedTarget){if(busy)return;setBusy(true);setError('');
-  try{const restored=await testingApi.restoreTarget(item,secret,nonce);setArchivedTargets(await testingApi.archivedTargets(secret,nonce));onChanged(restored.id);}
-  catch(e){setError(e instanceof Error?e.message:'Restore rejected.');}finally{setBusy(false);}
  }
  function probeError(e:unknown){return e instanceof Error&&e.message.startsWith('Workflow API')?e.message:
   'Connection could not be verified. Check the endpoint and retry the benign probe.';}
@@ -171,18 +166,37 @@ export default function TargetManager({enabled,nonce,target,onChanged,onDiscover
    {discovering&&<DiscoveryPanel nonce={nonce} secret={secret} onReset={resetDiscoveryPreview} onUse={acceptDiscovery}/>}
    {!discovering&&<section className="target-list" aria-label="Existing targets"><div className="target-list-head"><div><h2>Existing targets</h2><p className="caption">Select a target directly. Platform is an association, separate from protocol and Target ID.</p></div><button type="button" onClick={()=>start('create')} disabled={busy}>Add Target</button></div>
     <label className="target-search">Search targets<input type="search" value={query} onChange={e=>setQuery(e.target.value)} placeholder="Name, platform or endpoint"/></label>
-    {matchingProfiles.length===0?<p className="target-empty">{existingProfiles.length?'No targets match this search.':'No active targets. Connect or restore a target.'}</p>:platformGroups.map(([id,name])=><div className="target-platform-group" key={id}><h3>{name}</h3><div className="target-list-rows">{matchingProfiles.filter(item=>(item.platform_id??'unknown')===id).map(item=>{const active=item.id===target?.id;const itemConnection=active?connection:item.connection_verification?.status==='compatible'?'Connected':'Not checked';return <div className={`target-list-row ${active?'is-selected':''}`} key={item.id}>
-     <input aria-label={`Select ${item.name} for bulk archive`} type="checkbox" checked={selectedArchiveIds.includes(item.id)} onChange={e=>setSelectedArchiveIds(ids=>e.target.checked?[...ids,item.id]:ids.filter(id=>id!==item.id))}/>
-     <button type="button" className="target-list-select" aria-current={active?'true':undefined} onClick={()=>onChanged(item.id)}><strong>{item.name}</strong><span>{item.endpoint}</span><small>{item.protocol==='mcp-jsonrpc'?'MCP':'HTTP chat'} · {item.platform_provenance?.replaceAll('_',' ')??'platform source unknown'}</small></button>
+    {matchingProfiles.length===0?<p className="target-empty">{existingProfiles.length?'No targets match this search.':'No active targets. Connect a target.'}</p>:platformGroups.map(([id,name])=><div className="target-platform-group" key={id}><h3>{name}</h3><div className="target-list-rows">{matchingProfiles.filter(item=>(item.platform_id??'unknown')===id).map(item=>{const active=item.id===target?.id;const itemConnection=active?connection:item.connection_verification?.status==='compatible'?'Connected':'Not checked';return <div className={`target-list-row ${active?'is-selected':''}`} key={item.id}>
+     <button type="button" className="target-list-select" aria-current={active?'true':undefined} onClick={()=>onChanged(item.id)}><strong>{item.name}</strong><span>{item.endpoint}</span><small>{item.protocol==='mcp-jsonrpc'?'MCP':'HTTP chat'} · ID: <code>{item.id}</code> · {item.platform_provenance?.replaceAll('_',' ')??'platform source unknown'}</small></button>
      <div className="target-row-status"><span>{itemConnection}</span><span>{item.authorization_status==='reviewed_for_offline_configuration'?'Reviewed':'Review required'}</span></div>
-     <div className="target-row-actions"><button type="button" onClick={()=>start('edit',item)} disabled={busy}>Edit</button><button type="button" onClick={()=>{setArchiveCandidates([item]);setArchiveConfirmed(false);}} disabled={busy}>Archive</button></div>
+     <div className="target-row-actions"><button type="button" onClick={()=>start('edit',item)} disabled={busy}>Edit</button><button type="button" className="danger-button" onClick={()=>{setError('');setDeleteCandidate(item);}} disabled={busy}>Delete</button></div>
     </div>;})}</div></div>)}
     {existingProfiles.length===0&&target&&<button type="button" onClick={()=>start('edit')} disabled={busy}>Edit Target</button>}
-    {selectedArchiveIds.length>0&&<button type="button" onClick={()=>{setArchiveCandidates(existingProfiles.filter(item=>selectedArchiveIds.includes(item.id)));setArchiveConfirmed(false);}} disabled={busy}>Archive selected ({selectedArchiveIds.length})</button>}
-    {archivedTargets.length>0&&<details className="target-advanced"><summary>Archived targets ({archivedTargets.length})</summary><ul>{archivedTargets.map(item=><li key={item.id}><strong>{item.name}</strong> · {item.endpoint} <button type="button" disabled={busy} onClick={()=>void restoreArchived(item)}>Restore</button></li>)}</ul></details>}
    </section>}
    {!discovering&&!localSingleUser&&<button type="button" onClick={()=>{generation.current++;setUnlocked(false);setSecret('');setMode(null);setProbe(null);setConfirmed(false);setDiscovering(false);onDiscoveryFlowChange?.(false);}}>Lock</button>}
-   {archiveCandidates.length>0&&<div className="target-archive-overlay" role="dialog" aria-modal="true" aria-label="Confirm target archive"><div className="target-archive-dialog"><h2>Archive {archiveCandidates.length} target{archiveCandidates.length===1?'':'s'}?</h2><p>Archived targets cannot be selected for new tests. Their IDs, policy bindings and historical reports remain stored.</p><ul>{archiveCandidates.map(item=><li key={item.id}><strong>{item.name}</strong> · <code>{item.endpoint}</code></li>)}</ul><label className="target-consent"><input type="checkbox" checked={archiveConfirmed} onChange={e=>setArchiveConfirmed(e.target.checked)}/><span>I confirm the exact targets above should be archived.</span></label><div className="target-form-actions"><button type="button" disabled={!archiveConfirmed||busy} onClick={()=>void archiveSelected()}>Archive targets</button><button type="button" disabled={busy} onClick={()=>{setArchiveCandidates([]);setArchiveConfirmed(false);}}>Cancel</button></div></div></div>}
+   {deleteCandidate&&<div className="target-delete-overlay" role="dialog" aria-modal="true" aria-label="Confirm permanent target deletion"><div className="target-delete-dialog">
+    <h2>Permanently delete target?</h2>
+    <p className="notice error" role="alert"><strong>Warning: This action is permanent and cannot be undone.</strong></p>
+    <ul>
+     <li><strong>Target Name:</strong> {deleteCandidate.name}</li>
+     <li><strong>Target ID:</strong> <code>{deleteCandidate.id}</code></li>
+     <li><strong>Endpoint:</strong> <code>{deleteCandidate.endpoint}</code></li>
+    </ul>
+    <p><strong>The following target-specific records will be permanently purged:</strong></p>
+    <ul>
+     <li>Target Profile and endpoint/model/protocol configuration</li>
+     <li>Application Context / Application Details and security boundaries</li>
+     <li>Discovery and connection metadata associated with this Target</li>
+     <li>Evidence Source configurations and captures for this Target</li>
+     <li>Target-specific security policies, contracts, and MCP bindings</li>
+     <li>Scan history, execution results, evidence, and reports bound to this Target</li>
+    </ul>
+    <p className="caption">Shared testcase datasets, canonical rubrics, and other Targets will not be affected.</p>
+    <div className="target-form-actions">
+     <button type="button" disabled={busy} onClick={()=>setDeleteCandidate(null)}>Cancel</button>
+     <button type="button" className="danger-button" disabled={busy} onClick={()=>void deleteTargetPermanently()}>{busy?'Deleting...':'Delete Permanently'}</button>
+    </div>
+   </div></div>}
    {mode&&<form className="target-form" onSubmit={save} aria-label="Manage target details">
     <h3>{discoveryId?'Auto-detected Configuration':mode==='create'?'Add target':'Edit target'}</h3>
    {discoveryId&&discoveryResult&&<p className="target-detected-count">{discoveryResult.advertised_tools.length} advertised tools · {discoveryResult.possible_contracts.length} candidate API contracts. Metadata does not verify tool execution.</p>}
@@ -201,7 +215,6 @@ export default function TargetManager({enabled,nonce,target,onChanged,onDiscover
     </>}
     <label>{discoveryId?'Agent Name (from connection step)':'Target display name'}<input value={form.name} required maxLength={100} pattern="[A-Za-z0-9 ._-]+" onChange={e=>change('name',e.target.value)}/></label>
     {existingEndpoint&&<p role="status">Existing target: <strong>{existingEndpoint.name}</strong>. <button type="button" onClick={()=>{setDiscovering(false);setMode(null);onDiscoveryFlowChange?.(false);onChanged(existingEndpoint.id);}}>Use {existingEndpoint.name}</button> <button type="button" onClick={()=>start('edit',existingEndpoint,form.name.trim()||existingEndpoint.name)}>Rename Existing</button></p>}
-    {archivedEndpoint&&<p role="status">Archived target at this endpoint: <strong>{archivedEndpoint.name}</strong>. Restore it from the archived list before reconnecting.</p>}
     <label>Protocol<select value={form.protocol} onChange={e=>change('protocol',e.target.value as ManagedProfile['protocol'])}><option value="openai-chat">HTTP / OpenAI-compatible chat</option><option value="mcp-jsonrpc">MCP JSON-RPC</option></select></label>
     <label>Endpoint URL<input type="url" value={form.endpoint} required maxLength={256} onChange={e=>change('endpoint',e.target.value)}/></label>
     <label>{form.protocol==='mcp-jsonrpc'?'MCP service identifier (not an LLM model)':'Model identifier'}<input value={form.model} required maxLength={128} onChange={e=>change('model',e.target.value)}/></label>
@@ -218,7 +231,7 @@ export default function TargetManager({enabled,nonce,target,onChanged,onDiscover
     </div>}
     {quickError&&<p role="alert">{quickError}</p>}
     {!discoveryId&&<button type="button" disabled={busy} onClick={validate}>Validate Target Details</button>}
-    <div className="target-form-actions"><button className="primary target-save" type="submit" disabled={busy||!checked||!discoveryBindingValid||!!existingEndpoint||!!archivedEndpoint||!!platformNeedsConfirmation&&!platformConfirmed}>{discoveryId?'Save Target':'Save Configuration'}</button>
+    <div className="target-form-actions"><button className="primary target-save" type="submit" disabled={busy||!checked||!discoveryBindingValid||!!existingEndpoint||!!platformNeedsConfirmation&&!platformConfirmed}>{discoveryId?'Save Target':'Save Configuration'}</button>
     <button type="button" disabled={busy} onClick={()=>{generation.current++;setMode(null);setDiscovering(false);onDiscoveryFlowChange?.(false);}}>Cancel</button></div>
    </form>}
   </>)}
@@ -235,7 +248,7 @@ export default function TargetManager({enabled,nonce,target,onChanged,onDiscover
       <button disabled={!confirmed||busy} onClick={review}>{localSingleUser?'Authorize target for test selection':'Review / Approve Target'}</button>
       <p className="caption">Review this exact profile. No request is sent. Security payloads require a separate execution grant.</p>
      </>:null}
-     {connection!=='Connected'&&((!quickSavedProbe&&(!webLabReview||target.authorization_status==='reviewed_for_offline_configuration'&&probeAvailable))||
+     {(connection!=='Connected'||(quickSavedProbe&&target.connection_verification!==undefined&&target.connection_verification.status!=='compatible'))&&((!quickSavedProbe&&(!webLabReview||target.authorization_status==='reviewed_for_offline_configuration'&&probeAvailable))||
        (quickSavedProbe&&target.authorization_status==='reviewed_for_offline_configuration'))&&<>
       {probeConfirmationRequired&&<label className="target-consent"><input type="checkbox" checked={confirmed} disabled={checking||!settingsMatch||configurationInvalid} onChange={e=>setConfirmed(e.target.checked)}/> I confirm authorization for one benign probe to {new URL(target.endpoint).host}</label>}
       <button className="primary" disabled={busy||!nonce||!probeAvailable||!confirmed||!settingsMatch||configurationInvalid} onClick={testConnection}>{checking?'Checking...':connection==='Connection failed'?'Retry':'Test Connection'}</button>
@@ -248,7 +261,7 @@ export default function TargetManager({enabled,nonce,target,onChanged,onDiscover
    {(probe||probeFailed)&&<details className="target-probe-details"><summary>Connection details</summary><p>{probe?`Reason: ${probe.reason.replaceAll('_',' ')}. HTTP status: ${probe.http_status??'unavailable'}. API compatibility: ${probe.runtime_protocol_compatible===null?'unknown':probe.runtime_protocol_compatible?'yes':'no'}. Requests: ${probe.target_request_count}.`:'No connection proof was obtained.'}</p></details>}
   </div>}
   {message&&<p role="status">{message}</p>}{error&&<p role="alert">{error}</p>}
-  {target&&!discovering&&!awaitingSelection&&enabled&&(localSingleUser||unlocked)&&<details className="target-advanced target-context-drawer"><summary>Application Context · Optional</summary><ApplicationContext key={identity+nonce} target={target} nonce={nonce} secret={secret}/></details>}
+  {target&&!discovering&&!awaitingSelection&&enabled&&(localSingleUser||unlocked)&&<details className="target-advanced target-context-drawer"><summary>Application Context · Optional</summary><ApplicationContext key={identity+nonce} target={target} nonce={nonce} secret={secret} discovery={discoveryResult}/></details>}
   {target&&evidenceEnabled&&!discovering&&!awaitingSelection&&<details className="target-advanced target-evidence-drawer"><summary>Evidence Sources · Optional</summary><EvidenceSources key={identity+nonce} target={target} nonce={nonce} secret={secret} authorized={enabled&&(localSingleUser||unlocked)}/></details>}
  </div>;
 }

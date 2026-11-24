@@ -1,4 +1,5 @@
 import {useEffect,useState} from 'react';
+import DownloadReport from './DownloadReport';
 import {testingApi,type McpActionCatalog,type McpActionResult,type TargetPreset} from './testingApi';
 
 export default function McpActionPanel({targets,nonce,secret}:{targets:TargetPreset[];nonce:string;secret:string}){
@@ -65,7 +66,7 @@ export default function McpActionPanel({targets,nonce,secret}:{targets:TargetPre
    </select></label>
    <label className="target-consent"><input type="checkbox" checked={consent} onChange={e=>setConsent(e.target.checked)}/><span>I authorize one direct MCP <code>tools/call</code> to the selected endpoint for this structured testcase. No autonomous Agent action is implied.</span></label>
    <button className="primary" disabled={!reviewed||!consent||busy||!selected} onClick={()=>void run()}>{busy?'Running one MCP action…':'Run one MCP action'}</button>
-   {result&&<div className="notice" role="status"><strong>{result.final_verdict}</strong> · {result.target_request_count} target request · execution {result.execution_id}. Native report: <code>{result.report_path}</code>. Pi invoked: {result.semantic_invoked?'yes':'no'}.</div>}
+   {result&&<div className="notice" role="status"><strong>{result.final_verdict}</strong> · {result.target_request_count} target request · execution {result.execution_id}. Native report: <code>{result.report_path}</code>. Pi invoked: {result.semantic_invoked?'yes':'no'}.{/^[a-f0-9]{32}$/.test(result.execution_id)&&<> <a href={`#mcp-run/${result.execution_id}`}>View run detail</a> <DownloadReport kind="mcp-runs" id={result.execution_id}/></>}</div>}
   </>}
  </section>;
 }

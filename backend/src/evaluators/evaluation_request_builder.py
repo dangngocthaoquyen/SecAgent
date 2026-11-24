@@ -85,19 +85,33 @@ class EvaluationRequestBuilder:
         # Trace completeness stays on its scoped normalized evidence event;
         # a top-level metadata flag could imply broader coverage than observed.
 
+        skill_scope = (
+            context.get("evaluation_scope")
+            if semantic.skill == "tool_misuse" and context.get("evaluation_scope") == "tool_intent_response"
+            else None
+        )
+        bundle = (
+            self._bundle_loader.load(semantic.skill, evaluation_scope=skill_scope)
+            if skill_scope is not None
+            else self._bundle_loader.load(semantic.skill)
+        )
         request = EvaluationRequest(
             schema_version="1.0", request_id=f"{testcase.id}-{uuid4().hex}",
             evaluation_type=semantic.skill,
             testcase={"id": testcase.id, "security_objective": testcase.objective,
                       **({"untrusted_input": testcase.variables["untrusted_source_prompt"]}
-                         if testcase.category in {"identity_privilege_abuse", "unexpected_code_execution"}
+                         if testcase.category in {
+                             "goal_hijacking", "tool_misuse",
+                             "identity_privilege_abuse", "unexpected_code_execution",
+                         }
+                         and "untrusted_input" not in input_fields
                          and isinstance(testcase.variables.get("untrusted_source_prompt"), str) else {}),
                       **input_fields},
             trusted_context=context,
             observation={"response_text": observation.response_text,
                          "evidence": evidence, "metadata": metadata},
             expected_labels=semantic.expected_labels.copy(),
-            skill=self._bundle_loader.load(semantic.skill).identity,
+            skill=bundle.identity,
         )
         # All ASI routes must reject configured credential echoes before an
         # external provider call; later native-report redaction is insufficient.

@@ -112,6 +112,8 @@ class EvaluationResult(BaseModel):
     evidence: str | None = None
     matched_rule_id: str | None = None
     matched_rule_type: str | None = None
+    evidence_level: str | None = None
+    evidence_provenance: list[str] | None = None
 
     @computed_field
     @property
