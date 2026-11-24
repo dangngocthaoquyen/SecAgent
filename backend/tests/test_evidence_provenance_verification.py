@@ -1738,5 +1738,3 @@ def test_g01_fix2_whitespace_parity_rejects_padded_positive_and_negative_fields(
     assert cl["verified_execution_present"] is False
     proj = public_evidence_data(ev)
     assert is_execution_verified(Evidence(kind=ev.kind, source=ev.source, data=proj)) is False
-
-

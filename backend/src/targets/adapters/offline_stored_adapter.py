@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from core.models import ExecutionResult, TargetProfile, TestInput
+from core.models.execution import resolve_response_completeness
 from core.models.tool_intent import (
     build_tool_intent_event,
     extract_structured_tool_fingerprints,
@@ -47,8 +48,14 @@ class OfflineStoredTargetAdapter(BaseTargetAdapter):
                 error="Offline stored record is missing string 'stored_response'.",
             )
 
-        if response_complete is None and isinstance(finish_reason, str):
-            response_complete = finish_reason == "stop"
+        explicit_complete = response_complete if isinstance(response_complete, bool) else None
+        response_complete = resolve_response_completeness(
+            finish_reason=finish_reason if isinstance(finish_reason, str) else None,
+            explicit_response_complete=explicit_complete,
+            has_output_text=True,
+            response_only_completion=True,
+            is_offline=True,
+        )
 
         safe_source = (
             source_tool

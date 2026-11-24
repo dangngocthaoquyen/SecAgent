@@ -2085,7 +2085,7 @@ def test_judge_readiness_missing_credential_and_fault_metadata(tmp_path: Path, m
             "target_id": "fault-target",
             "asi_category": "ASI02",
             "use_judge": True,
-            "cases": [{"case_id": "f-1", "prompt": "Test", "stored_response": "Refused."}],
+            "cases": [{"case_id": "f-1", "prompt": "Test", "stored_response": "Refused.", "finish_reason": "stop"}],
         }),
     ).get_json()
     assert fault_run["judge_metadata"]["mode"] == "hybrid"

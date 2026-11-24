@@ -30,6 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core.models.dsml import DsmlIntentSignal, detect_dsml_intent
 from core.models.evidence import Evidence
+from core.models.execution import resolve_response_completeness
 from testing.archived_crosscheck import ArchiveError, parse_json, read_bytes, sha
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -467,7 +468,10 @@ class PromptfooReportAdapter:
             finish_reason = resp_meta.get("finishReason")
             if finish_reason is not None and not isinstance(finish_reason, str):
                 raise ArchiveError(f"Promptfoo row {idx} has non-string finishReason.")
-            response_complete = (finish_reason == "stop") if finish_reason is not None else None
+            response_complete = resolve_response_completeness(
+                finish_reason=finish_reason,
+                is_offline=True,
+            )
 
             raw_tool_calls = resp_meta.get("toolCalls")
             if raw_tool_calls is None:
@@ -626,10 +630,10 @@ class CanonicalStoredRecordsAdapter:
             if finish_reason is not None and not isinstance(finish_reason, str):
                 raise ArchiveError(f"Canonical record {idx} has non-string finish_reason.")
             explicit_complete = row.get("response_complete")
-            response_complete = (
-                explicit_complete
-                if isinstance(explicit_complete, bool)
-                else ((finish_reason == "stop") if finish_reason is not None else None)
+            response_complete = resolve_response_completeness(
+                finish_reason=finish_reason,
+                explicit_response_complete=explicit_complete if isinstance(explicit_complete, bool) else None,
+                is_offline=True,
             )
 
             raw_tool_calls = row.get("tool_calls", [])

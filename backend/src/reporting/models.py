@@ -402,6 +402,7 @@ class ExecutionReport(BaseReport):
     submitted_payload_preview: Text | None = None
     evidence_classification: dict[str, Any] | None = None
     collector_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
+    research_provenance: dict[str, Any] | None = None
 
 
 class ParentExecution(Model):

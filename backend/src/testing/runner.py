@@ -22,6 +22,7 @@ from core.models import (
 )
 from evaluators import BaseEvaluator
 from core.models.evidence import classify_observation_evidence, public_evidence_data
+from core.models.provenance import build_case_research_provenance
 from observers import (
     BaseObserver,
     CollectorContext,
@@ -60,6 +61,18 @@ class Runner:
             raise ValueError("Choose existing evaluator injection or Runner evaluation configuration, not both.")
         self._diagnostics = []
         self._evaluation_config = evaluation_config or RunnerEvaluationConfig()
+        self._judge_provider_name: str | None = None
+        self._judge_model_name: str | None = None
+        if self._evaluation_config.pi is not None:
+            self._judge_provider_name = self._evaluation_config.pi.provider
+            self._judge_model_name = self._evaluation_config.pi.model
+        elif judge_provider is not None:
+            raw_prov = getattr(judge_provider, "provider_name", None) or getattr(judge_provider, "provider", None)
+            raw_mod = getattr(judge_provider, "model_name", None) or getattr(judge_provider, "model", None)
+            if isinstance(raw_prov, str) and raw_prov.strip():
+                self._judge_provider_name = raw_prov.strip()
+            if isinstance(raw_mod, str) and raw_mod.strip():
+                self._judge_model_name = raw_mod.strip()
         self._budget = None
         self._evaluator = evaluator
         if self._evaluator is None:
@@ -226,8 +239,18 @@ class Runner:
             if (self._require_complete_response_for_fail
                     and evaluated.status is EvaluationStatus.FAIL
                     and observation.metadata.get("response_complete") is not True):
-                return EvaluationResult(status=EvaluationStatus.INCONCLUSIVE,
-                    reason="Response-only FAIL requires a complete observed response.")
+                verified_exec_fail = (
+                    evaluated.matched_rule_type in {"collector_receipt", "asi05_execution"}
+                    or (
+                        evaluated.matched_rule_type == "tool_call"
+                        and classify_observation_evidence(
+                            observation.evidence, observation.response_text
+                        ).get("verified_execution_present") is True
+                    )
+                )
+                if not verified_exec_fail:
+                    return EvaluationResult(status=EvaluationStatus.INCONCLUSIVE,
+                        reason="Response-only FAIL requires a complete observed response.")
             return evaluated
         except Exception:
             return EvaluationResult(
@@ -331,6 +354,19 @@ class Runner:
             "evidence_classification": None if observed is None else classify_observation_evidence(
                 observed.evidence, observed.response_text
             ),
+            "research_provenance": build_case_research_provenance(
+                testcase=testcase,
+                target=target,
+                test_input=test_input,
+                evaluation_mode="custom" if self._custom_evaluator else self._evaluation_config.mode,
+                evaluation_strategy=testcase.evaluation.strategy,
+                semantic_enabled=bool(semantic and semantic.enabled),
+                trusted_context=context,
+                diagnostic=diagnostic,
+                evidence=observed.evidence if observed is not None else None,
+                judge_provider_name=self._judge_provider_name,
+                judge_model_name=self._judge_model_name,
+            ),
             "downgrade_reason": diagnostic["downgrade_reason"] if diagnostic else None,
             "judge_budget": None if self._budget is None else {
                 "enabled": self._evaluation_config.judge_enabled,
@@ -348,16 +384,21 @@ class Runner:
                 "completeness": "Only explicit trusted observer metadata authorizes semantic PASS; HTTP success/finish_reason alone does not."}}
         # Redact configured credential values even if a response/reason echoes
         # them. Arbitrary private target data still requires caller data policy.
+        return self.redact_report_value(target, report)
+
+    def redact_report_value(self, target, value):
+        """Redact configured credential values recursively using Runner's sensitivity list."""
         secrets = sorted(self._judge_sensitive_values(target), key=len, reverse=True)
 
-        def sanitize(value):
-            if isinstance(value, str):
+        def sanitize(item):
+            if isinstance(item, str):
                 for secret in secrets:
-                    value = value.replace(secret, "[REDACTED]")
-                return value
-            if isinstance(value, dict):
-                return {sanitize(key): sanitize(item) for key, item in value.items()}
-            if isinstance(value, (list, tuple)):
-                return [sanitize(item) for item in value]
-            return value
-        return sanitize(report)
+                    item = item.replace(secret, "[REDACTED]")
+                return item
+            if isinstance(item, dict):
+                return {sanitize(key): sanitize(val) for key, val in item.items()}
+            if isinstance(item, (list, tuple)):
+                return [sanitize(val) for val in item]
+            return item
+
+        return sanitize(value)

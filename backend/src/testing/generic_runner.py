@@ -24,6 +24,11 @@ import yaml
 
 from attack_modules import BaseAttackModule, build_default_attack_module_registry
 from core.models import TargetProfile, TestCase, TestInput
+from core.models.execution import resolve_response_completeness
+from core.models.provenance import (
+    build_case_research_provenance,
+    summarize_run_research_provenance,
+)
 from observers import EvidenceCollector
 from targets.adapters import (
     HttpTargetAdapter,
@@ -162,6 +167,8 @@ def run_generic_cases(
     require_complete_response: bool = True,
     generic_run_id: str | None = None,
     case_progress_callback: Any = None,
+    target_revision_sha256: str | None = None,
+    dataset_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute one or more cases through Runner -> Collectors -> HybridEvaluator -> Report."""
     out_root = Path(output_dir).resolve()
@@ -241,13 +248,42 @@ def run_generic_cases(
         sent_payload_sha256 = sha256(sent_material.encode("utf-8")).hexdigest()
         stored_rec = test_input.parameters.get("stored_record")
         stored_prov = (
-            dict(stored_rec["provenance"])
+            runner.redact_report_value(target, dict(stored_rec["provenance"]))
             if isinstance(stored_rec, dict) and isinstance(stored_rec.get("provenance"), dict)
             else None
         )
+        sanitized_dataset_meta = (
+            runner.redact_report_value(target, dict(dataset_metadata))
+            if isinstance(dataset_metadata, dict)
+            else None
+        )
+        merged_ds_meta: dict[str, Any] = {}
+        if isinstance(sanitized_dataset_meta, dict):
+            merged_ds_meta.update(sanitized_dataset_meta)
+        if stored_prov is not None:
+            merged_ds_meta.update(stored_prov)
+        case_prov = snapshot.get("research_provenance")
+        if isinstance(case_prov, dict):
+            ds_block = case_prov.get("dataset")
+            if isinstance(ds_block, dict):
+                ds_block["sent_payload_sha256"] = sent_payload_sha256
+                if ds_block.get("dataset_id") is None and merged_ds_meta.get("dataset_id"):
+                    ds_block["dataset_id"] = merged_ds_meta.get("dataset_id")
+                if ds_block.get("dataset_revision_sha256") is None:
+                    rev_sha = merged_ds_meta.get("dataset_revision_sha256") or merged_ds_meta.get("source_file_sha256")
+                    if isinstance(rev_sha, str) and len(rev_sha) == 64:
+                        ds_block["dataset_revision_sha256"] = rev_sha
+                if ds_block.get("source_filename") is None and merged_ds_meta.get("source_filename"):
+                    ds_block["source_filename"] = merged_ds_meta.get("source_filename")
+                if ds_block.get("source_tool") is None and merged_ds_meta.get("source_tool"):
+                    ds_block["source_tool"] = merged_ds_meta.get("source_tool")
+            tgt_block = case_prov.get("target")
+            if isinstance(tgt_block, dict) and target_revision_sha256 and tgt_block.get("target_revision_sha256") is None:
+                tgt_block["target_revision_sha256"] = target_revision_sha256
+            snapshot["research_provenance"] = runner.redact_report_value(target, case_prov)
         envelope["evaluation"] = snapshot
         envelope["source_provenance"] = "synthetic_mock" if mode == "offline" else "target_observation"
-        envelope["batch_provenance"] = {
+        envelope["batch_provenance"] = runner.redact_report_value(target, {
             "execution_mode": mode,
             "batch_id": batch_id,
             **({"generic_run_id": generic_run_id} if generic_run_id else {}),
@@ -256,7 +292,7 @@ def run_generic_cases(
             "payload_ref": test_input.payload_ref,
             "sent_payload_sha256": sent_payload_sha256,
             **({"stored_provenance": stored_prov} if stored_prov is not None else {}),
-        }
+        })
         report_file = runs_dir / f"native-{testcase.id}-{run_id}.secagent.json"
         report_bytes = (json.dumps(envelope, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
         report_file.write_bytes(report_bytes)
@@ -288,6 +324,7 @@ def run_generic_cases(
             "evidence_level": result.evidence_level or ev_class.get("evidence_level"),
             "provenance_tiers": result.evidence_provenance or ev_class.get("provenance_tiers", []),
             "collector_diagnostics": snapshot.get("collector_diagnostics", []),
+            "research_provenance": snapshot.get("research_provenance"),
             **({"stored_provenance": stored_prov} if stored_prov is not None else {}),
             "report_path": str(report_file),
         }
@@ -303,6 +340,26 @@ def run_generic_cases(
                 "test_input": test_input,
             })
 
+    safe_batch_ds = (
+        runner.redact_report_value(target, dict(dataset_metadata))
+        if isinstance(dataset_metadata, dict)
+        else None
+    )
+    run_provenance = runner.redact_report_value(
+        target,
+        summarize_run_research_provenance(
+            [c.get("research_provenance") for c in case_summaries if isinstance(c.get("research_provenance"), dict)],
+            target=target,
+            target_revision_sha256=target_revision_sha256,
+            dataset_id=safe_batch_ds.get("dataset_id") if isinstance(safe_batch_ds, dict) else None,
+            dataset_revision_sha256=(
+                (safe_batch_ds.get("dataset_revision_sha256") or safe_batch_ds.get("source_file_sha256"))
+                if isinstance(safe_batch_ds, dict)
+                else None
+            ),
+            dataset_name=safe_batch_ds.get("source_filename") if isinstance(safe_batch_ds, dict) else None,
+        ),
+    )
     batch_summary = {
         "schema_version": "secagent.generic_batch.v1",
         "batch_id": batch_id,
@@ -312,6 +369,7 @@ def run_generic_cases(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "total_cases": len(case_summaries),
         "verdict_counts": dict(sorted(verdict_counts.items())),
+        "research_provenance": run_provenance,
         "cases": case_summaries,
     }
     summary_path = out_root / "batch-summary.json"
@@ -414,8 +472,12 @@ def resolve_trusted_context_for_target_category(
     if reviewed_policy is not None and policy_store is not None:
         ctx = policy_store.to_trusted_context(reviewed_policy)
         if verified_app_draft is not None and app_rev_sha:
+            ctx["context_source"] = "reviewed_policy_with_application_context"
             ctx["application_details"] = verified_app_draft
+            ctx["application_context_id"] = f"appctx-{target_id}"
             ctx["application_context_sha256"] = app_rev_sha
+            ctx["application_context_revision_sha256"] = app_rev_sha
+            ctx["application_context_provenance"] = "operator_declared"
         return ctx, reviewed_policy, None
 
     if verified_app_draft is not None and app_rev_sha:
@@ -470,14 +532,20 @@ def resolve_trusted_context_for_target_category(
         tool_list = [t.strip() for t in re.split(r"[,;\n]+", raw_tools) if t.strip()]
         ctx = {
             "evaluation_scope": DEFAULT_EVALUATION_SCOPES[norm_category],
+            "context_source": "application_context",
             "policy_id": f"appctx-{target_id}",
+            "reviewed_policy_id": None,
+            "reviewed_policy_revision_sha256": None,
             rev_key: app_rev_sha,
             "policy_review_status": "reviewed",
             "delivery_surface": "direct_chat",
             "allowed_benign_context": allowed,
             "expected_response_boundary": boundary,
             "application_details": verified_app_draft,
+            "application_context_id": f"appctx-{target_id}",
             "application_context_sha256": app_rev_sha,
+            "application_context_revision_sha256": app_rev_sha,
+            "application_context_provenance": "operator_declared",
         }
         if norm_category == "goal_hijacking":
             ctx["original_goal"] = allowed
@@ -567,8 +635,12 @@ def prepare_generic_case_pair(
 
     if not isinstance(stored_response, str):
         raise ValueError("generic_stored_response_required_for_offline")
-    eff_finish = finish_reason or ("stop" if response_complete is not False else "length")
-    is_complete = bool(response_complete) if isinstance(response_complete, bool) else (eff_finish == "stop")
+    eff_finish = finish_reason.strip() if isinstance(finish_reason, str) and finish_reason.strip() else None
+    is_complete = resolve_response_completeness(
+        finish_reason=eff_finish,
+        explicit_response_complete=response_complete if isinstance(response_complete, bool) else None,
+        is_offline=True,
+    )
     tc = TestCase(
         id=case_id,
         name=f"Generic Offline {norm_category} · {case_id}",

@@ -34,7 +34,7 @@ def reported_http_evidence(body):
         data = {"provenance": "target_reported", "execution_verified": False}
         if "content" in message:
             data["assistant_content_present"] = isinstance(message["content"], str)
-        if finish in ("stop", "length", "tool_calls", "content_filter", "function_call"):
+        if finish in ("stop", "length", "max_tokens", "tool_calls", "content_filter", "function_call"):
             data["finish_reason"] = finish
         if isinstance(calls, list):
             data["declared_tool_call_count"] = len(calls)

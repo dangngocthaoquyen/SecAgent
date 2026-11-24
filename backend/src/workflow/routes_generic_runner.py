@@ -20,6 +20,10 @@ from flask import Response, jsonify, request
 from pydantic import ValidationError
 
 from core.models import TargetProfile, TestCase as CoreTestCase, TestInput as CoreTestInput
+from core.models.provenance import (
+    extract_context_provenance,
+    summarize_run_research_provenance,
+)
 from integrations.external_evaluator.pi import PiEvaluatorConfig, PiEvaluatorProvider
 from observers.evidence_collectors import HttpCallbackCollector, _has_symlink_or_reparse
 from reporting.redaction import Redactor
@@ -461,7 +465,7 @@ class GenericRunService:
                     "category": row_cat,
                     "prompt": tc.prompt,
                     "stored_response": extra.get("stored_response") or extra.get("response_text"),
-                    "finish_reason": extra.get("finish_reason", "stop"),
+                    "finish_reason": extra.get("finish_reason"),
                     "response_complete": extra.get("response_complete"),
                     "tool_calls": extra.get("tool_calls", []),
                     "response_id": extra.get("response_id"),
@@ -541,7 +545,9 @@ class GenericRunService:
         pairs: list[tuple[CoreTestCase, CoreTestInput]] = []
         preview_items: list[dict[str, Any]] = []
         asi_breakdown: dict[str, int] = {}
-        first_reviewed_policy = None
+        reviewed_policies_seen: dict[tuple[str, str, str], dict[str, Any]] = {}
+        app_contexts_seen: dict[tuple[str, str], dict[str, Any]] = {}
+        context_sources_seen: set[str] = set()
         overall_blocker: str | None = None
 
         for idx, row in enumerate(raw_cases):
@@ -593,8 +599,24 @@ class GenericRunService:
                             policy_id=policy_id,
                         )
                     trusted_context, rev_pol, row_blocker = context_cache[row_cat]
-                    if rev_pol is not None and first_reviewed_policy is None:
-                        first_reviewed_policy = rev_pol
+                    if rev_pol is not None:
+                        reviewed_policies_seen[(rev_pol.policy_id, rev_pol.category, rev_pol.revision_sha256)] = {
+                            "policy_id": rev_pol.policy_id,
+                            "category": rev_pol.category,
+                            "revision_sha256": rev_pol.revision_sha256,
+                        }
+                    if isinstance(trusted_context, dict):
+                        ctx_prov = extract_context_provenance(trusted_context)
+                        if ctx_prov["context_source"] != "none":
+                            context_sources_seen.add(ctx_prov["context_source"])
+                        if ctx_prov["application_context_id"] or ctx_prov["application_context_revision_sha256"]:
+                            ac_id = ctx_prov["application_context_id"] or f"appctx-{target.id}"
+                            ac_rev = ctx_prov["application_context_revision_sha256"] or ""
+                            app_contexts_seen[(ac_id, ac_rev)] = {
+                                "application_context_id": ac_id,
+                                "revision_sha256": ac_rev or None,
+                                "provenance": ctx_prov["application_context_provenance"] or "operator_declared",
+                            }
                     if row_blocker is None and not self.pi_judge_ready():
                         row_blocker = "judge_provider_unavailable"
 
@@ -630,6 +652,8 @@ class GenericRunService:
                 )
                 if isinstance(row.get("historical_verdict"), dict):
                     ti.metadata["isolated_historical_verdict"] = row["historical_verdict"]
+                if isinstance(row.get("source_provenance"), dict):
+                    ti.metadata["research_dataset_provenance"] = dict(row["source_provenance"])
                 pairs.append((tc, ti))
 
             preview_items.append({
@@ -657,6 +681,53 @@ class GenericRunService:
         if overall_blocker is None and ready_count == 0:
             overall_blocker = "generic_no_executable_cases"
         has_stored = bool(preview_items) and all(i["has_stored_response"] for i in preview_items)
+        reviewed_policies_list = sorted(
+            reviewed_policies_seen.values(),
+            key=lambda item: (item["policy_id"], item["category"]),
+        )
+        app_contexts_list = sorted(
+            app_contexts_seen.values(),
+            key=lambda item: (item["application_context_id"], item.get("revision_sha256") or ""),
+        )
+        has_app_only = "application_context" in context_sources_seen
+        if not use_judge:
+            resolved_policy_id = None
+            resolved_policy_rev = None
+            resolved_policy_status = "not_required"
+            resolved_context_source = "none"
+        elif overall_blocker is not None:
+            resolved_policy_id = reviewed_policies_list[0]["policy_id"] if len(reviewed_policies_list) == 1 and not has_app_only else policy_id
+            resolved_policy_rev = reviewed_policies_list[0]["revision_sha256"] if len(reviewed_policies_list) == 1 and not has_app_only else None
+            resolved_policy_status = "missing_or_draft"
+            resolved_context_source = (
+                "mixed" if len(context_sources_seen) > 1 else (next(iter(context_sources_seen), "none"))
+            )
+        elif len(reviewed_policies_list) == 1 and not has_app_only:
+            resolved_policy_id = reviewed_policies_list[0]["policy_id"]
+            resolved_policy_rev = reviewed_policies_list[0]["revision_sha256"]
+            resolved_policy_status = "reviewed"
+            resolved_context_source = (
+                "reviewed_policy_with_application_context"
+                if "reviewed_policy_with_application_context" in context_sources_seen
+                else "reviewed_policy"
+            )
+        elif not reviewed_policies_list and has_app_only:
+            resolved_policy_id = None
+            resolved_policy_rev = None
+            resolved_policy_status = "application_context_only"
+            resolved_context_source = "application_context"
+        elif len(reviewed_policies_list) > 1 or (reviewed_policies_list and has_app_only):
+            resolved_policy_id = None
+            resolved_policy_rev = None
+            resolved_policy_status = "mixed"
+            resolved_context_source = "mixed"
+        else:
+            resolved_policy_id = policy_id
+            resolved_policy_rev = None
+            resolved_policy_status = "missing_or_draft"
+            resolved_context_source = "none"
+
+        single_app_ctx = app_contexts_list[0] if len(app_contexts_list) == 1 else None
         return pairs, {
             "selected_cases": len(preview_items),
             "executed_cases": ready_count,
@@ -671,13 +742,14 @@ class GenericRunService:
             "skipped_cases": skipped_cases,
             "target_request_budget": 0 if mode == "offline" else ready_count,
             "judge_request_budget": ready_count if use_judge else 0,
-            "policy_id": first_reviewed_policy.policy_id if first_reviewed_policy else policy_id,
-            "policy_revision_sha256": first_reviewed_policy.revision_sha256 if first_reviewed_policy else None,
-            "policy_review_status": (
-                first_reviewed_policy.review_status
-                if first_reviewed_policy
-                else ("reviewed" if (use_judge and not overall_blocker) else ("missing_or_draft" if use_judge else "not_required"))
-            ),
+            "policy_id": resolved_policy_id,
+            "policy_revision_sha256": resolved_policy_rev,
+            "policy_review_status": resolved_policy_status,
+            "context_source": resolved_context_source,
+            "application_context_id": single_app_ctx["application_context_id"] if single_app_ctx else None,
+            "application_context_revision_sha256": single_app_ctx["revision_sha256"] if single_app_ctx else None,
+            "reviewed_policies": reviewed_policies_list,
+            "application_contexts": app_contexts_list,
             "blocker": overall_blocker,
             "items": preview_items,
         }
@@ -1209,10 +1281,22 @@ class GenericRunService:
 
             dataset_id = payload.get("dataset_id") if isinstance(payload.get("dataset_id"), str) else None
             dataset_name = None
+            dataset_revision_sha256 = None
             if dataset_id and self.dataset_repo is not None:
                 env = self.dataset_repo.get_dataset(dataset_id)
                 if env is not None:
                     dataset_name = env.name
+                    dataset_revision_sha256 = env.file_sha256
+            target_revision_sha256 = self._current_target_revision(target.id)
+            run_dataset_metadata = (
+                {
+                    "dataset_id": dataset_id,
+                    "dataset_revision_sha256": dataset_revision_sha256,
+                    "source_filename": dataset_name,
+                }
+                if dataset_id
+                else None
+            )
 
             started_at = datetime.now(timezone.utc).isoformat()
             case_statuses = [
@@ -1239,12 +1323,28 @@ class GenericRunService:
                 "mode": mode,
                 "target_id": target.id,
                 "target_name": target.name,
+                "target_revision_sha256": target_revision_sha256,
                 "dataset_id": dataset_id,
                 "dataset_name": dataset_name,
+                "dataset_revision_sha256": dataset_revision_sha256,
                 "asi_category": asi_category,
                 "use_judge": use_judge,
                 "policy_id": preview_meta["policy_id"],
                 "policy_revision_sha256": preview_meta["policy_revision_sha256"],
+                "policy_review_status": preview_meta["policy_review_status"],
+                "context_source": preview_meta["context_source"],
+                "application_context_id": preview_meta["application_context_id"],
+                "application_context_revision_sha256": preview_meta["application_context_revision_sha256"],
+                "reviewed_policies": preview_meta["reviewed_policies"],
+                "application_contexts": preview_meta["application_contexts"],
+                "research_provenance": summarize_run_research_provenance(
+                    [],
+                    target=target,
+                    target_revision_sha256=target_revision_sha256,
+                    dataset_id=dataset_id,
+                    dataset_revision_sha256=dataset_revision_sha256,
+                    dataset_name=dataset_name,
+                ),
                 "capability_states": target.capability_states,
                 "selected_cases": len(preview_meta["items"]),
                 "ready_count": len(pairs),
@@ -1385,6 +1485,7 @@ class GenericRunService:
                         "execution_status": exec_status,
                         "collector_diagnostics": item["collector_diagnostics"],
                         "evidence": obs_block.get("evidence", []),
+                        "research_provenance": ev_block.get("research_provenance"),
                         **({"source_provenance": source_prov} if source_prov is not None else {}),
                         **({"historical_verdict": hist_verdict} if isinstance(hist_verdict, dict) else {}),
                         "report_path": str(report_path),
@@ -1440,12 +1541,16 @@ class GenericRunService:
                         allowed_collector_endpoints=tuple(allowed_endpoints),
                         generic_run_id=run_id,
                         case_progress_callback=_on_progress,
+                        target_revision_sha256=target_revision_sha256,
+                        dataset_metadata=run_dataset_metadata,
                     )
                     done_iso = datetime.now(timezone.utc).isoformat()
                     with self._lock:
                         record["executed_cases"] = len(record["cases"])
                         record["total_cases"] = len(pairs)
                         record["verdict_counts"] = summary["verdict_counts"]
+                        if isinstance(summary.get("research_provenance"), dict):
+                            record["research_provenance"] = summary["research_provenance"]
                         self._verify_completion_invariants(
                             run_id=run_id,
                             record=record,

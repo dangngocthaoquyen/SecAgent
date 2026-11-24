@@ -702,4 +702,3 @@ def test_g01_fix4_unpaired_surrogates_and_deep_json_nesting_fail_safely(bad_text
     cl = classify_observation_evidence(obs.evidence, obs.response_text)
     assert cl["verified_execution_present"] is False
     assert cl["evidence_level"] == "response_only"
-

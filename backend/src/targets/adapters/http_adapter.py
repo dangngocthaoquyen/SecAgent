@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from core.models import ExecutionResult, TargetProfile, TestInput
+from core.models.execution import resolve_response_completeness
 from core.models.tool_intent import (
     build_tool_intent_event,
     extract_structured_tool_fingerprints,
@@ -204,16 +205,34 @@ class HttpTargetAdapter(BaseTargetAdapter):
                     else None
                 )
                 events.append(build_tool_intent_event(intent_signal, reference=response_id))
-        resp_complete: bool | None = None
-        if response_only_completion and response.body_complete is True and output_text is not None:
-            if isinstance(response.json_body, dict) and "choices" in response.json_body:
+        is_json_dict = isinstance(response.json_body, dict)
+        has_choices = is_json_dict and "choices" in response.json_body
+        finish_reason: str | None = None
+        truncated_flag: bool | None = None
+        if is_json_dict:
+            if has_choices:
                 choices = response.json_body.get("choices")
-                if (isinstance(choices, list) and bool(choices)
-                        and isinstance(choices[0], dict)
-                        and choices[0].get("finish_reason") == "stop"):
-                    resp_complete = True
-            elif isinstance(response.json_body, dict):
-                resp_complete = True
+                if isinstance(choices, list) and bool(choices) and isinstance(choices[0], dict):
+                    raw_fr = choices[0].get("finish_reason")
+                    if isinstance(raw_fr, str):
+                        finish_reason = raw_fr
+            else:
+                raw_fr = response.json_body.get("finish_reason")
+                if isinstance(raw_fr, str):
+                    finish_reason = raw_fr
+                raw_trunc = response.json_body.get("truncated")
+                if type(raw_trunc) is bool:
+                    truncated_flag = raw_trunc
+        resp_complete = resolve_response_completeness(
+            finish_reason=finish_reason,
+            body_complete=response.body_complete,
+            has_output_text=output_text is not None,
+            response_only_completion=response_only_completion,
+            has_choices_envelope=has_choices,
+            is_json_dict=is_json_dict,
+            is_offline=False,
+            truncated_flag=truncated_flag,
+        )
         return ExecutionResult(
             success=True,
             status_code=response.status_code,

@@ -214,7 +214,10 @@ class ResponsePolicyStore:
         rev_key = POLICY_REVISION_KEYS[verified.category]
         context: dict[str, Any] = {
             "evaluation_scope": verified.draft.evaluation_scope,
+            "context_source": "reviewed_policy",
             "policy_id": verified.policy_id,
+            "reviewed_policy_id": verified.policy_id,
+            "reviewed_policy_revision_sha256": verified.revision_sha256,
             rev_key: verified.revision_sha256,
             "policy_review_status": verified.review_status,
             "delivery_surface": verified.draft.delivery_surface,

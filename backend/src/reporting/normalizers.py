@@ -281,6 +281,35 @@ def _human(value, r):
         reviewer_ref=r.clean(row.get("reviewer_ref")), verification_basis=r.clean(row.get("verification_basis")))
 
 
+def _sanitize_provenance_mapping(value, r, depth: int = 0):
+    if depth > 6 or not isinstance(value, dict):
+        return None
+    out = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            continue
+        clean_key = r.clean(key, limit=128)
+        if not clean_key:
+            continue
+        if isinstance(item, dict):
+            out[clean_key] = _sanitize_provenance_mapping(item, r, depth + 1)
+        elif isinstance(item, list):
+            sanitized_list = []
+            for elem in item[:64]:
+                if isinstance(elem, dict):
+                    sanitized_list.append(_sanitize_provenance_mapping(elem, r, depth + 1))
+                elif isinstance(elem, str):
+                    sanitized_list.append(r.clean(elem, limit=512))
+                elif isinstance(elem, (bool, int, float)) or elem is None:
+                    sanitized_list.append(elem)
+            out[clean_key] = sanitized_list
+        elif isinstance(item, str):
+            out[clean_key] = r.clean(item, limit=512)
+        elif isinstance(item, (bool, int, float)) or item is None:
+            out[clean_key] = item
+    return out
+
+
 def _native(document, source, r):
     notes = ["Historical verdict projection only; evidence verification and completeness claims were not independently repeated."]
     e = _optional_object(document.get("evaluation"))
@@ -340,6 +369,11 @@ def _native(document, source, r):
             }
             for row in e.get("collector_diagnostics", []) if isinstance(row, dict)
         ] if isinstance(e.get("collector_diagnostics"), list) else []),
+        research_provenance=(
+            _sanitize_provenance_mapping(e["research_provenance"], r)
+            if isinstance(e.get("research_provenance"), dict)
+            else None
+        ),
         human_reference=_human(document.get("human_reference"), r),
         technical_errors=errors, limitations=_limitations(e.get("evidence_limitations"), r), normalization_notes=notes)
 
