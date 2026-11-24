@@ -124,6 +124,11 @@ def validate_corpus(path: Path) -> tuple[dict, list[dict], str]:
     return corpus, rows, digest(data)
 
 
+def _select_skill_loader(args):
+    skill_root = getattr(args, "skill_root", None)
+    return base.SkillBundleLoader(skill_root) if skill_root is not None else base.SkillBundleLoader()
+
+
 def validate_environment(args, corpus: dict, corpus_sha256: str, rows: list[dict]):
     snapshot_bytes = args.policy_snapshot.read_bytes()
     if digest(snapshot_bytes) != base.POLICY_FILE_SHA256:
@@ -151,7 +156,8 @@ def validate_environment(args, corpus: dict, corpus_sha256: str, rows: list[dict
             "policy_id", "revision_sha256", "draft", "binding", "review_status")):
         fail("Live ASI05 reviewed policy differs from pinned snapshot")
 
-    skill = base.SkillBundleLoader().load("unexpected_code_execution").identity
+    loader = _select_skill_loader(args)
+    skill = loader.load("unexpected_code_execution").identity
     if skill.sha256 != base.SKILL_SHA256 or skill.sha256 != corpus["judge_skill_sha256"]:
         fail("Trusted ASI05 Judge Skill identity mismatch")
     config_bytes = args.judge_config.read_bytes()
@@ -192,17 +198,37 @@ class GateSentinel:
         raise AssertionError("Pre-Judge gate case reached the external Judge")
 
 
-def evaluate_case(row, policy, config, source_sha256, *, execute, provider=None):
+def evaluate_case(
+    row,
+    policy,
+    config,
+    source_sha256,
+    *,
+    execute,
+    provider=None,
+    bundle_loader=None,
+    expected_skill=None,
+):
     testcase = make_testcase(row, policy, source_sha256)
     observation = make_observation(row)
     selected_config = config if execute else config.model_copy(update={"allow_live_judge": False})
+    active_loader = bundle_loader if bundle_loader is not None else base.SkillBundleLoader()
     if row["evaluation_lane"] == "pre_judge_gate":
         delegate = GateSentinel()
     else:
-        delegate = (provider if provider is not None else base.PiEvaluatorProvider(config.pi)) if execute else base.DryRunJudge()
+        delegate = (
+            provider
+            if provider is not None
+            else base.PiEvaluatorProvider(config.pi, bundle_loader=active_loader)
+        ) if execute else base.DryRunJudge()
     recording = base.RecordingProvider(delegate)
     diagnostics = []
-    evaluator, budget = configured_evaluator(selected_config, recording, diagnostics.append)
+    evaluator, budget = configured_evaluator(
+        selected_config,
+        recording,
+        diagnostics.append,
+        bundle_loader=active_loader,
+    )
     result = evaluator.evaluate(testcase, observation)
     diagnostic = diagnostics[-1] if diagnostics else None
     if row["evaluation_lane"] == "pre_judge_gate":
@@ -210,16 +236,27 @@ def evaluate_case(row, policy, config, source_sha256, *, execute, provider=None)
                 or recording.request is not None or diagnostic is None
                 or diagnostic.semantic_invoked):
             fail("X09 completeness gate failed or attempted an external Judge call")
-    elif not execute:
+    else:
         request = recording.request
-        if (request is None or diagnostic is None or not diagnostic.semantic_invoked
-                or budget.used != 1 or result.status.value != "INCONCLUSIVE"):
-            fail(f"{row['fixture_id']}: dry-run did not traverse the production Judge gate")
-        independent = EvaluationRequestBuilder().build(testcase, observation)
-        if (independent.observation != request.observation
-                or independent.trusted_context != request.trusted_context
-                or independent.testcase != request.testcase):
-            fail(f"{row['fixture_id']}: EvaluationRequestBuilder disagreement")
+        if expected_skill is not None and request is not None:
+            if request.skill != expected_skill:
+                fail(f"{row['fixture_id']}: EvaluationRequest Skill identity mismatch")
+            if (diagnostic is not None and diagnostic.skill_sha256 is not None
+                    and diagnostic.skill_sha256 != expected_skill.sha256):
+                fail(f"{row['fixture_id']}: Diagnostic Skill identity mismatch")
+            if (recording.outcome is not None and recording.outcome.skill is not None
+                    and recording.outcome.skill != expected_skill):
+                fail(f"{row['fixture_id']}: Provider Skill identity mismatch")
+        if not execute:
+            if (request is None or diagnostic is None or not diagnostic.semantic_invoked
+                    or budget.used != 1 or result.status.value != "INCONCLUSIVE"):
+                fail(f"{row['fixture_id']}: dry-run did not traverse the production Judge gate")
+            independent = EvaluationRequestBuilder(bundle_loader=active_loader).build(testcase, observation)
+            if (independent.observation != request.observation
+                    or independent.trusted_context != request.trusted_context
+                    or independent.testcase != request.testcase
+                    or independent.skill != request.skill):
+                fail(f"{row['fixture_id']}: EvaluationRequestBuilder disagreement")
     return result, diagnostic, budget.used, recording
 
 
@@ -279,6 +316,7 @@ def run(args, *, provider_factory=None):
     if args.execute and any(case_id in HUMAN_REVIEW for case_id in selected):
         fail("--execute excludes X04, X06, X08, and X10 pending human review")
     policy, config, skill, validation = validate_environment(args, corpus, corpus_sha256, rows)
+    bundle_loader = _select_skill_loader(args)
     validation["selected_fixtures"] = selected
     mode = "execute" if args.execute else "dry-run" if args.dry_run else "validate-only"
     results = []
@@ -310,7 +348,10 @@ def run(args, *, provider_factory=None):
             provider = provider_factory() if args.execute and row["evaluation_lane"] == "semantic_judge" and provider_factory else None
             result, diagnostic, attempts, recording = evaluate_case(
                 row, policy, config, validation["request_source_sha256"],
-                execute=args.execute, provider=provider)
+                execute=args.execute, provider=provider,
+                bundle_loader=bundle_loader, expected_skill=skill)
+            if recording.request is not None:
+                result_row["judge_skill_sha256"] = recording.request.skill.sha256
             result_row["judge_request_sha256"] = recording.request.sha256 if recording.request else None
             if row["evaluation_lane"] == "pre_judge_gate":
                 result_row.update(resolved_verdict=result.status.value,
@@ -369,6 +410,7 @@ def parser():
     p.add_argument("--judge-config", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--fixtures-select", help="Comma-separated X02–X10; default all for safe modes")
+    p.add_argument("--skill-root", type=Path, default=None, help="Optional archived Skill bundle directory for historical v1.0.0 replay")
     p.add_argument("--allow-external-judge", action="store_true")
     return p
 

@@ -237,13 +237,15 @@ def test_application_context_only_never_fabricates_reviewed_policy_and_aligns_al
             assert ctx["trust_boundary"]
             assert "source_text" not in ctx
         elif cat == "tool_misuse":
+            assert "authorized_tools" not in ctx
             assert ctx["declared_tool_capabilities"] == ["read_docs", "search_index"]
             assert ctx["actual_callable_capabilities"] == "unknown"
             assert ctx["authorized_tool_operations"] == ["Read public documentation"]
             assert ctx["unauthorized_tool_operations"] == ["/etc/shadow"]
             assert ctx["tool_authorization_status"] == "User approval for write actions"
         elif cat == "identity_privilege_abuse":
-            assert ctx["established_identity"] == "authenticated_reader"
+            assert ctx["established_identity"] == "unknown"
+            assert ctx["application_details"]["users"] == "authenticated_reader"
             assert ctx["allowed_privileges"] == "Read public documentation"
             assert ctx["prohibited_identity_claim"] == "/etc/shadow"
             assert ctx["prohibited_authority_claim"] == "/etc/shadow"
@@ -423,7 +425,7 @@ def test_missing_or_unverified_context_fails_safely_in_verdict_resolver() -> Non
 def test_judge_skill_bundles_align_with_normalized_context_and_record_actual_hash() -> None:
     loader = SkillBundleLoader()
     base_id = skill_identity()
-    assert base_id["version"] == "1.1.0"
+    assert base_id["version"] == "1.3.0"
     assert len(base_id["sha256"]) == 64
 
     b_gh = loader.load("goal_hijacking")
@@ -433,10 +435,10 @@ def test_judge_skill_bundles_align_with_normalized_context_and_record_actual_has
     b_cmd = loader.load("unexpected_code_execution")
 
     # Shared security bundle identity matches dynamic skill_identity(); response-first ASI02 has distinct hash
-    assert b_gh.identity.version == "1.1.0"
+    assert b_gh.identity.version == "1.3.0"
     assert b_gh.identity.sha256 == base_id["sha256"]
     assert b_cmd.identity.sha256 == base_id["sha256"]
-    assert b_tm_resp.identity.version == "1.1.0"
+    assert b_tm_resp.identity.version == "1.3.0"
     assert b_tm_resp.identity.sha256 != base_id["sha256"]
 
     # Shared instructions distinguish all four evidence tiers & operator declarations

@@ -2,7 +2,7 @@
 name: security
 description: Classify SecAgent observations against a trusted security testcase and return a structured semantic recommendation. Use for external evaluation of ASI01/GH, PI, ASI02/TM, SD, ASI03, or ASI05; not to execute attacks or operate target tools.
 metadata:
-  version: "1.1.0"
+  version: "1.3.0"
 ---
 
 # SecAgent security evaluator

@@ -67,8 +67,22 @@ def semantic_cases(reviewed_policy):
     return {row["id"]: row for row in corpus["cases"]}
 
 
-def test_trusted_skill_identity_is_the_audited_bundle():
-    assert SkillBundleLoader().load("unexpected_code_execution").identity.sha256 == SKILL_BUNDLE_SHA256
+def test_trusted_skill_identity_is_the_audited_bundle(tmp_path):
+    import tarfile
+    from integrations.external_evaluator.identity import skill_identity
+
+    # Archived v1.0.0 reproducibility check against preserved historical Skill bundle
+    archived_root = tmp_path / "archived_v1_0_0"
+    with tarfile.open(FIXTURES / "archived_skill_v1_0_0.tar.gz", "r:gz") as tf:
+        tf.extractall(archived_root, filter="data")
+    archived = SkillBundleLoader(archived_root).load("unexpected_code_execution").identity
+    assert archived.version == "1.0.0"
+    assert archived.sha256 == SKILL_BUNDLE_SHA256
+
+    # Current Skill identity verified separately from archived v1.0.0 pin
+    current = SkillBundleLoader().load("unexpected_code_execution").identity
+    assert current.model_dump() == skill_identity()
+    assert current.sha256 != SKILL_BUNDLE_SHA256
 
 
 def build_case(row, policy):

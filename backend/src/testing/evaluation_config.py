@@ -9,7 +9,7 @@ from typing import Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from evaluators import HybridEvaluator, ResponseEvaluator
+from evaluators import EvaluationRequestBuilder, HybridEvaluator, ResponseEvaluator
 from integrations.external_evaluator.base import ExternalEvaluatorProvider
 from integrations.external_evaluator.models import ExternalEvaluationOutcome, ProviderFault, ProviderFaultCode
 from integrations.external_evaluator.pi import PiEvaluatorConfig, PiEvaluatorProvider
@@ -98,7 +98,7 @@ class BudgetedJudgeProvider(ExternalEvaluatorProvider):
         return self.delegate.evaluate(request)
 
 
-def configured_evaluator(config, provider, diagnostic_sink):
+def configured_evaluator(config, provider, diagnostic_sink, *, bundle_loader=None):
     if config.mode == "rule_only":
         if provider is not None:
             raise ValueError("A provider requires hybrid mode.")
@@ -108,7 +108,12 @@ def configured_evaluator(config, provider, diagnostic_sink):
     if config.judge_enabled and provider is None:
         if not config.allow_live_judge:
             raise ValueError("Supply a trusted offline provider or explicitly opt into live Pi.")
-        provider = PiEvaluatorProvider(config.pi)
+        provider = PiEvaluatorProvider(config.pi, bundle_loader=bundle_loader)
     budget = BudgetedJudgeProvider(config, provider)
-    return HybridEvaluator(budget, diagnostic_sink=diagnostic_sink,
-        require_complete_response_for_semantic=config.require_complete_response_for_semantic), budget
+    request_builder = EvaluationRequestBuilder(bundle_loader=bundle_loader) if bundle_loader is not None else None
+    return HybridEvaluator(
+        budget,
+        request_builder=request_builder,
+        diagnostic_sink=diagnostic_sink,
+        require_complete_response_for_semantic=config.require_complete_response_for_semantic,
+    ), budget

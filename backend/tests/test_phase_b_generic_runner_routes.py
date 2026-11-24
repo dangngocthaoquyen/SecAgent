@@ -782,8 +782,11 @@ def test_negative_application_details_missing_boundaries_unverified_metadata_and
     assert start3.status_code == 201
     assert len(received_requests) == 1
     judge_req = received_requests[0]
-    # Unconfirmed discovered_observed tool `execute_command` must NOT be in authorized_tools
-    assert judge_req.trusted_context.get("authorized_tools") == []
+    # Unconfirmed discovered_observed tool `execute_command` must NOT become declared or authorized
+    assert "authorized_tools" not in judge_req.trusted_context
+    assert judge_req.trusted_context.get("declared_tool_capabilities") == "unknown"
+    assert judge_req.trusted_context.get("actual_callable_capabilities") == "unknown"
+    assert judge_req.trusted_context.get("authorized_tool_operations") == "unknown"
     # Historical gradingResult must NEVER leak into EvaluationRequest
     assert "HISTORICAL_SECRET_GRADING_REASON_DO_NOT_LEAK" not in judge_req.model_dump_json()
     # ResponsePolicyStore was never auto-populated or auto-reviewed

@@ -547,8 +547,6 @@ def resolve_trusted_context_for_target_category(
                 if ctx.get("tool_authorization_status") == "unknown" and auth_required:
                     ctx["tool_authorization_status"] = auth_required
             elif norm_category == "identity_privilege_abuse":
-                if ctx.get("established_identity") == "unknown" and users_val:
-                    ctx["established_identity"] = users_val
                 if ctx.get("allowed_privileges") == "unknown" and auth_actions:
                     ctx["allowed_privileges"] = auth_actions
             elif norm_category == "unexpected_code_execution":
@@ -607,7 +605,6 @@ def resolve_trusted_context_for_target_category(
         tool_list = [t.strip() for t in re.split(r"[,;\n]+", raw_tools) if t.strip()]
         auth_actions = str(verified_app_draft.get("authorized_actions") or "").strip()
         auth_required = str(verified_app_draft.get("authorization_required") or "").strip()
-        users_val = str(verified_app_draft.get("users") or "").strip()
         ctx = {
             "evaluation_scope": DEFAULT_EVALUATION_SCOPES[norm_category],
             "context_source": "application_context",
@@ -634,9 +631,8 @@ def resolve_trusted_context_for_target_category(
             ctx["authorized_tool_operations"] = [auth_actions] if auth_actions else "unknown"
             ctx["unauthorized_tool_operations"] = [prohibited]
             ctx["tool_authorization_status"] = auth_required if auth_required else "unknown"
-            ctx["authorized_tools"] = tool_list
         elif norm_category == "identity_privilege_abuse":
-            ctx["established_identity"] = users_val if users_val else "unknown"
+            ctx["established_identity"] = "unknown"
             ctx["allowed_privileges"] = auth_actions if auth_actions else "unknown"
             ctx["prohibited_identity_claim"] = prohibited
             ctx["prohibited_authority_claim"] = prohibited

@@ -136,7 +136,10 @@ def test_schema_rejects_missing_or_extra_reference_fields():
         ChallengeCorpus.model_validate(extra)
 
 
-def test_challenge_and_existing_corpus_hashes_policy_binding_and_skill():
+def test_challenge_and_existing_corpus_hashes_policy_binding_and_skill(tmp_path):
+    import tarfile
+    from integrations.external_evaluator.identity import skill_identity
+
     assert sha256(CHALLENGE.read_bytes()).hexdigest() == CHALLENGE_SHA256
     assert sha256((FIXTURES / "semantic_cases.json").read_bytes()).hexdigest() == pilot.CORPUS_SHA256
     snapshot_bytes = (FIXTURES / "reviewed_policy_snapshot.json").read_bytes()
@@ -146,7 +149,18 @@ def test_challenge_and_existing_corpus_hashes_policy_binding_and_skill():
     assert snapshot["review_status"] == "reviewed"
     assert_binding(corpus, snapshot)
     assert corpus.judge_skill_sha256 == pilot.SKILL_SHA256
-    assert SkillBundleLoader().load("unexpected_code_execution").identity.sha256 == corpus.judge_skill_sha256
+
+    # Verify archived v1.0.0 Skill reproducibility against preserved historical bundle
+    archived_root = tmp_path / "archived_v1_0_0"
+    with tarfile.open(FIXTURES / "archived_skill_v1_0_0.tar.gz", "r:gz") as tf:
+        tf.extractall(archived_root, filter="data")
+    archived = SkillBundleLoader(archived_root).load("unexpected_code_execution").identity
+    assert archived.sha256 == corpus.judge_skill_sha256
+
+    # Current Skill identity stays distinct from archived v1.0.0 pin
+    current = SkillBundleLoader().load("unexpected_code_execution").identity
+    assert current.model_dump() == skill_identity()
+    assert current.sha256 != corpus.judge_skill_sha256
 
     changed = corpus.model_copy(update={"policy_binding": {**corpus.policy_binding, "target_model": "other"}})
     with pytest.raises(AssertionError):

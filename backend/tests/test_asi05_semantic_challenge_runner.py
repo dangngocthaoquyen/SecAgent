@@ -232,9 +232,24 @@ def test_policy_skill_and_config_binding_are_checked_without_network(tmp_path, m
     monkeypatch.setattr(challenge.base, "ManagedState", FakeState)
     monkeypatch.setattr(challenge.base, "ManagedTargetCatalog", lambda *_: object())
     monkeypatch.setattr(challenge.base, "ASI05PolicyStore", FakeStore)
+    import tarfile
+
+    archived_root = tmp_path / "archived_v1_0_0"
+    with tarfile.open(challenge.base.FIXTURES / "archived_skill_v1_0_0.tar.gz", "r:gz") as tf:
+        tf.extractall(archived_root, filter="data")
+
+    # Running archived v1.0.0 challenge without --skill-root against current live bundle rejects mismatch
+    args_live = challenge.parser().parse_args([
+        "--validate-only", "--target-data-dir", str(target_dir),
+        "--judge-config", str(config_path), "--output-dir", str(tmp_path / "output-live"),
+    ])
+    with pytest.raises(challenge.ChallengeValidationError, match="Skill identity mismatch"):
+        challenge.validate_environment(args_live, corpus, corpus_sha, rows)
+
     args = challenge.parser().parse_args([
         "--validate-only", "--target-data-dir", str(target_dir),
         "--judge-config", str(config_path), "--output-dir", str(tmp_path / "output"),
+        "--skill-root", str(archived_root),
     ])
     _, config, skill, validation = challenge.validate_environment(args, corpus, corpus_sha, rows)
     assert config.max_judge_calls == 1
@@ -250,3 +265,147 @@ def test_policy_skill_and_config_binding_are_checked_without_network(tmp_path, m
     config_path.write_bytes(config_bytes + b" ")
     with pytest.raises(challenge.ChallengeValidationError, match="configuration SHA256 mismatch"):
         challenge.validate_environment(args, corpus, corpus_sha, rows)
+
+
+def test_archived_skill_propagates_to_dry_run_execute_and_reports_while_current_uses_live_skill(
+    tmp_path, monkeypatch
+):
+    """Fix 1: Historical v1.0.0 bundle propagates consistently across validation, request, provider, and report."""
+    import tarfile
+    from integrations.external_evaluator.identity import skill_identity
+    from integrations.external_evaluator.pi import PiEvaluatorProvider, ProcessOutput
+    from integrations.external_evaluator.skills import SkillBundleLoader
+
+    archived_root = tmp_path / "archived_v1_0_0"
+    with tarfile.open(challenge.base.FIXTURES / "archived_skill_v1_0_0.tar.gz", "r:gz") as tf:
+        tf.extractall(archived_root, filter="data")
+
+    corpus, rows, _ = challenge.validate_corpus(challenge.CORPUS)
+    policy = challenge.base.read_json(challenge.base.FIXTURES / "reviewed_policy_snapshot.json")
+    config_bytes = json.dumps({
+        "mode": "hybrid", "judge_enabled": True, "allow_live_judge": True,
+        "max_judge_calls": 1, "require_complete_response_for_semantic": True,
+        "pi": {"executable": "never-launched", "provider": "fixture", "model": "fixture",
+               "timeout_seconds": 2},
+    }, separators=(",", ":")).encode()
+    config_path = tmp_path / "config.json"
+    config_path.write_bytes(config_bytes)
+    monkeypatch.setattr(challenge.base, "CONFIG_SHA256", sha256(config_bytes).hexdigest())
+    target_dir = tmp_path / "target-data"
+    target_dir.mkdir()
+    (target_dir / "target-catalog.json").write_text("{}", encoding="utf-8")
+
+    class FakeState:
+        @staticmethod
+        def model_validate(_value):
+            return SimpleNamespace(catalog={})
+
+    class FakeStore:
+        def __init__(self, _catalog):
+            pass
+
+        def load(self, _policy_id):
+            return policy
+
+        def status(self, _live):
+            return {"response_policy_ready": True}
+
+    monkeypatch.setattr(challenge.base, "ManagedState", FakeState)
+    monkeypatch.setattr(challenge.base, "ManagedTargetCatalog", lambda *_: object())
+    monkeypatch.setattr(challenge.base, "ASI05PolicyStore", FakeStore)
+
+    # 1. Archived dry-run: capture actual EvaluationRequest (no mocking of request builder)
+    captured_dry_requests = []
+    orig_dry_eval = challenge.base.DryRunJudge.evaluate
+
+    def spy_dry_eval(self, request):
+        captured_dry_requests.append(request)
+        return orig_dry_eval(self, request)
+
+    monkeypatch.setattr(challenge.base.DryRunJudge, "evaluate", spy_dry_eval)
+
+    dry_out = tmp_path / "out-dry"
+    dry_args = challenge.parser().parse_args([
+        "--dry-run", "--target-data-dir", str(target_dir),
+        "--judge-config", str(config_path), "--output-dir", str(dry_out),
+        "--fixtures-select", "X02,X09", "--skill-root", str(archived_root),
+    ])
+    dry_summary = challenge.run(dry_args)
+    assert dry_summary["fake_judge_calls"] == 1
+    assert len(captured_dry_requests) == 1
+    dry_req = captured_dry_requests[0]
+    assert dry_req.skill.version == "1.0.0"
+    assert dry_req.skill.sha256 == corpus["judge_skill_sha256"]
+
+    dry_val = json.loads((dry_out / "validation_report.json").read_text(encoding="utf-8"))
+    dry_rows = {r["fixture_id"]: r for r in json.loads((dry_out / "challenge_results.json").read_text(encoding="utf-8"))}
+    assert dry_val["judge_skill_sha256"] == dry_req.skill.sha256
+    assert dry_rows["X02"]["judge_skill_sha256"] == dry_req.skill.sha256
+    assert dry_rows["X09"]["judge_request_sha256"] is None
+    assert dry_rows["X09"]["comparison_status"] == "pre_judge_gate_no_external_judge"
+
+    # 2. Archived execute pathway via PiEvaluatorProvider + FakeProcessRunner (zero external calls)
+    x02_row = next(r for r in rows if r["fixture_id"] == "X02")
+    pi_stdin_requests = []
+
+    class _FakePiProcess:
+        def run(self, argv, *, input_bytes, cwd, env, timeout_seconds, max_output_bytes):
+            del argv, cwd, env, timeout_seconds, max_output_bytes
+            req_json = json.loads(input_bytes.decode("utf-8"))
+            pi_stdin_requests.append(req_json)
+            out = {
+                "verdict": x02_row["expected_verdict"],
+                "classification": x02_row["expected_classification"],
+                "confidence": 0.9,
+                "reason": "Offline fake Pi output for archived skill propagation verification.",
+                "evidence": [{"type": "response_span", "value": x02_row["required_evidence"]["response_spans"][0]}],
+            }
+            return ProcessOutput(exit_code=0, stdout=json.dumps(out).encode("utf-8"))
+
+    exec_out = tmp_path / "out-exec"
+    exec_args = challenge.parser().parse_args([
+        "--execute", "--allow-external-judge",
+        "--target-data-dir", str(target_dir),
+        "--judge-config", str(config_path), "--output-dir", str(exec_out),
+        "--fixtures-select", "X02,X09", "--skill-root", str(archived_root),
+    ])
+    pi_cfg = challenge.base.RunnerEvaluationConfig.model_validate(json.loads(config_bytes)).pi
+    archived_loader = SkillBundleLoader(archived_root)
+    exec_summary = challenge.run(
+        exec_args,
+        provider_factory=lambda: PiEvaluatorProvider(
+            pi_cfg, bundle_loader=archived_loader, process_runner=_FakePiProcess()
+        ),
+    )
+    assert exec_summary["judge_attempts"] == 1
+    assert len(pi_stdin_requests) == 1
+    assert pi_stdin_requests[0]["skill"]["version"] == "1.0.0"
+    assert pi_stdin_requests[0]["skill"]["sha256"] == corpus["judge_skill_sha256"]
+    exec_rows = {r["fixture_id"]: r for r in json.loads((exec_out / "challenge_results.json").read_text(encoding="utf-8"))}
+    assert exec_rows["X02"]["judge_skill_sha256"] == corpus["judge_skill_sha256"]
+    assert exec_rows["X02"]["provider_fault"] is None
+    assert exec_rows["X09"]["external_judge_attempts"] == 0
+
+    # 3. Mismatched provider bundle (current v1.3.0 instead of archived v1.0.0) fails safely
+    mismatch_out = tmp_path / "out-mismatch"
+    mismatch_args = challenge.parser().parse_args([
+        "--execute", "--allow-external-judge",
+        "--target-data-dir", str(target_dir),
+        "--judge-config", str(config_path), "--output-dir", str(mismatch_out),
+        "--fixtures-select", "X02", "--skill-root", str(archived_root),
+    ])
+    with pytest.raises(challenge.ChallengeValidationError, match="Provider Skill identity mismatch"):
+        challenge.run(
+            mismatch_args,
+            provider_factory=lambda: PiEvaluatorProvider(
+                pi_cfg, bundle_loader=SkillBundleLoader(), process_runner=_FakePiProcess()
+            ),
+        )
+
+    # 4. Ordinary current-version evaluation still loads the current live Skill bundle
+    current_req = challenge.EvaluationRequestBuilder().build(
+        challenge.make_testcase(x02_row, policy, challenge.source_material_sha256(rows)),
+        challenge.make_observation(x02_row),
+    )
+    assert current_req.skill.model_dump() == skill_identity()
+    assert current_req.skill.sha256 != corpus["judge_skill_sha256"]
