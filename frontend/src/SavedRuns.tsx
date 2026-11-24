@@ -214,7 +214,7 @@ export default function SavedRuns({
           : 'runs');
 
   return (
-    <section className="panel results-panel history-shell" aria-label="Saved run history">
+    <section className="panel history-shell" aria-label="Saved run history">
       <div className="page-title">
         <div>
           <span className="eyebrow">PERSISTENT HISTORY · LIVE DISCOVERY</span>
