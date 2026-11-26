@@ -189,6 +189,12 @@ def main(argv=None) -> int:
         workflow_env = common | {"SECAGENT_WORKFLOW_OPERATOR_TOKEN": token,
                                  "SECAGENT_LOCAL_SINGLE_USER": "1"}
         workflow_credential_names: set[str] = set()
+        # Forward DeepSeek API key exclusively to Workflow API (shared by Generator & Judge;
+        # never exposed to Frontend/Vite or Reporting processes).
+        if os.environ.get("DEEPSEEK_API_KEY"):
+            common.pop("DEEPSEEK_API_KEY", None)
+            workflow_env["DEEPSEEK_API_KEY"] = os.environ["DEEPSEEK_API_KEY"]
+            workflow_credential_names.add("DEEPSEEK_API_KEY")
         # Forward only explicitly registered Target catalog credential references
         # to the Workflow API process; strip them from common/Frontend/Reporting
         # regardless of variable naming.

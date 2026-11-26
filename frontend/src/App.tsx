@@ -9,10 +9,12 @@ import Comparisons from "./Comparisons";
 import TargetConfiguration from './TargetConfiguration';
 import BatchProgress from './BatchProgress';
 import DatasetLibrary from './DatasetLibrary';
+import GeneratorModeWorkspace from './GeneratorModeWorkspace';
 import SecurityScanWizard from './SecurityScanWizard';
+import { saveScanHandoff } from './testingApi';
 function route() {
   const hash = location.hash.slice(1);
-  return hash === 'scan' || hash.startsWith('scan/') || hash === 'targets' || hash === 'datasets' || hash === "executions" ||
+  return hash === 'scan' || hash.startsWith('scan/') || hash === 'targets' || hash === 'datasets' || hash === 'generator' || hash === "executions" ||
     hash === "comparisons" ||
     hash.startsWith("execution/") || hash.startsWith("run/") || hash.startsWith("mcp-run/") || hash.startsWith("batch/")
     ? hash
@@ -25,6 +27,7 @@ export default function App() {
   const scanRunId = view.startsWith('scan/') ? view.slice('scan/'.length) : undefined;
   const targetsView = view === 'targets';
   const datasetsView = view === 'datasets';
+  const generatorView = view === 'generator';
   const batchView = view.startsWith('batch/');
   const [summary, setSummary] = useState<Summary | null>(null),
     [error, setError] = useState(""),
@@ -39,7 +42,7 @@ export default function App() {
     return () => window.removeEventListener("hashchange", listener);
   }, []);
   useEffect(() => {
-    if (scanView || targetsView || batchView || datasetsView) return;
+    if (scanView || targetsView || batchView || datasetsView || generatorView) return;
     const controller = new AbortController();
     setLoading(true);
     setSummary(null);
@@ -70,7 +73,7 @@ export default function App() {
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [revision, scanView, targetsView, batchView, datasetsView]);
+  }, [revision, scanView, targetsView, batchView, datasetsView, generatorView]);
   const connection = useCallback((ok: boolean) => setConnected(ok), []);
   function navigate(next: string) {
     location.hash = next;
@@ -101,6 +104,9 @@ export default function App() {
           </a>
           <a href="#datasets" aria-current={datasetsView?'page':undefined} onClick={()=>navigate('datasets')}>
             <span aria-hidden="true">▤</span> Datasets
+          </a>
+          <a href="#generator" aria-current={generatorView?'page':undefined} onClick={()=>navigate('generator')}>
+            <span aria-hidden="true">✦</span> AI Generator
           </a>
           <a href="#scan" aria-current={scanView?'page':undefined} onClick={()=>navigate('scan')}>
             <span aria-hidden="true">▶</span> New Scan
@@ -146,9 +152,9 @@ export default function App() {
       <div className="workspace">
         <header>
           <div className="breadcrumb">
-            {scanView||targetsView||batchView||datasetsView?'Security Testing':'Evaluation'} <span>/</span>{" "}
+            {scanView||targetsView||batchView||datasetsView||generatorView?'Security Testing':'Evaluation'} <span>/</span>{" "}
             <b>
-              {scanView ? 'New Security Scan' : targetsView ? 'Targets' : datasetsView ? 'Dataset Library' : batchView ? 'Batch Progress' : view === "overview"
+              {scanView ? 'New Security Scan' : targetsView ? 'Targets' : datasetsView ? 'Dataset Library' : generatorView ? 'AI Generator' : batchView ? 'Batch Progress' : view === "overview"
                 ? "Overview"
                 : view === "comparisons"
                   ? "Rule / Pi comparison"
@@ -159,21 +165,21 @@ export default function App() {
           </div>
           <div className="header-actions">
             <span
-              className={`connection ${connected && !scanView && !targetsView && !datasetsView ? "online" : ""}`}
+              className={`connection ${connected && !scanView && !targetsView && !datasetsView && !generatorView ? "online" : ""}`}
               role="status"
             >
               <span className="dot" />
-              {scanView||targetsView||batchView||datasetsView ? 'Target workflow service' : loading
+              {scanView||targetsView||batchView||datasetsView||generatorView ? 'Target workflow service' : loading
                 ? "Connecting to API"
                 : connected
                   ? "Reporting API connected"
                   : "Reporting API unavailable"}
             </span>
-            <span className="readonly">{scanView||targetsView||batchView||datasetsView?'Operator controlled':'Read-only'}</span>
+            <span className="readonly">{scanView||targetsView||batchView||datasetsView||generatorView?'Operator controlled':'Read-only'}</span>
           </div>
         </header>
         <main id="main" tabIndex={-1}>
-          {scanView ? <SecurityScanWizard initialRunId={scanRunId} initialTargetId={selectedTargetId}/> : targetsView ? <TargetConfiguration initialTargetId={selectedTargetId} onSelectDataset={setSelectedTargetId}/> : datasetsView ? <DatasetLibrary initialTargetId={selectedTargetId}/> : batchView ? <BatchProgress id={view.slice('batch/'.length)}/> : <>
+          {scanView ? <SecurityScanWizard initialRunId={scanRunId} initialTargetId={selectedTargetId}/> : targetsView ? <TargetConfiguration initialTargetId={selectedTargetId} onSelectDataset={setSelectedTargetId}/> : datasetsView ? <DatasetLibrary initialTargetId={selectedTargetId}/> : generatorView ? <GeneratorModeWorkspace initialTargetId={selectedTargetId} onSelectTarget={setSelectedTargetId} onOpenDatasetLibrary={() => navigate('datasets')} onOpenExistingScan={(datasetId) => { if (datasetId) saveScanHandoff({ dataset_id: datasetId }); navigate('scan'); }} onOpenRunReport={(runId) => navigate(`scan/${runId}`)}/> : batchView ? <BatchProgress id={view.slice('batch/'.length)}/> : <>
           <div className="dataset-line">
             <span>
               Selected reporting dataset{" "}
