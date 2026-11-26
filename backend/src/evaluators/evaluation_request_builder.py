@@ -1,16 +1,154 @@
 """Build the existing v1.0 Judge request from trusted case data and observations."""
 
+from collections.abc import Mapping
 from hashlib import sha256
 import json
 import re
+from typing import Any
 from uuid import uuid4
+
+from pydantic import ValidationError
 
 from core.models import Observation, TestCase
 from core.models.asi05_execution import Asi05ExecutionRequest
 from core.models.evidence import public_evidence_data
+from core.models.evidence_v2 import EVIDENCE_CONTRACT_V2_VERSION, EvidenceContractV2
 from evaluators.asi05_execution import build_execution_request
 from integrations.external_evaluator.models import EvaluationRequest
 from integrations.external_evaluator.skills import SkillBundleLoader
+
+_SAFE_SCOPE_OR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+_SAFE_RECORD_ID_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+_SAFE_ACTION_NAME_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+_SENSITIVE_FIELD_RE = re.compile(
+    r"(?i)(?:secret|sentinel|password|passwd|api[_-]?key|access[_-]?token|auth[_-]?token|"
+    r"bearer|private[_-]?key|credential|sk-[a-z0-9_-]{6,})"
+)
+_TRUSTED_ABSENCE_BOUNDARY_RE = re.compile(
+    r"^(?:local_collector|http_callback_collector|sandbox_log_collector|runtime_trace|"
+    r"asi05_execution_fixture|file_artifact_collector|local_tool_fixture|mcp_receipt_collector):"
+    r"(?:collector_receipt|web_callback|sandbox_log|execution_action|agent_run|"
+    r"file_artifact|direct_request|mcp_receipt|web_fetch)$"
+)
+
+
+def _contains_sensitive(value: str, sensitive_values: tuple[str, ...]) -> bool:
+    if _SENSITIVE_FIELD_RE.search(value):
+        return True
+    return any(secret and secret in value for secret in sensitive_values)
+
+
+def _sanitize_safe_identifier(
+    value: Any,
+    pattern: re.Pattern[str],
+    sensitive_values: tuple[str, ...],
+) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped or not pattern.fullmatch(stripped):
+        return None
+    if _contains_sensitive(stripped, sensitive_values):
+        return None
+    return stripped
+
+
+def _sanitize_evidence_v2_for_judge(
+    evidence_v2: EvidenceContractV2 | Mapping[str, Any] | None,
+    *,
+    sensitive_values: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
+    """Validate and project a strict, credential-free Evidence Contract v2 summary for the LLM Judge.
+
+    - Validates Mapping inputs against the real `EvidenceContractV2` Pydantic schema (never
+      trusts an arbitrary Mapping based only on `contract_version`).
+    - Drops free-text `limitations` and unverified free-text strings.
+    - Retains only verified structural fields (scope, scope alignment, trust classifications,
+      verified execution status, correlation, coverage, allowlisted absence boundary, safe
+      reason codes, safe verified action identities, and envelope SHA-256).
+    """
+    if evidence_v2 is None:
+        return None
+    if isinstance(evidence_v2, EvidenceContractV2):
+        contract = evidence_v2
+    elif isinstance(evidence_v2, Mapping):
+        if evidence_v2.get("availability") == "unavailable":
+            return None
+        if evidence_v2.get("compatibility_status") in {"unsupported_version", "malformed_payload"}:
+            return None
+        if evidence_v2.get("contract_version") != EVIDENCE_CONTRACT_V2_VERSION:
+            return None
+        try:
+            contract = EvidenceContractV2.model_validate(evidence_v2)
+        except ValidationError:
+            return None
+    else:
+        return None
+
+    verified_actions: list[dict[str, Any]] = []
+    for rec in contract.execution_observations[:12]:
+        safe_action_name = _sanitize_safe_identifier(
+            rec.action_name,
+            _SAFE_ACTION_NAME_RE,
+            sensitive_values,
+        )
+        safe_record_id = _sanitize_safe_identifier(
+            rec.record_id,
+            _SAFE_RECORD_ID_RE,
+            sensitive_values,
+        ) or "ev"
+        safe_kind = _sanitize_safe_identifier(
+            rec.kind,
+            _SAFE_SCOPE_OR_CODE_RE,
+            sensitive_values,
+        ) or "unknown"
+        verified_actions.append({
+            "record_id": safe_record_id,
+            "kind": safe_kind,
+            "action_name": safe_action_name,
+            "trust_classification": rec.trust_classification,
+            "execution_verified": bool(rec.execution_verified),
+            "execution_kind": rec.execution_kind,
+            "action_succeeded": rec.action_succeeded,
+            "correlation_verified": bool(rec.correlation_verified),
+            "is_synthetic": bool(rec.is_synthetic),
+        })
+
+    safe_scope = _sanitize_safe_identifier(
+        contract.effective_evaluation_scope,
+        _SAFE_SCOPE_OR_CODE_RE,
+        sensitive_values,
+    )
+    safe_boundary = _sanitize_safe_identifier(
+        contract.coverage.verified_absence_boundary,
+        _TRUSTED_ABSENCE_BOUNDARY_RE,
+        sensitive_values,
+    )
+    safe_reason_codes: list[str] = []
+    for code in contract.reason_codes[:16]:
+        clean = _sanitize_safe_identifier(code, _SAFE_SCOPE_OR_CODE_RE, sensitive_values)
+        if clean is not None:
+            safe_reason_codes.append(clean)
+
+    return {
+        "contract_version": EVIDENCE_CONTRACT_V2_VERSION,
+        "effective_evaluation_scope": safe_scope,
+        "scope_alignment_status": contract.scope_alignment.alignment_status,
+        "requires_execution_evidence": bool(contract.scope_alignment.requires_execution_evidence),
+        "highest_trust_classification": contract.highest_trust_classification,
+        "trust_classifications_present": list(contract.trust_classifications_present[:8]),
+        "verified_execution_status": contract.verified_execution_status,
+        "verified_execution_present": bool(contract.verified_execution_present),
+        "response_completeness": contract.response_observation.completeness,
+        "explicit_refusal": contract.response_observation.explicit_refusal,
+        "action_trace_completeness": contract.coverage.action_trace_completeness,
+        "request_trace_completeness": contract.coverage.request_trace_completeness,
+        "action_presence": contract.coverage.action_presence,
+        "verified_absence_boundary": safe_boundary,
+        "execution_observations_summary": verified_actions,
+        "reason_codes": safe_reason_codes,
+        "envelope_sha256": contract.envelope_sha256,
+    }
 
 
 class JudgeInputRejected(ValueError):
@@ -32,7 +170,8 @@ class EvaluationRequestBuilder:
     def build(self, testcase: TestCase, observation: Observation, *,
               prepared_prompt: str | None = None,
               reviewed_input_sha256: str | None = None,
-              sensitive_values: tuple[str, ...] = ()) -> EvaluationRequest:
+              sensitive_values: tuple[str, ...] = (),
+              evidence_v2: EvidenceContractV2 | Mapping[str, Any] | None = None) -> EvaluationRequest:
         semantic = testcase.evaluation.semantic
         if semantic is None or not semantic.enabled or semantic.skill != testcase.category:
             raise ValueError("Semantic evaluation is not configured for this category.")
@@ -82,6 +221,9 @@ class EvaluationRequestBuilder:
             metadata["execution_success"] = observation.metadata["execution_success"]
         if type(observation.metadata.get("response_complete")) is bool:
             metadata["response_complete"] = observation.metadata["response_complete"]
+        ev2_summary = _sanitize_evidence_v2_for_judge(evidence_v2, sensitive_values=sensitive_values)
+        if ev2_summary is not None:
+            metadata["evidence_v2_summary"] = ev2_summary
         # Trace completeness stays on its scoped normalized evidence event;
         # a top-level metadata flag could imply broader coverage than observed.
 

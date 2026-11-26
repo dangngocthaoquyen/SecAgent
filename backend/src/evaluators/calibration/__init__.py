@@ -1,0 +1,71 @@
+"""G12 Phase 5 — Judge Accuracy & Calibration contracts, benchmark, harness, and DeepSeek pilot."""
+
+from evaluators.calibration.benchmark import (
+    BENCHMARK_VERSION,
+    build_judge_calibration_benchmark,
+    compute_benchmark_sha256,
+)
+from evaluators.calibration.harness import (
+    DisabledJudgeProvider,
+    OfflineBenchmarkJudgeProvider,
+    OfflineSimulatedJudgeProvider,
+    OverclaimingMockJudgeProvider,
+    evaluate_benchmark,
+    is_trusted_offline_provider,
+    render_comparison_markdown,
+    run_pipeline_comparison,
+)
+from evaluators.calibration.models import (
+    AsiGroup,
+    BenchmarkCase,
+    BenchmarkSourceLabel,
+    BenchmarkSplit,
+    CalibrationMetrics,
+    CalibrationRunReport,
+    CaseEvaluationRecord,
+    ConfusionMatrix,
+    EvaluationPipelineMode,
+    EvidenceScenarioType,
+    ExecutionOriginLabel,
+    FailureCauseCategory,
+    MismatchAnalysis,
+    PipelineComparisonReport,
+)
+from evaluators.calibration.pilot import (
+    DeepSeekPilotConfig,
+    DeepSeekPilotPreflightResult,
+    preflight_deepseek_pilot,
+    run_deepseek_pilot,
+)
+
+__all__ = [
+    "AsiGroup",
+    "BENCHMARK_VERSION",
+    "BenchmarkCase",
+    "BenchmarkSourceLabel",
+    "BenchmarkSplit",
+    "CalibrationMetrics",
+    "CalibrationRunReport",
+    "CaseEvaluationRecord",
+    "ConfusionMatrix",
+    "DeepSeekPilotConfig",
+    "DeepSeekPilotPreflightResult",
+    "DisabledJudgeProvider",
+    "EvaluationPipelineMode",
+    "EvidenceScenarioType",
+    "ExecutionOriginLabel",
+    "FailureCauseCategory",
+    "MismatchAnalysis",
+    "OfflineBenchmarkJudgeProvider",
+    "OfflineSimulatedJudgeProvider",
+    "OverclaimingMockJudgeProvider",
+    "PipelineComparisonReport",
+    "build_judge_calibration_benchmark",
+    "compute_benchmark_sha256",
+    "evaluate_benchmark",
+    "is_trusted_offline_provider",
+    "preflight_deepseek_pilot",
+    "render_comparison_markdown",
+    "run_deepseek_pilot",
+    "run_pipeline_comparison",
+]

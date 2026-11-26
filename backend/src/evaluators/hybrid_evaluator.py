@@ -284,9 +284,14 @@ class HybridEvaluator(BaseEvaluator):
             ), baseline, effective)
             return effective
         try:
-            request = self._request_builder.build(testcase, observation,
-                prepared_prompt=prepared_prompt, reviewed_input_sha256=reviewed_input_sha256,
-                sensitive_values=sensitive_values)
+            build_kwargs: dict[str, Any] = {
+                "prepared_prompt": prepared_prompt,
+                "reviewed_input_sha256": reviewed_input_sha256,
+                "sensitive_values": sensitive_values,
+            }
+            if evidence_v2 is not None:
+                build_kwargs["evidence_v2"] = evidence_v2
+            request = self._request_builder.build(testcase, observation, **build_kwargs)
         except JudgeInputRejected as exc:
             result = EvaluationResult(status=EvaluationStatus.INCONCLUSIVE, reason=str(exc))
             self._record(HybridEvaluationDiagnostic(
