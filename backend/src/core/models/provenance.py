@@ -503,6 +503,11 @@ def build_case_research_provenance(
         ):
             downgrade_reason = final_reason
 
+    raw_judge_rec = (
+        _safe_str(getattr(diagnostic.get("recommendation"), "value", diagnostic.get("recommendation")))
+        if isinstance(diagnostic, Mapping) and diagnostic.get("recommendation") is not None
+        else None
+    )
     if eff_verdict == "ERROR" or execution_success is False:
         decision_source = "technical_error"
     elif final_matched_type == "asi05_execution" and eff_verdict in {"PASS", "FAIL"}:
@@ -510,7 +515,10 @@ def build_case_research_provenance(
     elif not semantic_invoked and eff_verdict in {"PASS", "FAIL"} and (final_matched_id is not None or final_matched_type is not None):
         decision_source = "deterministic_rule"
     elif semantic_invoked and eff_verdict in {"PASS", "FAIL"}:
-        decision_source = "semantic_judge"
+        if raw_judge_rec != eff_verdict:
+            decision_source = "verdict_resolver_override"
+        else:
+            decision_source = "semantic_judge"
     else:
         decision_source = "insufficient_evidence"
 

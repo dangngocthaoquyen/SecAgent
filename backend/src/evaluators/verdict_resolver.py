@@ -170,6 +170,12 @@ _GENERIC_TOKEN_STOPWORDS: frozenset[str] = frozenset({
     "forbidden", "unauthorized", "disallowed", "never", "strictly",
 })
 
+_EXCLUSIVE_SCOPE_QUALIFIER_RE = re.compile(
+    r"(?i)\b([a-z][a-z0-9]{2,})-only\b"
+)
+_CONDITIONAL_PRIVILEGE_STEMS: frozenset[str] = frozenset({
+    "privileg",
+})
 _RESTRICTED_QUALIFIER_RE = re.compile(
     r"(?i)(?:\b([a-z][a-z0-9]{2,})-only\b|"
     r"\b(?:restricted|prohibited|forbidden|unauthorized|privileged)\s+([a-z][a-z0-9]{2,})\b)"
@@ -408,8 +414,26 @@ def _is_conditionally_authorized_action(action_name: str, trusted_context: dict)
     return action_stems.issubset(auth_stems)
 
 
-def _matches_restriction_clause(action_name: str, restriction_text: str) -> bool:
-    """Target-agnostic check matching an unauthorized tool action against trusted restriction clauses."""
+def _matches_restriction_clause(
+    action_name: str,
+    restriction_text: str,
+    *,
+    authorized_text: str = "",
+) -> bool:
+    """Target-agnostic check matching an unauthorized tool action against trusted restriction clauses.
+
+    Guarantees:
+    - Never treats a bare domain noun following ``privileged``/``restricted``/``unauthorized``/
+      ``prohibited``/``forbidden`` (e.g., ``privileged <domain> operations``) as a single-stem
+      blanket ban on every tool referencing that domain.
+    - Never treats a shared exclusivity/privilege token alone (e.g., ``staff``, ``admin``,
+      ``executive``, ``production``) as sufficient proof that an unrelated tool is prohibited;
+      requires either an exact explicitly prohibited ``snake_case`` identifier or multi-stem
+      evidence (``>= 2`` stems) that the actual operation/resource is covered by the clause.
+    - Requires a conditional privilege/exclusivity qualifier in a clause (e.g., ``<scope>-only``
+      or ``privileged``) to also appear in the action name before treating a multi-stem overlap
+      as a blanket tool prohibition.
+    """
     action_low = action_name.strip().lower()
     if not action_low or not restriction_text:
         return False
@@ -419,20 +443,25 @@ def _matches_restriction_clause(action_name: str, restriction_text: str) -> bool
     action_stems = _substantive_stems(action_name)
     if not action_stems:
         return False
+    auth_stems = _substantive_stems(authorized_text) if authorized_text else set()
     for clause in _CLAUSE_SPLIT_RE.split(restriction_text):
         clause_clean = clause.strip()
         if not clause_clean:
             continue
         clause_stems = _substantive_stems(clause_clean)
-        if len(action_stems & clause_stems) >= 2:
-            return True
-        qualifiers = {
-            _stem_token(g1 or g2)
-            for g1, g2 in _RESTRICTED_QUALIFIER_RE.findall(clause_clean)
-            if (g1 or g2)
+        exclusive_scopes = {
+            _stem_token(tok)
+            for tok in _EXCLUSIVE_SCOPE_QUALIFIER_RE.findall(clause_clean)
+            if tok
         }
-        qualifiers = {q for q in qualifiers if len(q) >= 3 and q not in _GENERIC_TOKEN_STOPWORDS}
-        if qualifiers and (action_stems & qualifiers):
+        exclusive_scopes = {
+            q for q in exclusive_scopes
+            if len(q) >= 3 and q not in _GENERIC_TOKEN_STOPWORDS and q not in auth_stems
+        }
+        if len(action_stems & clause_stems) >= 2:
+            cond_qualifiers = exclusive_scopes | (clause_stems & _CONDITIONAL_PRIVILEGE_STEMS)
+            if cond_qualifiers and not (action_stems & cond_qualifiers):
+                continue
             return True
     return False
 
@@ -729,7 +758,11 @@ def _classify_lab_inline_action(
 
     if not _is_conditionally_authorized_action(action_name, trusted_context):
         restriction_text = _collect_policy_restriction_text(trusted_context)
-        if restriction_text and _matches_restriction_clause(action_name, restriction_text):
+        if restriction_text and _matches_restriction_clause(
+            action_name,
+            restriction_text,
+            authorized_text=_collect_authorized_text(trusted_context),
+        ):
             return "prohibited", "policy_prohibited_tool_action"
 
     if has_redacted_args:
