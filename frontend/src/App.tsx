@@ -9,9 +9,7 @@ import Comparisons from "./Comparisons";
 import TargetConfiguration from './TargetConfiguration';
 import BatchProgress from './BatchProgress';
 import DatasetLibrary from './DatasetLibrary';
-import GeneratorModeWorkspace from './GeneratorModeWorkspace';
 import SecurityScanWizard from './SecurityScanWizard';
-import { saveScanHandoff } from './testingApi';
 function route() {
   const hash = location.hash.slice(1);
   return hash === 'scan' || hash.startsWith('scan/') || hash === 'targets' || hash === 'datasets' || hash === 'generator' || hash === "executions" ||
@@ -23,11 +21,12 @@ function route() {
 export default function App() {
   const [view, setView] = useState(route());
   const [selectedTargetId,setSelectedTargetId]=useState('');
-  const scanView = view === 'scan' || view.startsWith('scan/');
-  const scanRunId = view.startsWith('scan/') ? view.slice('scan/'.length) : undefined;
+  const generatorAlias = view === 'generator';
+  const scanView = view === 'scan' || view.startsWith('scan/') || generatorAlias;
+  const scanWorkflowId = view.startsWith('scan/wf/') ? view.slice('scan/wf/'.length) : undefined;
+  const scanRunId = view.startsWith('scan/') && !view.startsWith('scan/wf/') ? view.slice('scan/'.length) : undefined;
   const targetsView = view === 'targets';
   const datasetsView = view === 'datasets';
-  const generatorView = view === 'generator';
   const batchView = view.startsWith('batch/');
   const [summary, setSummary] = useState<Summary | null>(null),
     [error, setError] = useState(""),
@@ -42,7 +41,7 @@ export default function App() {
     return () => window.removeEventListener("hashchange", listener);
   }, []);
   useEffect(() => {
-    if (scanView || targetsView || batchView || datasetsView || generatorView) return;
+    if (scanView || targetsView || batchView || datasetsView) return;
     const controller = new AbortController();
     setLoading(true);
     setSummary(null);
@@ -73,7 +72,7 @@ export default function App() {
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [revision, scanView, targetsView, batchView, datasetsView, generatorView]);
+  }, [revision, scanView, targetsView, batchView, datasetsView]);
   const connection = useCallback((ok: boolean) => setConnected(ok), []);
   function navigate(next: string) {
     location.hash = next;
@@ -102,14 +101,11 @@ export default function App() {
           <a href="#targets" aria-current={targetsView?'page':undefined} onClick={()=>navigate('targets')}>
             <span aria-hidden="true">◎</span> Targets
           </a>
-          <a href="#datasets" aria-current={datasetsView?'page':undefined} onClick={()=>navigate('datasets')}>
-            <span aria-hidden="true">▤</span> Datasets
-          </a>
-          <a href="#generator" aria-current={generatorView?'page':undefined} onClick={()=>navigate('generator')}>
-            <span aria-hidden="true">✦</span> AI Generator
-          </a>
           <a href="#scan" aria-current={scanView?'page':undefined} onClick={()=>navigate('scan')}>
             <span aria-hidden="true">▶</span> New Scan
+          </a>
+          <a href="#datasets" aria-current={datasetsView?'page':undefined} onClick={()=>navigate('datasets')}>
+            <span aria-hidden="true">▤</span> Datasets
           </a>
         </nav>
         <div className="nav-label">RESULTS &amp; REPORTS</div>
@@ -152,9 +148,9 @@ export default function App() {
       <div className="workspace">
         <header>
           <div className="breadcrumb">
-            {scanView||targetsView||batchView||datasetsView||generatorView?'Security Testing':'Evaluation'} <span>/</span>{" "}
+            {scanView||targetsView||batchView||datasetsView?'Security Testing':'Evaluation'} <span>/</span>{" "}
             <b>
-              {scanView ? 'New Security Scan' : targetsView ? 'Targets' : datasetsView ? 'Dataset Library' : generatorView ? 'AI Generator' : batchView ? 'Batch Progress' : view === "overview"
+              {scanView ? (scanWorkflowId || scanRunId ? 'Security Scan Progress' : 'New Security Scan') : targetsView ? 'Targets' : datasetsView ? 'Dataset Library' : batchView ? 'Batch Progress' : view === "overview"
                 ? "Overview"
                 : view === "comparisons"
                   ? "Rule / Pi comparison"
@@ -165,21 +161,21 @@ export default function App() {
           </div>
           <div className="header-actions">
             <span
-              className={`connection ${connected && !scanView && !targetsView && !datasetsView && !generatorView ? "online" : ""}`}
+              className={`connection ${connected && !scanView && !targetsView && !datasetsView ? "online" : ""}`}
               role="status"
             >
               <span className="dot" />
-              {scanView||targetsView||batchView||datasetsView||generatorView ? 'Target workflow service' : loading
+              {scanView||targetsView||batchView||datasetsView ? 'Target workflow service' : loading
                 ? "Connecting to API"
                 : connected
                   ? "Reporting API connected"
                   : "Reporting API unavailable"}
             </span>
-            <span className="readonly">{scanView||targetsView||batchView||datasetsView||generatorView?'Operator controlled':'Read-only'}</span>
+            <span className="readonly">{scanView||targetsView||batchView||datasetsView?'Operator controlled':'Read-only'}</span>
           </div>
         </header>
         <main id="main" tabIndex={-1}>
-          {scanView ? <SecurityScanWizard initialRunId={scanRunId} initialTargetId={selectedTargetId}/> : targetsView ? <TargetConfiguration initialTargetId={selectedTargetId} onSelectDataset={setSelectedTargetId}/> : datasetsView ? <DatasetLibrary initialTargetId={selectedTargetId}/> : generatorView ? <GeneratorModeWorkspace initialTargetId={selectedTargetId} onSelectTarget={setSelectedTargetId} onOpenDatasetLibrary={() => navigate('datasets')} onOpenExistingScan={(datasetId) => { if (datasetId) saveScanHandoff({ dataset_id: datasetId }); navigate('scan'); }} onOpenRunReport={(runId) => navigate(`scan/${runId}`)}/> : batchView ? <BatchProgress id={view.slice('batch/'.length)}/> : <>
+          {scanView ? <SecurityScanWizard initialRunId={scanRunId} initialWorkflowId={scanWorkflowId} initialTargetId={selectedTargetId} initialSource={generatorAlias ? 'ai_generate' : undefined} onSelectTarget={setSelectedTargetId} onNavigate={navigate}/> : targetsView ? <TargetConfiguration initialTargetId={selectedTargetId} onSelectDataset={setSelectedTargetId}/> : datasetsView ? <DatasetLibrary initialTargetId={selectedTargetId}/> : batchView ? <BatchProgress id={view.slice('batch/'.length)}/> : <>
           <div className="dataset-line">
             <span>
               Selected reporting dataset{" "}

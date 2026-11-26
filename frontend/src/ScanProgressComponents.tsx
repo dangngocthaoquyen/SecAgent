@@ -65,6 +65,12 @@ export function ProgressMetadata({ record }: { record: GenericRunRecord }) {
           <strong>{unified.isUnified ? 'Scan ID:' : 'Run ID:'}</strong>{' '}
           <code className="mono">{unified.logicalScanId}</code>
         </span>
+        {record.workflow_id && (
+          <span>
+            · <strong>Workflow ID:</strong>{' '}
+            <code className="mono">{safeLabel(record.workflow_id)}</code>
+          </span>
+        )}
         {unified.isUnified && unified.activeSessionId !== unified.logicalScanId && (
           <span>
             · <strong>Resume Session #{unified.resumeCount}:</strong>{' '}
@@ -158,15 +164,36 @@ export function ExecutionCounters({ record }: { record: GenericRunRecord }) {
   const skipped = unified.skippedCount;
   const ready = unified.readyCount;
   const remaining = Math.max(0, ready - executed);
+  const techFailureCount = Number(
+    record.unified_lineage?.evaluation_summary?.technical_failure_count ??
+      record.evaluation_summary?.technical_failure_count ??
+      vc.ERROR ??
+      0,
+  );
+  const isBinaryV2 = Boolean(
+    (record.unified_lineage?.verdict_schema_version ??
+      record.verdict_schema_version ??
+      '').startsWith('2.'),
+  );
+  const legacyInconclusive = Number(vc.INCONCLUSIVE ?? 0);
 
-  const cards = [
-    { label: 'PASS', value: Number(vc.PASS ?? 0), cls: 'ok' },
-    { label: 'FAIL', value: Number(vc.FAIL ?? 0), cls: 'fail' },
-    { label: 'INCONCLUSIVE', value: Number(vc.INCONCLUSIVE ?? 0), cls: 'warn' },
-    { label: 'ERROR', value: Number(vc.ERROR ?? 0), cls: 'err' },
-    { label: 'SKIPPED', value: skipped, cls: '' },
-    { label: 'REMAINING', value: remaining, cls: '' },
-  ] as const;
+  const cards =
+    isBinaryV2 && legacyInconclusive === 0
+      ? ([
+          { label: 'PASS', value: Number(vc.PASS ?? 0), cls: 'ok' },
+          { label: 'FAIL', value: Number(vc.FAIL ?? 0), cls: 'fail' },
+          { label: 'TECH ERRORS', value: techFailureCount, cls: techFailureCount > 0 ? 'err' : '' },
+          { label: 'SKIPPED', value: skipped, cls: '' },
+          { label: 'REMAINING', value: remaining, cls: '' },
+        ] as const)
+      : ([
+          { label: 'PASS', value: Number(vc.PASS ?? 0), cls: 'ok' },
+          { label: 'FAIL', value: Number(vc.FAIL ?? 0), cls: 'fail' },
+          { label: 'INCONCLUSIVE', value: legacyInconclusive, cls: 'warn' },
+          { label: 'ERROR', value: Number(vc.ERROR ?? 0), cls: 'err' },
+          { label: 'SKIPPED', value: skipped, cls: '' },
+          { label: 'REMAINING', value: remaining, cls: '' },
+        ] as const);
 
   return (
     <div className="cards live-counters" aria-label="Live verdict counters">
@@ -176,6 +203,55 @@ export function ExecutionCounters({ record }: { record: GenericRunRecord }) {
           <div className="v">{item.value}</div>
         </article>
       ))}
+    </div>
+  );
+}
+
+export function TechnicalDiagnosticsNotice({ record }: { record: GenericRunRecord }) {
+  const unified = resolveUnifiedDisplay(record);
+  const errored = unified.cases.filter(
+    c =>
+      c.evaluation_status === 'EXECUTION_ERROR' ||
+      c.verdict === 'ERROR' ||
+      (typeof c.http_status_code === 'number' && c.http_status_code >= 400),
+  );
+  const erroredStatuses = unified.caseStatuses.filter(
+    s =>
+      s.status === 'error' ||
+      s.verdict === 'ERROR' ||
+      (typeof s.http_status_code === 'number' && s.http_status_code >= 400),
+  );
+  const count = Math.max(errored.length, erroredStatuses.length);
+  if (count === 0) return null;
+
+  const codes = new Map<number, number>();
+  const durations: number[] = [];
+  for (const item of errored.length > 0 ? errored : erroredStatuses) {
+    if (typeof item.http_status_code === 'number') {
+      codes.set(item.http_status_code, (codes.get(item.http_status_code) ?? 0) + 1);
+    }
+    if (typeof item.duration_ms === 'number' && Number.isFinite(item.duration_ms)) {
+      durations.push(item.duration_ms);
+    }
+  }
+  const codeSummary = Array.from(codes.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([code, n]) => `HTTP ${code} (×${n})`)
+    .join(', ');
+  const avgSec =
+    durations.length > 0
+      ? `${(durations.reduce((sum, v) => sum + v, 0) / durations.length / 1000).toFixed(1)}s avg`
+      : null;
+
+  return (
+    <div className="notice warn" role="status" data-testid="technical-diagnostics-banner">
+      <strong>Technical Execution Failures Detected ({count}):</strong>{' '}
+      {codeSummary ? <code className="mono">{codeSummary}</code> : <span>Target request error</span>}
+      {avgSec ? <span> · {avgSec}</span> : null}
+      <span>
+        {' '}
+        — Technical failures are excluded from binary PASS/FAIL security counts and Judge is not invoked for failed target responses.
+      </span>
     </div>
   );
 }
@@ -376,6 +452,13 @@ export function TestcaseStatusList({ cases }: { cases: GenericCaseStatus[] }) {
                 </td>
                 <td>
                   <code className="mono">{readableStage(row.stage)}</code>
+                  {typeof row.http_status_code === 'number' && row.http_status_code >= 400 && (
+                    <small className="mono">
+                      {' '}
+                      (HTTP {row.http_status_code}
+                      {typeof row.duration_ms === 'number' ? ` · ${(row.duration_ms / 1000).toFixed(1)}s` : ''})
+                    </small>
+                  )}
                   {row.reason && row.status !== 'completed' && (
                     <small> ({safeLabel(row.reason)})</small>
                   )}

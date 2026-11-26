@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from hashlib import sha256
 import ipaddress
@@ -13,7 +13,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
-from threading import Event, RLock, Thread
+from threading import Event, RLock, Thread, local as thread_local
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -312,6 +312,54 @@ class _StaticDiagnosticCollector:
         return CollectedEvidenceOutput(evidence=[], diagnostics=list(self._diagnostics))
 
 
+class TargetExecutionConflictError(ValueError):
+    """Raised when a live execution or workflow reservation is already active for a target."""
+
+    def __init__(self, code: str, conflict: dict[str, Any]) -> None:
+        super().__init__(code)
+        self.code = code
+        self.conflict = dict(conflict)
+
+
+class LiveTargetReservationHandle:
+    """Server-owned, unforgeable in-process capability handle for live target ownership.
+
+    Never serialized to HTTP responses, never derived from public identifiers such as
+    ``workflow_id``, and never constructible from untrusted HTTP JSON payloads.
+    """
+
+    __slots__ = ("_service_id", "_target_id", "_capability_token", "_adopted_run_id", "_released")
+
+    def __init__(self, *, service_id: int, target_id: str, capability_token: str) -> None:
+        self._service_id = service_id
+        self._target_id = target_id
+        self._capability_token = capability_token
+        self._adopted_run_id: str | None = None
+        self._released: bool = False
+
+    @property
+    def target_id(self) -> str:
+        return self._target_id
+
+    @property
+    def adopted(self) -> bool:
+        return self._adopted_run_id is not None
+
+    @property
+    def adopted_run_id(self) -> str | None:
+        return self._adopted_run_id
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    def __repr__(self) -> str:
+        return f"<LiveTargetReservationHandle target_id={self._target_id!r} adopted={self.adopted}>"
+
+
+_WORKFLOW_ID_OPT_RE = re.compile(r"^gnr-[a-f0-9]{32}$")
+
+
 class GenericRunService:
     """Thread-safe service bridging Web API with `testing.generic_runner` & `ResponsePolicyStore`."""
 
@@ -347,9 +395,11 @@ class GenericRunService:
         self.application_contexts = application_contexts
         self.evidence_source_store = evidence_source_store
         self._active_target_counts: dict[str, int] = {}
+        self._live_target_reservations: dict[str, dict[str, Any]] = {}
         self._in_progress_runs: dict[str, Thread] = {}
         self._active_resumes_by_root: dict[str, str] = {}
         self._submissions_in_flight: dict[str, dict[str, Any]] = {}
+        self._internal_handoff_tls = thread_local()
         self.submission_wait_timeout: float = 30.0
         self._lock = RLock()
 
@@ -359,7 +409,7 @@ class GenericRunService:
 
     def is_active_for_target(self, target_id: str) -> bool:
         with self._lock:
-            return self._active_target_counts.get(target_id, 0) > 0
+            return self._active_target_counts.get(target_id, 0) > 0 or target_id in self._live_target_reservations
 
     def _acquire_target_run(self, target_id: str) -> None:
         with self._lock:
@@ -372,6 +422,112 @@ class GenericRunService:
                 self._active_target_counts[target_id] = remaining
             else:
                 self._active_target_counts.pop(target_id, None)
+
+    @staticmethod
+    def _public_reservation(entry: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "target_id": entry.get("target_id"),
+            "owner_kind": entry.get("owner_kind"),
+            "workflow_id": entry.get("workflow_id"),
+            "run_id": entry.get("run_id"),
+            "reserved_at": entry.get("reserved_at"),
+        }
+
+    def reserve_live_target(
+        self,
+        target_id: str,
+        *,
+        owner_kind: str = "workflow",
+        workflow_id: str | None = None,
+        run_id: str | None = None,
+    ) -> LiveTargetReservationHandle:
+        """Atomically reserve exclusive live execution ownership and return a server-owned handle."""
+        clean_tid = str(target_id or "").strip()
+        if not clean_tid:
+            raise ValueError("generic_invalid_target_id")
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cap_token = secrets.token_hex(32)
+        with self._lock:
+            existing = self._live_target_reservations.get(clean_tid)
+            if existing is not None:
+                raise TargetExecutionConflictError(
+                    "generic_target_execution_in_progress",
+                    self._public_reservation(existing),
+                )
+            handle = LiveTargetReservationHandle(
+                service_id=id(self),
+                target_id=clean_tid,
+                capability_token=cap_token,
+            )
+            entry = {
+                "target_id": clean_tid,
+                "handle": handle,
+                "capability_token": cap_token,
+                "owner_kind": owner_kind,
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+                "adopted_by_run_id": None,
+                "reserved_at": now_iso,
+            }
+            self._live_target_reservations[clean_tid] = entry
+            return handle
+
+    def release_live_target(
+        self,
+        target_id: str,
+        *,
+        handle: LiveTargetReservationHandle | None = None,
+    ) -> bool:
+        """Release a live target reservation iff the exact server-owned capability handle matches."""
+        clean_tid = str(target_id or "").strip()
+        if (
+            not clean_tid
+            or not isinstance(handle, LiveTargetReservationHandle)
+            or handle._service_id != id(self)
+        ):
+            return False
+        with self._lock:
+            existing = self._live_target_reservations.get(clean_tid)
+            if existing is None:
+                return False
+            if existing.get("handle") is not handle:
+                return False
+            if not secrets.compare_digest(
+                str(existing.get("capability_token") or ""),
+                handle._capability_token,
+            ):
+                return False
+            self._live_target_reservations.pop(clean_tid, None)
+            handle._released = True
+            return True
+
+    def get_live_target_reservation(self, target_id: str) -> dict[str, Any] | None:
+        clean_tid = str(target_id or "").strip()
+        with self._lock:
+            existing = self._live_target_reservations.get(clean_tid)
+            return self._public_reservation(existing) if existing is not None else None
+
+    def list_live_target_reservations(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [self._public_reservation(v) for v in self._live_target_reservations.values()]
+
+    @contextmanager
+    def internal_reservation_context(
+        self,
+        handle: LiveTargetReservationHandle | None,
+        *,
+        workflow_id: str | None = None,
+    ):
+        """Server-internal, thread-local context passing a verified reservation handle to start_run().
+
+        Public HTTP routes never enter this context, preventing caller-controlled adoption.
+        """
+        prev = getattr(self._internal_handoff_tls, "handoff", None)
+        self._internal_handoff_tls.handoff = (handle, workflow_id)
+        try:
+            yield
+        finally:
+            self._internal_handoff_tls.handoff = prev
 
     def judge_status(self) -> dict[str, Any]:
         if self.judge_provider is not None:
@@ -1376,6 +1532,9 @@ class GenericRunService:
             "active_evidence_source_count": active_evidence_source_count,
             "configured_evidence_source_count": configured_evidence_source_count,
             "evidence_source_diagnostics": evidence_source_diagnostics,
+            "active_target_reservation": (
+                self.get_live_target_reservation(target.id) if mode == "live" else None
+            ),
             **preview_meta,
         }
 
@@ -1663,6 +1822,8 @@ class GenericRunService:
         *,
         _continuation_meta: dict[str, Any] | None = None,
         _owns_root_lock: str | None = None,
+        _reservation_handle: LiveTargetReservationHandle | None = None,
+        _workflow_id: str | None = None,
     ) -> dict[str, Any]:
         if payload.get("authorization_confirmed") is not True:
             raise ValueError("generic_authorization_required")
@@ -1737,7 +1898,7 @@ class GenericRunService:
                     worker_to_join.join(timeout=300)
                 existing_record = self.get_run(existing_id_to_return)
                 if existing_record is not None:
-                    return existing_record
+                    return {**existing_record, "idempotent_replay": True}
                 raise ValueError("generic_submission_record_unavailable")
 
             if wait_entry is not None:
@@ -1758,13 +1919,40 @@ class GenericRunService:
                     w_thread.join(timeout=300)
                 waited_record = self.get_run(waited_id)
                 if waited_record is not None:
-                    return waited_record
+                    return {**waited_record, "idempotent_replay": True}
                 raise ValueError("generic_submission_record_unavailable")
 
         if submission_id and not in_flight_owner:
             raise ValueError("generic_submission_in_progress")
 
         tracked_ids: tuple[str, ...] = ()
+        live_reserved_handles: list[tuple[str, LiveTargetReservationHandle]] = []
+        newly_reserved_handles: list[tuple[str, LiveTargetReservationHandle]] = []
+        adopted_reserved_handles: list[tuple[str, LiveTargetReservationHandle]] = []
+        # G13-R01: Public HTTP payload fields (e.g. reservation_token / workflow_id) are NEVER
+        # trusted for reservation ownership adoption or internal workflow attribution. Only an
+        # in-process server-owned LiveTargetReservationHandle passed via keyword argument or
+        # server-internal thread-local handoff context is accepted.
+        tls_handoff = getattr(self._internal_handoff_tls, "handoff", None)
+        if _reservation_handle is None and isinstance(tls_handoff, tuple) and len(tls_handoff) == 2:
+            _reservation_handle = tls_handoff[0]
+            if _workflow_id is None:
+                _workflow_id = tls_handoff[1]
+        valid_internal_handle: LiveTargetReservationHandle | None = (
+            _reservation_handle
+            if (
+                isinstance(_reservation_handle, LiveTargetReservationHandle)
+                and _reservation_handle._service_id == id(self)
+                and not _reservation_handle._released
+            )
+            else None
+        )
+        workflow_id: str | None = (
+            _workflow_id.strip()
+            if isinstance(_workflow_id, str) and _WORKFLOW_ID_OPT_RE.fullmatch(_workflow_id.strip())
+            else None
+        )
+        run_id = uuid4().hex
         released = False
         try:
             cat_lock = getattr(self.catalog, "_lock", None)
@@ -1831,6 +2019,59 @@ class GenericRunService:
                     raise ValueError("generic_session_credential_stale")
 
                 tracked_ids = tuple(dict.fromkeys((target_id, target.id)))
+                # Atomically enforce single live execution per target_id (offline runs remain unblocked).
+                if mode == "live":
+                    now_res_iso = datetime.now(timezone.utc).isoformat()
+                    for tid in tracked_ids:
+                        existing_res = self._live_target_reservations.get(tid)
+                        if existing_res is not None:
+                            can_adopt = (
+                                valid_internal_handle is not None
+                                and existing_res.get("handle") is valid_internal_handle
+                                and secrets.compare_digest(
+                                    str(existing_res.get("capability_token") or ""),
+                                    valid_internal_handle._capability_token,
+                                )
+                                and existing_res.get("adopted_by_run_id") is None
+                                and valid_internal_handle._adopted_run_id is None
+                            )
+                            if can_adopt:
+                                adopted_reserved_handles.append((tid, valid_internal_handle))
+                            else:
+                                for rollback_tid, rollback_handle in newly_reserved_handles:
+                                    self.release_live_target(rollback_tid, handle=rollback_handle)
+                                newly_reserved_handles.clear()
+                                raise TargetExecutionConflictError(
+                                    "generic_target_execution_in_progress",
+                                    self._public_reservation(existing_res),
+                                )
+                        else:
+                            fresh_cap = secrets.token_hex(32)
+                            fresh_handle = LiveTargetReservationHandle(
+                                service_id=id(self),
+                                target_id=tid,
+                                capability_token=fresh_cap,
+                            )
+                            fresh_handle._adopted_run_id = run_id
+                            self._live_target_reservations[tid] = {
+                                "target_id": tid,
+                                "handle": fresh_handle,
+                                "capability_token": fresh_cap,
+                                "owner_kind": "generic_run",
+                                "workflow_id": workflow_id,
+                                "run_id": run_id,
+                                "adopted_by_run_id": run_id,
+                                "reserved_at": now_res_iso,
+                            }
+                            newly_reserved_handles.append((tid, fresh_handle))
+                    for tid, adopted_handle in adopted_reserved_handles:
+                        existing_res = self._live_target_reservations[tid]
+                        existing_res["run_id"] = run_id
+                        existing_res["adopted_by_run_id"] = run_id
+                        adopted_handle._adopted_run_id = run_id
+                        if workflow_id is not None:
+                            existing_res["workflow_id"] = workflow_id
+                    live_reserved_handles = list(newly_reserved_handles) + list(adopted_reserved_handles)
                 for tid in tracked_ids:
                     self._acquire_target_run(tid)
 
@@ -1873,7 +2114,6 @@ class GenericRunService:
                 else:
                     raise ValueError("judge_provider_unavailable")
 
-            run_id = uuid4().hex
             run_dir = self.runs_root / run_id
             allowed_endpoints: list[str] = []
             if target.interface.config.get("url"):
@@ -1993,6 +2233,7 @@ class GenericRunService:
                 "verdict_schema_version": VERDICT_SCHEMA_VERSION,
                 "verdict_policy_version": VERDICT_POLICY_VERSION,
                 "generic_run_id": run_id,
+                "workflow_id": workflow_id,
                 "submission_id": submission_id,
                 "status": "running",
                 "started_at": started_at,
@@ -2211,6 +2452,18 @@ class GenericRunService:
                         "evidence_level": ev_level,
                         "provenance_tiers": item["provenance_tiers"],
                         "execution_status": exec_status,
+                        "http_status_code": (
+                            int(exec_block["status_code"])
+                            if isinstance(exec_block.get("status_code"), int)
+                            and not isinstance(exec_block.get("status_code"), bool)
+                            else None
+                        ),
+                        "duration_ms": (
+                            round(float(exec_block["duration_ms"]), 1)
+                            if isinstance(exec_block.get("duration_ms"), (int, float))
+                            and not isinstance(exec_block.get("duration_ms"), bool)
+                            else None
+                        ),
                         "collector_diagnostics": item["collector_diagnostics"],
                         "evidence": obs_block.get("evidence", []),
                         "research_provenance": ev_block.get("research_provenance"),
@@ -2253,6 +2506,8 @@ class GenericRunService:
                                 row["evaluation_status"] = case_eval_status
                                 row["evaluation_reason_code"] = case_eval_reason
                                 row["reason"] = item["reason"]
+                                row["http_status_code"] = enriched_case.get("http_status_code")
+                                row["duration_ms"] = enriched_case.get("duration_ms")
                                 row["evidence_level"] = ev_level
                                 row["run_id"] = item["run_id"]
                                 break
@@ -2363,6 +2618,8 @@ class GenericRunService:
                         self._in_progress_runs.pop(run_id, None)
                         if _owns_root_lock and self._active_resumes_by_root.get(_owns_root_lock) in {run_id, "reserving"}:
                             self._active_resumes_by_root.pop(_owns_root_lock, None)
+                    for tid, res_handle in live_reserved_handles:
+                        self.release_live_target(tid, handle=res_handle)
                     for tid in tracked_ids:
                         self._release_target_run(tid)
 
@@ -2370,8 +2627,26 @@ class GenericRunService:
                 worker_thread = Thread(target=_execute_worker, name=f"secagent-generic-run-{run_id[:8]}", daemon=True)
                 with self._lock:
                     self._in_progress_runs[run_id] = worker_thread
-                released = True
-                worker_thread.start()
+                try:
+                    # G13-R04: Only mark ownership handed off AFTER worker_thread.start() succeeds.
+                    worker_thread.start()
+                    released = True
+                except Exception as start_exc:
+                    fail_iso = datetime.now(timezone.utc).isoformat()
+                    with self._lock:
+                        self._in_progress_runs.pop(run_id, None)
+                        record["status"] = "failed"
+                        record["completed_at"] = fail_iso
+                        record["current_stage"] = "failed"
+                        record["error_code"] = "runner_worker_startup_failed"
+                        record["events"] = (
+                            record["events"] + [{"at": fail_iso, "stage": "failed", "case_id": None}]
+                        )[-120:]
+                    try:
+                        self._write_run_record(run_dir, record)
+                    except OSError:
+                        pass
+                    raise ValueError("runner_worker_startup_failed") from start_exc
                 with self._lock:
                     snap = dict(record)
                 if isinstance(_continuation_meta, dict):
@@ -2399,6 +2674,18 @@ class GenericRunService:
                 if _owns_root_lock:
                     with self._lock:
                         self._active_resumes_by_root.pop(_owns_root_lock, None)
+                with self._lock:
+                    for tid, res_handle in newly_reserved_handles:
+                        self.release_live_target(tid, handle=res_handle)
+                    for tid, adopted_handle in adopted_reserved_handles:
+                        existing_res = self._live_target_reservations.get(tid)
+                        if existing_res is not None and existing_res.get("handle") is adopted_handle:
+                            if existing_res.get("run_id") == run_id:
+                                existing_res["run_id"] = None
+                            if existing_res.get("adopted_by_run_id") == run_id:
+                                existing_res["adopted_by_run_id"] = None
+                        if adopted_handle._adopted_run_id == run_id:
+                            adopted_handle._adopted_run_id = None
                 for tid in tracked_ids:
                     self._release_target_run(tid)
 
@@ -4055,6 +4342,7 @@ class GenericRunService:
                     asi_codes.add(_ASI_CODE_BY_POLICY_CATEGORY.get(code_str, code_str))
             summaries.append({
                 "generic_run_id": rec.get("generic_run_id") or entry.name,
+                "workflow_id": rec.get("workflow_id"),
                 "status": rec.get("status", "completed"),
                 "started_at": rec.get("started_at"),
                 "completed_at": rec.get("completed_at"),
@@ -4175,13 +4463,25 @@ def register_generic_runner_routes(app, ctx) -> None:
             record = service.start_run(payload)
             status_code = 202 if payload.get("async_execution") is True and record.get("status") in {"preparing", "running"} else 201
             return jsonify(record), status_code
+        except TargetExecutionConflictError as exc:
+            return jsonify(
+                workflow_schema_version="1.0.0",
+                error={
+                    "code": exc.code,
+                    "message": "Another live security test is already active for this Target. Wait for it to finish or open the active progress view.",
+                    "conflict": exc.conflict,
+                },
+            ), 409
         except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+            if str(exc) == "runner_worker_startup_failed":
+                return fail("runner_worker_startup_failed", 500)
             code = str(exc) if (str(exc) == "credential_unavailable" or str(exc).startswith(("generic_", "policy_", "judge_", "dataset_", "unmapped_", "application_context_", "unverified_", "unreviewed_", "invalid_evaluation_rule_"))) else "generic_run_rejected"
             status = 409 if code in {
                 "credential_unavailable",
                 "generic_session_credential_stale",
                 "generic_session_credential_authorization_required",
                 "generic_target_revision_stale",
+                "generic_target_execution_in_progress",
                 "policy_review_required",
                 "policy_category_mismatch",
                 "judge_provider_unavailable",
@@ -4209,6 +4509,8 @@ def register_generic_runner_routes(app, ctx) -> None:
             return jsonify(service.preview_resume(run_id, payload))
         except (ValidationError, ValueError, json.JSONDecodeError) as exc:
             code = str(exc)
+            if code == "runner_worker_startup_failed":
+                return fail(code, 500)
             if code == "generic_run_not_found":
                 return fail(code, 404)
             if code.startswith(("generic_resume_", "resume_")):
@@ -4225,8 +4527,19 @@ def register_generic_runner_routes(app, ctx) -> None:
             record = service.start_resume(run_id, payload)
             status_code = 202 if payload.get("async_execution") is True and record.get("status") in {"preparing", "running"} else 201
             return jsonify(record), status_code
+        except TargetExecutionConflictError as exc:
+            return jsonify(
+                workflow_schema_version="1.0.0",
+                error={
+                    "code": exc.code,
+                    "message": "Another live security test is already active for this Target. Wait for it to finish before resuming.",
+                    "conflict": exc.conflict,
+                },
+            ), 409
         except (ValidationError, ValueError, json.JSONDecodeError) as exc:
             code = str(exc)
+            if code == "runner_worker_startup_failed":
+                return fail(code, 500)
             if code == "generic_run_not_found":
                 return fail(code, 404)
             known = (

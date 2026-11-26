@@ -117,8 +117,8 @@ describe('SecurityScanWizard (3-Step Dataset-First Scan)',()=>{
 
   render(<SecurityScanWizard/>);
 
-  // Step 1: Select Saved Target and Select Imported Dataset
-  expect(await screen.findByRole('heading',{name:'1 · Select Target and Dataset'})).toBeInTheDocument();
+  // Step 1: Select Saved Target and Test Source
+  expect(await screen.findByRole('heading',{name:'1 · Select Target and Test Source'})).toBeInTheDocument();
   expect(screen.queryByLabelText(/Target Endpoint URL/i)).not.toBeInTheDocument();
   expect(screen.queryByLabelText(/Policy ID/i)).not.toBeInTheDocument();
 
@@ -853,7 +853,7 @@ describe('SecurityScanWizard (3-Step Dataset-First Scan)',()=>{
 
   // 6. Clicking New Scan resets location.hash to #scan and clears sessionStorage so F5 does not reopen the old Run
   fireEvent.click(screen.getByRole('button',{name:'New Scan'}));
-  expect(await screen.findByRole('heading',{name:'1 · Select Target and Dataset'})).toBeInTheDocument();
+  expect(await screen.findByRole('heading',{name:'1 · Select Target and Test Source'})).toBeInTheDocument();
   expect(window.location.hash).toBe('#scan');
   expect(sessionStorage.getItem('secagent_active_generic_run_id')).toBeNull();
   expect(sessionStorage.getItem('secagent_pending_generic_submission')).toBeNull();

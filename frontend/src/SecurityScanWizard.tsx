@@ -1,4 +1,6 @@
-import {useEffect,useRef,useState} from 'react';
+import {useCallback,useEffect,useMemo,useRef,useState,type ChangeEvent} from 'react';
+import GenerateAndRunPrepPanel from './GenerateAndRunPrepPanel';
+import GeneratorOnlyPanel from './GeneratorOnlyPanel';
 import ScanPreviewPanel from './ScanPreviewPanel';
 import ScanResumePanel from './ScanResumePanel';
 import {
@@ -7,9 +9,29 @@ import {
  ExecutionCounters,
  ProgressMetadata,
  ScanProgressBar,
+ TechnicalDiagnosticsNotice,
  TestcaseStatusList,
 } from './ScanProgressComponents';
 import ScanResultsView from './ScanResultsView';
+import {
+ clearActiveWorkflowId,
+ createDefaultGeneratorConfig,
+ extractActiveCounts,
+ generatorApi,
+ GeneratorApiError,
+ LIVE_GENERATE_AND_RUN_STAGES,
+ loadActiveWorkflowId,
+ saveActiveWorkflowId,
+ SUPPORTED_ASI_CODES,
+ type ActiveTargetReservation,
+ type GenerateAndRunSnapshot,
+ type GeneratorConfigState,
+ type GeneratorJudgeStatus,
+ type GeneratorProviderStatus,
+ type PreviewSaveRecord,
+ type StageStatus,
+ type TargetReadinessReport,
+} from './generatorApi';
 import { resolveUnifiedDisplay } from './scanLineage';
 import {
  clearPendingScanSubmission,
@@ -31,8 +53,31 @@ import {
 } from './testingApi';
 
 type ScanStep = 1 | 2 | 3;
+type TestSource = 'ai_generate' | 'existing_dataset' | 'import_dataset';
 
 const TERMINAL_RUN_STATUSES=new Set(['completed','failed','interrupted','cancelled']);
+const TERMINAL_WORKFLOW_STATUSES=new Set(['completed','failed','blocked','partial_stopped','interrupted']);
+const WORKFLOW_ID_RE=/^gnr-[a-f0-9]{32}$/;
+
+function buildReadinessFingerprint(cfg:GeneratorConfigState):string{
+ const activeAsi:string[]=[];
+ const scopes:Record<string,string>={};
+ const policies:Record<string,string>={};
+ for(const code of SUPPORTED_ASI_CODES){
+  if(!cfg.selectedAsi[code])continue;
+  activeAsi.push(code);
+  if(cfg.requestedScopes[code])scopes[code]=cfg.requestedScopes[code]!;
+  if(cfg.policyIdsByAsi[code])policies[code]=cfg.policyIdsByAsi[code]!;
+ }
+ return JSON.stringify({targetId:cfg.targetId,activeAsi,scopes,policies});
+}
+
+function stageChipColor(status:StageStatus):string{
+ if(status==='completed')return 'var(--ok, #0f766e)';
+ if(status==='running')return 'var(--teal, #0d9488)';
+ if(status==='failed'||status==='blocked')return 'var(--fail, #b91c1c)';
+ return 'var(--muted, #64748b)';
+}
 
 function randomHex32():string{
  const bytes=new Uint8Array(16);
@@ -46,16 +91,28 @@ function randomHex32():string{
 
 export default function SecurityScanWizard({
  initialRunId,
+ initialWorkflowId,
  initialTargetId,
  initialDatasetId,
+ initialSource,
+ onSelectTarget,
+ onNavigate,
  maxPollRetries=5,
 }:{
  initialRunId?:string;
+ initialWorkflowId?:string;
  initialTargetId?:string;
  initialDatasetId?:string;
+ initialSource?:TestSource;
+ onSelectTarget?:(targetId:string)=>void;
+ onNavigate?:(next:string)=>void;
  maxPollRetries?:number;
 }={}){
- const [step,setStep]=useState<ScanStep>(initialRunId?3:1);
+ const [step,setStep]=useState<ScanStep>(initialRunId||initialWorkflowId?3:1);
+ const [testSource,setTestSource]=useState<TestSource>(
+  initialSource??(initialDatasetId?'existing_dataset':'existing_dataset'),
+ );
+ const [aiSubMode,setAiSubMode]=useState<'generate_and_run'|'generate_only'>('generate_and_run');
  const [nonce,setNonce]=useState('');
  const [secret,setSecret]=useState(()=>getEphemeralOperatorSecret());
  const [unlocked,setUnlocked]=useState(()=>Boolean(getEphemeralOperatorSecret()));
@@ -66,10 +123,39 @@ export default function SecurityScanWizard({
  const [targets,setTargets]=useState<TargetPreset[]>([]);
  const [datasets,setDatasets]=useState<DatasetSummary[]>([]);
  const [savedRuns,setSavedRuns]=useState<GenericRunSummary[]>([]);
+ const [activeWorkflows,setActiveWorkflows]=useState<GenerateAndRunSnapshot[]>([]);
+ const [activeReservations,setActiveReservations]=useState<ActiveTargetReservation[]>([]);
  const [selectedTargetId,setSelectedTargetId]=useState(initialTargetId||'');
  const [selectedDatasetId,setSelectedDatasetId]=useState(initialDatasetId||'');
  const [datasetDetail,setDatasetDetail]=useState<DatasetEnvelope|null>(null);
  const [pendingTestcaseIds,setPendingTestcaseIds]=useState<string[]|null>(null);
+
+ // Source #1 (AI Generate) state
+ const [genConfig,setGenConfig]=useState<GeneratorConfigState>(()=>createDefaultGeneratorConfig(initialTargetId||''));
+ const [genProviderStatus,setGenProviderStatus]=useState<GeneratorProviderStatus|null>(null);
+ const [genJudgeStatus,setGenJudgeStatus]=useState<GeneratorJudgeStatus|null>(null);
+ const [genAndRunAvailable,setGenAndRunAvailable]=useState(false);
+ const [genProviderError,setGenProviderError]=useState('');
+ const [genReadiness,setGenReadiness]=useState<TargetReadinessReport|null>(null);
+ const [genReadinessLoading,setGenReadinessLoading]=useState(false);
+ const [genReadinessError,setGenReadinessError]=useState('');
+ const genReadinessSeqRef=useRef(0);
+ const genReadinessAbortRef=useRef<AbortController|null>(null);
+ const genReadinessKey=useMemo(()=>buildReadinessFingerprint(genConfig),[genConfig]);
+
+ // Source #3 (Inline Import Testcases) state
+ const [importFile,setImportFile]=useState<File|null>(null);
+ const [importPreview,setImportPreview]=useState<DatasetEnvelope|null>(null);
+ const [importBusy,setImportBusy]=useState(false);
+ const [importError,setImportError]=useState('');
+ const [importNotice,setImportNotice]=useState('');
+ const importInputRef=useRef<HTMLInputElement|null>(null);
+
+ // Unified Workflow Progress state (Generate & Run -> Shared ScanProgressComponents -> ScanResultsView)
+ const [activeWorkflowId,setActiveWorkflowId]=useState<string>(initialWorkflowId||'');
+ const [workflowSnapshot,setWorkflowSnapshot]=useState<GenerateAndRunSnapshot|null>(null);
+ const [rerunBusy,setRerunBusy]=useState(false);
+ const prevInitialWorkflowId=useRef<string|undefined>(initialWorkflowId);
 
  const [scanMode,setScanMode]=useState<'live'|'offline'>('live');
  const [useJudge,setUseJudge]=useState(true);
@@ -124,6 +210,7 @@ export default function SecurityScanWizard({
   if(handoff){
    if(handoff.dataset_id)setSelectedDatasetId(handoff.dataset_id);
    if(handoff.target_id)setSelectedTargetId(handoff.target_id);
+   if(handoff.source)setTestSource(handoff.source);
    if(Array.isArray(handoff.testcase_ids)&&handoff.testcase_ids.length>0){
     setPendingTestcaseIds(handoff.testcase_ids);
    }
@@ -137,7 +224,7 @@ export default function SecurityScanWizard({
    setScanMode(pendingSub.mode);
    setUseJudge(pendingSub.use_judge);
   }
-  if(!initialRunId){
+  if(!initialRunId&&!initialWorkflowId){
    try{
     const persistedRun=sessionStorage.getItem('secagent_active_generic_run_id');
     if(persistedRun&&/^[a-f0-9]{32}$/.test(persistedRun)){
@@ -145,19 +232,41 @@ export default function SecurityScanWizard({
      setStep(3);
      return;
     }
+    const persistedWf=loadActiveWorkflowId();
+    if(persistedWf&&WORKFLOW_ID_RE.test(persistedWf)){
+     setActiveWorkflowId(persistedWf);
+     setStep(3);
+     return;
+    }
    }catch{}
   }
- },[initialRunId]);
+ },[initialRunId,initialWorkflowId]);
+
+ useEffect(()=>{
+  if(initialSource){
+   setTestSource(initialSource);
+  }
+ },[initialSource]);
+
+ useEffect(()=>{
+  if(initialWorkflowId&&WORKFLOW_ID_RE.test(initialWorkflowId)){
+   setActiveWorkflowId(initialWorkflowId);
+   setStep(3);
+  }else if(prevInitialWorkflowId.current&&!initialWorkflowId&&!initialRunId){
+   resetToNewScan();
+  }
+  prevInitialWorkflowId.current=initialWorkflowId;
+ },[initialWorkflowId,initialRunId]);
 
  useEffect(()=>{
   if(initialRunId&&/^[a-f0-9]{32}$/.test(initialRunId)){
    setActiveRunId(initialRunId);
    setStep(3);
-  }else if(prevInitialRunId.current&&!initialRunId){
+  }else if(prevInitialRunId.current&&!initialRunId&&!initialWorkflowId){
    resetToNewScan();
   }
   prevInitialRunId.current=initialRunId;
- },[initialRunId]);
+ },[initialRunId,initialWorkflowId]);
 
  useEffect(()=>{
   const ctrl=new AbortController();
@@ -189,7 +298,139 @@ export default function SecurityScanWizard({
   testingApi.listGenericRuns(secret,nonce)
    .then(runs=>setSavedRuns(runs))
    .catch(()=>{});
+  if(typeof generatorApi.listGenerateAndRunWorkflows==='function'){
+   generatorApi.listGenerateAndRunWorkflows(nonce,secret)
+    .then(res=>{
+     setActiveWorkflows(res.workflows??[]);
+     setActiveReservations(res.active_reservations??[]);
+    })
+    .catch(()=>{});
+  }
  },[nonce,localSingleUser,unlocked,secret]);
+
+ // Sync top Target Agent selection into AI Generator config
+ useEffect(()=>{
+  if(!selectedTargetId||selectedTargetId==='generic-stored-target')return;
+  setGenConfig(prev=>prev.targetId===selectedTargetId?prev:{...prev,targetId:selectedTargetId,requestedScopes:{},policyIdsByAsi:{}});
+ },[selectedTargetId]);
+
+ // Invalidate stale AI readiness when config changes
+ useEffect(()=>{
+  genReadinessAbortRef.current?.abort();
+  genReadinessAbortRef.current=null;
+  genReadinessSeqRef.current+=1;
+  setGenReadiness(null);
+  setGenReadinessError('');
+  setGenReadinessLoading(false);
+  return ()=>{genReadinessAbortRef.current?.abort();};
+ },[genReadinessKey]);
+
+ // Lazy-load Generator status ONLY when AI Generate source is active (Existing Dataset never calls Generator)
+ useEffect(()=>{
+  if(testSource!=='ai_generate'||!nonce||!(localSingleUser||unlocked))return;
+  const ctrl=new AbortController();
+  setGenProviderError('');
+  generatorApi.getStatus(nonce,secret,ctrl.signal)
+   .then(res=>{
+    if(ctrl.signal.aborted)return;
+    setGenProviderStatus(res.provider);
+    setGenJudgeStatus(res.judge??null);
+    setGenAndRunAvailable(res.generate_and_run_available===true);
+   })
+   .catch(err=>{
+    if(ctrl.signal.aborted)return;
+    setGenAndRunAvailable(false);
+    setGenJudgeStatus(null);
+    setGenProviderError(
+     err instanceof GeneratorApiError
+      ?`${err.code}: ${err.message}`
+      :err instanceof Error
+       ?err.message
+       :'Generator status unavailable.',
+    );
+   });
+  return ()=>ctrl.abort();
+ },[testSource,nonce,secret,localSingleUser,unlocked]);
+
+ // Poll active Generate & Run workflow (#scan/wf/<workflowId>) and seamlessly bind run_id into shared ScanProgressComponents!
+ useEffect(()=>{
+  if(!activeWorkflowId||!WORKFLOW_ID_RE.test(activeWorkflowId)||!nonce||!(localSingleUser||unlocked))return;
+  if(workflowSnapshot&&workflowSnapshot.workflow_id===activeWorkflowId&&TERMINAL_WORKFLOW_STATUSES.has(workflowSnapshot.status))return;
+  let timer:ReturnType<typeof setTimeout>|undefined;
+  let cancelled=false;
+
+  async function refreshWorkflow(){
+   if(cancelled)return;
+   try{
+    const wf=await generatorApi.getGenerateAndRunStatus(activeWorkflowId,nonce,secret);
+    if(cancelled)return;
+    setWorkflowSnapshot(wf);
+    setStep(3);
+    setError('');
+    if(wf.run_id&&/^[a-f0-9]{32}$/.test(wf.run_id)){
+     setActiveRunId(curr=>curr===wf.run_id?curr:wf.run_id!);
+    }
+    if(TERMINAL_WORKFLOW_STATUSES.has(wf.status)){
+     clearActiveWorkflowId();
+     testingApi.listDatasets(secret,nonce).then(setDatasets).catch(()=>{});
+     testingApi.listGenericRuns(secret,nonce).then(setSavedRuns).catch(()=>{});
+     if(typeof generatorApi.listGenerateAndRunWorkflows==='function'){
+      generatorApi.listGenerateAndRunWorkflows(nonce,secret)
+       .then(res=>{setActiveWorkflows(res.workflows??[]);setActiveReservations(res.active_reservations??[]);})
+       .catch(()=>{});
+     }
+    }else{
+     timer=setTimeout(refreshWorkflow,450);
+    }
+   }catch(e){
+    if(!cancelled){
+     setError(e instanceof Error?e.message:`Failed to load Generate & Run workflow ${activeWorkflowId}.`);
+    }
+   }
+  }
+
+  void refreshWorkflow();
+  return ()=>{
+   cancelled=true;
+   if(timer)clearTimeout(timer);
+  };
+ },[activeWorkflowId,nonce,secret,localSingleUser,unlocked,workflowSnapshot?.workflow_id,workflowSnapshot?.status]);
+
+ const handleCheckGenReadiness=useCallback(()=>{
+  if(!genConfig.targetId||!nonce)return;
+  genReadinessAbortRef.current?.abort();
+  const ctrl=new AbortController();
+  genReadinessAbortRef.current=ctrl;
+  const seq=++genReadinessSeqRef.current;
+  const requestedTargetId=genConfig.targetId;
+  const {selectedList}=extractActiveCounts(genConfig);
+  setGenReadinessLoading(true);
+  setGenReadinessError('');
+  generatorApi.checkReadiness({
+   target_id:requestedTargetId,
+   selected_asi:selectedList.length>0?selectedList:undefined,
+   requested_scopes:Object.keys(genConfig.requestedScopes).length>0?genConfig.requestedScopes:undefined,
+   policy_ids_by_asi:Object.keys(genConfig.policyIdsByAsi).length>0?genConfig.policyIdsByAsi:undefined,
+  },nonce,secret,ctrl.signal)
+   .then(report=>{
+    if(ctrl.signal.aborted||genReadinessSeqRef.current!==seq||report.target_id!==requestedTargetId)return;
+    setGenReadiness(report);
+   })
+   .catch(err=>{
+    if(ctrl.signal.aborted||genReadinessSeqRef.current!==seq)return;
+    setGenReadiness(null);
+    setGenReadinessError(
+     err instanceof GeneratorApiError
+      ?`${err.code}: ${err.message}`
+      :err instanceof Error
+       ?err.message
+       :'Failed to check context readiness.',
+    );
+   })
+   .finally(()=>{
+    if(genReadinessSeqRef.current===seq)setGenReadinessLoading(false);
+   });
+ },[genConfig,nonce,secret]);
 
  useEffect(()=>{
   if(!nonce||!(localSingleUser||unlocked)||!selectedDatasetId){
@@ -404,6 +645,7 @@ export default function SecurityScanWizard({
    setSubmissionVerifyNote('');
   }
   try{sessionStorage.removeItem('secagent_active_generic_run_id');}catch{}
+  clearActiveWorkflowId();
   try{
    location.hash='#scan';
    window.history.replaceState(null,'','#scan');
@@ -414,8 +656,144 @@ export default function SecurityScanWizard({
   setError('');
   setRunRecord(null);
   setActiveRunId('');
+  setActiveWorkflowId('');
+  setWorkflowSnapshot(null);
   setPreview(null);
   setStep(1);
+ }
+
+ function openActiveExecution(wfId?:string|null,runId?:string|null){
+  resetResumeState();
+  setError('');
+  if(wfId&&WORKFLOW_ID_RE.test(wfId)){
+   setWorkflowSnapshot(null);
+   setActiveWorkflowId(wfId);
+   if(runId&&/^[a-f0-9]{32}$/.test(runId)){
+    setRunRecord(null);
+    setActiveRunId(runId);
+   }else{
+    setRunRecord(null);
+    setActiveRunId('');
+   }
+   setStep(3);
+   try{
+    location.hash=`#scan/wf/${wfId}`;
+    window.history.replaceState(null,'',`#scan/wf/${wfId}`);
+   }catch{}
+   return;
+  }
+  if(runId&&/^[a-f0-9]{32}$/.test(runId)){
+   void openExistingRun(runId);
+  }
+ }
+
+ function handleWorkflowStarted(wf:GenerateAndRunSnapshot){
+  resetResumeState();
+  setError('');
+  setWorkflowSnapshot(wf);
+  setActiveWorkflowId(wf.workflow_id);
+  if(!TERMINAL_WORKFLOW_STATUSES.has(wf.status)){
+   saveActiveWorkflowId(wf.workflow_id);
+  }
+  if(wf.run_id&&/^[a-f0-9]{32}$/.test(wf.run_id)){
+   setActiveRunId(wf.run_id);
+  }else{
+   setRunRecord(null);
+   setActiveRunId('');
+  }
+  setStep(3);
+  try{
+   location.hash=`#scan/wf/${wf.workflow_id}`;
+   window.history.replaceState(null,'',`#scan/wf/${wf.workflow_id}`);
+  }catch{}
+ }
+
+ async function handleRerunWorkflowSavedDataset(){
+  const wfId=workflowSnapshot?.workflow_id||runRecord?.workflow_id;
+  if(!wfId||!nonce||rerunBusy)return;
+  setRerunBusy(true);
+  setError('');
+  try{
+   const res=await generatorApi.rerunGenerateAndRun(
+    wfId,
+    {
+     authorization_confirmed:true,
+     evaluation_mode:runRecord?.use_judge?'hybrid':'rule_only',
+     submission_id:randomHex32(),
+     async_execution:true,
+    },
+    nonce,
+    secret,
+   );
+   setWorkflowSnapshot(res.workflow);
+   setActiveWorkflowId(res.workflow.workflow_id);
+   saveActiveWorkflowId(res.workflow.workflow_id);
+   setRunRecord(null);
+   setActiveRunId(res.new_run_id);
+   setStep(3);
+   try{
+    location.hash=`#scan/wf/${res.workflow.workflow_id}`;
+    window.history.replaceState(null,'',`#scan/wf/${res.workflow.workflow_id}`);
+   }catch{}
+  }catch(e){
+   setError(e instanceof Error?e.message:'Failed to rerun saved dataset.');
+  }finally{
+   setRerunBusy(false);
+  }
+ }
+
+ async function handleInlineImportFile(e:ChangeEvent<HTMLInputElement>){
+  const file=e.target.files?.[0];
+  if(!file||!nonce)return;
+  setImportError('');
+  setImportNotice('');
+  setImportFile(null);
+  setImportPreview(null);
+  setImportBusy(true);
+  try{
+   if(file.size>5*1024*1024)throw new Error('Dataset file exceeds the 5 MB limit.');
+   const validated=await testingApi.validateDataset(file,file.name,secret,nonce);
+   setImportFile(file);
+   setImportPreview(validated);
+  }catch(err){
+   setImportError(err instanceof Error?err.message:'Invalid dataset file.');
+  }finally{
+   setImportBusy(false);
+  }
+ }
+
+ async function handleConfirmInlineImport(){
+  if(!importFile||!importPreview||!nonce||importBusy)return;
+  setImportBusy(true);
+  setImportError('');
+  try{
+   const imported=await testingApi.importDataset(importFile,importFile.name,secret,nonce);
+   const refreshed=await testingApi.listDatasets(secret,nonce).catch(()=>datasets);
+   setDatasets(refreshed);
+   setSelectedDatasetId(imported.dataset.dataset_id);
+   setDatasetDetail(imported.dataset);
+   setSelectedCaseIds(imported.dataset.testcases.map(tc=>tc.testcase_id));
+   setImportFile(null);
+   setImportPreview(null);
+   setImportNotice(`Imported "${imported.dataset.name}" (${imported.dataset.total_testcases} testcases). Ready for Scan Preview.`);
+   setTestSource('existing_dataset');
+  }catch(err){
+   setImportError(err instanceof Error?err.message:'Failed to import dataset.');
+  }finally{
+   setImportBusy(false);
+  }
+ }
+
+ function handleInlineDatasetSaved(rec:PreviewSaveRecord){
+  setImportNotice(`Saved AI-generated dataset "${rec.dataset_name}" (${rec.saved_count} testcases) to Dataset Library.`);
+  if(nonce){
+   testingApi.listDatasets(secret,nonce)
+    .then(rows=>{
+     setDatasets(rows);
+     setSelectedDatasetId(rec.dataset_id);
+    })
+    .catch(()=>{});
+  }
  }
 
  async function loadPreview(modeOverride?:'live'|'offline',judgeOverride?:boolean,caseIdsOverride?:string[]){
@@ -502,7 +880,8 @@ export default function SecurityScanWizard({
     errMsg.includes('[application_context_stale]')||
     errMsg.includes('[unverified_discovery_metadata_rejected]')||
     errMsg.includes('[generic_no_executable_cases]')||
-    errMsg.includes('[generic_submission_conflict]')
+    errMsg.includes('[generic_submission_conflict]')||
+    errMsg.includes('[generic_target_execution_in_progress]')
    ){
     clearPendingScanSubmission();
     updatePendingSubmission(null);
@@ -686,22 +1065,65 @@ export default function SecurityScanWizard({
  }
 
  const canOperatorAct=localSingleUser||unlocked;
+ const isRunningWorkflow=Boolean(workflowSnapshot&&!TERMINAL_WORKFLOW_STATUSES.has(workflowSnapshot.status));
  const isRunningRecord=Boolean(runRecord&&(!TERMINAL_RUN_STATUSES.has(runRecord.status??'completed')||Boolean(runRecord.lineage_summary?.active_lineage_run_id)));
+ const isAnyActiveInStep3=isRunningRecord||isRunningWorkflow;
  const hasUnresolvedSubmission=Boolean(pendingSubmission);
  const isSubmissionLocked=busy||hasUnresolvedSubmission;
+
+ // Active live-target reservation for selected target (from Generate & Run or GenericRunService)
+ const activeTargetReservation:ActiveTargetReservation|null=useMemo(()=>{
+  if(!selectedTargetId||selectedTargetId==='generic-stored-target')return null;
+  const fromRes=activeReservations.find(r=>r.target_id===selectedTargetId);
+  if(fromRes)return fromRes;
+  const fromWf=activeWorkflows.find(w=>w.target_id===selectedTargetId&&!TERMINAL_WORKFLOW_STATUSES.has(w.status));
+  if(fromWf){
+   return {
+    target_id:fromWf.target_id,
+    owner_kind:'generate_and_run',
+    workflow_id:fromWf.workflow_id,
+    run_id:fromWf.run_id,
+    reserved_at:fromWf.created_at,
+   };
+  }
+  const fromRun=savedRuns.find(r=>r.target_id===selectedTargetId&&r.mode==='live'&&!TERMINAL_RUN_STATUSES.has(r.status));
+  if(fromRun){
+   return {
+    target_id:fromRun.target_id,
+    owner_kind:'generic_run',
+    workflow_id:fromRun.workflow_id??null,
+    run_id:fromRun.generic_run_id,
+    reserved_at:fromRun.started_at??'',
+   };
+  }
+  return null;
+ },[selectedTargetId,activeReservations,activeWorkflows,savedRuns]);
+
+ const anyActiveExecution=useMemo(()=>{
+  if(activeReservations.length>0)return activeReservations[0];
+  const rw=activeWorkflows.find(w=>!TERMINAL_WORKFLOW_STATUSES.has(w.status));
+  if(rw){
+   return {target_id:rw.target_id,owner_kind:'generate_and_run',workflow_id:rw.workflow_id,run_id:rw.run_id};
+  }
+  const rr=savedRuns.find(r=>!TERMINAL_RUN_STATUSES.has(r.status));
+  if(rr){
+   return {target_id:rr.target_id,owner_kind:'generic_run',workflow_id:rr.workflow_id??null,run_id:rr.generic_run_id};
+  }
+  return null;
+ },[activeReservations,activeWorkflows,savedRuns]);
 
  return (
   <div className="detail-page scan-wizard-page">
    <div className="page-title">
     <div>
-     <span className="eyebrow">SECURITY SCAN · DATASET-FIRST WORKFLOW</span>
+     <span className="eyebrow">SECURITY SCAN · UNIFIED TESTING WORKFLOW</span>
      <h1>New Security Scan</h1>
-     <p>Select a configured Target and an imported Dataset, inspect the automated readiness preview, and monitor live execution progress through final results.</p>
+     <p>Select a configured Target, choose a test source (AI Generate, Existing Dataset, or Import), and monitor live execution progress through final results.</p>
     </div>
     <div className="scan-stepper" role="navigation" aria-label="Scan steps">
-     <span className={`step-badge ${step===1?'active':step>1?'done':''}`}>1 · Select Target &amp; Dataset</span>
+     <span className={`step-badge ${step===1?'active':step>1?'done':''}`}>1 · Target &amp; Test Source</span>
      <span className={`step-badge ${step===2?'active':step>2?'done':''}`}>2 · Scan Preview</span>
-     <span className={`step-badge ${step===3?'active':''}`}>3 · {isRunningRecord?'Live Progress':'Run & Results'}</span>
+     <span className={`step-badge ${step===3?'active':''}`}>3 · {isAnyActiveInStep3?'Live Progress':'Run & Results'}</span>
     </div>
    </div>
 
@@ -767,151 +1189,361 @@ export default function SecurityScanWizard({
      <div className="section-title">
       <div>
        <span className="eyebrow">STEP 1 OF 3</span>
-       <h2>1 · Select Target and Dataset</h2>
-       <p>Choose a configured Target profile and an imported Testcase Dataset. Target connection details and Application Details are managed in Targets.</p>
+       <h2>1 · Select Target and Test Source</h2>
+       <p>Choose a configured Target profile, then pick whether to AI-generate new testcases, run an existing dataset, or import a testcase file.</p>
       </div>
      </div>
 
-     <div className="split config-grid">
-      <div className="card">
-       <div className="card-head-row">
-        <h3>Target Agent</h3>
-        <a className="btn ghost sm" href="#targets">Add or Edit Target →</a>
+     {/* Active Execution Recovery Strip (survives refresh / tab navigation) */}
+     {anyActiveExecution&&(
+      <div className="notice warn" role="status" data-testid="scan-active-target-banner" style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:12,flexWrap:'wrap',marginBottom:'0.85rem'}}>
+       <div>
+        <strong>Active Scan in Progress on Target <code className="mono">{anyActiveExecution.target_id}</code>:</strong>{' '}
+        {anyActiveExecution.workflow_id
+         ?<>Workflow <code className="mono">{anyActiveExecution.workflow_id}</code></>
+         :anyActiveExecution.run_id
+          ?<>Run <code className="mono">{anyActiveExecution.run_id}</code></>
+          :'Execution active'}
+        . Live concurrent execution on the same target is locked until completion.
        </div>
-       <label htmlFor="scan-target-select">Select Saved Target
-        <select
-         id="scan-target-select"
-         value={selectedTargetId}
+       <button
+        type="button"
+        className="btn primary sm"
+        data-testid="open-active-execution-btn"
+        onClick={()=>openActiveExecution(anyActiveExecution.workflow_id,anyActiveExecution.run_id)}
+       >
+        Open Live Progress →
+       </button>
+      </div>
+     )}
+
+     {importNotice&&(
+      <div className="notice info" role="status" style={{marginBottom:'0.85rem'}}>
+       {importNotice}
+      </div>
+     )}
+
+     {/* Shared Target Agent Selector */}
+     <div className="card" style={{marginBottom:'0.9rem'}}>
+      <div className="card-head-row">
+       <h3>Target Agent</h3>
+       <a className="btn ghost sm" href="#targets">Add or Edit Target →</a>
+      </div>
+      <label htmlFor="scan-target-select">Select Saved Target
+       <select
+        id="scan-target-select"
+        value={selectedTargetId}
+        disabled={isSubmissionLocked}
+        onChange={e=>{
+         if(isActionLocked())return;
+         setSelectedTargetId(e.target.value);
+         onSelectTarget?.(e.target.value);
+        }}
+       >
+        {targets.length===0&&<option value="">-- No saved targets --</option>}
+        {targets.map(t=>(
+         <option key={t.id} value={t.id}>
+          {t.name} ({t.protocol==='mcp-jsonrpc'?'MCP':'HTTP Chat'} · {t.endpoint})
+         </option>
+        ))}
+        {datasetHasStoredResponses&&!targets.some(t=>t.id==='generic-stored-target')&&(
+         <option value="generic-stored-target">Offline Stored-Response Target (generic-stored-target)</option>
+        )}
+       </select>
+      </label>
+
+      {selectedTarget?(
+       <div className="detail-grid compact" aria-label="Selected Target Summary" style={{marginTop:'0.75rem'}}>
+        <div className="detail-pair">
+         <span>Target ID</span>
+         <strong className="mono">{selectedTarget.id}</strong>
+        </div>
+        <div className="detail-pair">
+         <span>Protocol &amp; Model</span>
+         <strong>
+          <code className="mono">{selectedTarget.protocol}</code> · <code className="mono">{selectedTarget.default_model}</code>
+         </strong>
+        </div>
+        <div className="detail-pair">
+         <span>Endpoint</span>
+         <strong className="mono wrap-anywhere">{selectedTarget.endpoint}</strong>
+        </div>
+        <div className="detail-pair">
+         <span>Authorization Review</span>
+         <strong>
+          {selectedTarget.authorization_status==='reviewed_for_offline_configuration'
+           ?'Reviewed'
+           :'Review required'}
+         </strong>
+        </div>
+       </div>
+      ):(
+       <div className="empty-box" style={{marginTop:'0.75rem'}}>
+        {selectedTargetId==='generic-stored-target'
+         ?'Using offline stored-response target binding (0 live HTTP requests).'
+         :'Select a Target agent profile to continue.'}
+       </div>
+      )}
+     </div>
+
+     {/* Unified 3-Source Selector */}
+     <div
+      role="tablist"
+      aria-label="Choose Test Source"
+      data-testid="unified-test-source-selector"
+      style={{display:'grid',gridTemplateColumns:'repeat(auto-fit, minmax(210px, 1fr))',gap:10,marginBottom:'0.95rem'}}
+     >
+      {([
+       {id:'ai_generate' as TestSource,title:'1. AI Generate New Testcases',desc:'Generate context-aware OWASP ASI testcases & run automatically (or preview & save).'},
+       {id:'existing_dataset' as TestSource,title:'2. Use Existing Dataset',desc:'Run any saved AI-generated or imported dataset without calling AI Generator.'},
+       {id:'import_dataset' as TestSource,title:'3. Import Testcases',desc:'Upload a JSON/JSONL/YAML testcase file directly into this scan flow.'},
+      ]).map(src=>{
+       const active=testSource===src.id;
+       return (
+        <button
+         key={src.id}
+         type="button"
+         role="tab"
+         aria-selected={active}
+         data-testid={`source-tab-${src.id}`}
          disabled={isSubmissionLocked}
-         onChange={e=>{
-          if(isActionLocked())return;
-          setSelectedTargetId(e.target.value);
+         onClick={()=>setTestSource(src.id)}
+         style={{
+          textAlign:'left',
+          whiteSpace:'normal',
+          padding:12,
+          borderRadius:10,
+          border:active?'2px solid var(--teal)':'1px solid var(--line)',
+          background:active?'var(--teal-soft)':'var(--surface)',
          }}
         >
-         {targets.length===0&&<option value="">-- No saved targets --</option>}
-         {targets.map(t=>(
-          <option key={t.id} value={t.id}>
-           {t.name} ({t.protocol==='mcp-jsonrpc'?'MCP':'HTTP Chat'} · {t.endpoint})
-          </option>
-         ))}
-         {datasetHasStoredResponses&&!targets.some(t=>t.id==='generic-stored-target')&&(
-          <option value="generic-stored-target">Offline Stored-Response Target (generic-stored-target)</option>
-         )}
-        </select>
-       </label>
+         <div style={{fontWeight:700}}>{src.title}</div>
+         <div style={{fontSize:12,color:'var(--muted)',marginTop:4,fontWeight:400}}>{src.desc}</div>
+        </button>
+       );
+      })}
+     </div>
 
-       {selectedTarget?(
-        <div className="detail-grid compact" aria-label="Selected Target Summary" style={{marginTop:'0.75rem'}}>
-         <div className="detail-pair">
-          <span>Target ID</span>
-          <strong className="mono">{selectedTarget.id}</strong>
-         </div>
-         <div className="detail-pair">
-          <span>Protocol &amp; Model</span>
-          <strong>
-           <code className="mono">{selectedTarget.protocol}</code> · <code className="mono">{selectedTarget.default_model}</code>
-          </strong>
-         </div>
-         <div className="detail-pair">
-          <span>Endpoint</span>
-          <strong className="mono wrap-anywhere">{selectedTarget.endpoint}</strong>
-         </div>
-         <div className="detail-pair">
-          <span>Authorization Review</span>
-          <strong>
-           {selectedTarget.authorization_status==='reviewed_for_offline_configuration'
-            ?'Reviewed'
-            :'Review required'}
-          </strong>
-         </div>
+     {/* Source 1: AI Generate New Testcases */}
+     {testSource==='ai_generate'&&(
+      <div className="card" data-testid="source-panel-ai_generate">
+       <div className="card-head-row" style={{marginBottom:'0.75rem'}}>
+        <div>
+         <h3 style={{margin:0}}>AI Generate New Testcases</h3>
+         <p className="caption" style={{margin:'4px 0 0'}}>
+          Generate &amp; Run transitions directly into the shared Live Scan Progress &amp; Results view.
+         </p>
         </div>
+        <div role="group" aria-label="AI generation mode" style={{display:'flex',gap:8}}>
+         <button
+          type="button"
+          className={aiSubMode==='generate_and_run'?'btn primary sm':'btn ghost sm'}
+          data-testid="ai-submode-generate_and_run"
+          aria-pressed={aiSubMode==='generate_and_run'}
+          onClick={()=>setAiSubMode('generate_and_run')}
+         >
+          Generate &amp; Run
+         </button>
+         <button
+          type="button"
+          className={aiSubMode==='generate_only'?'btn primary sm':'btn ghost sm'}
+          data-testid="ai-submode-generate_only"
+          aria-pressed={aiSubMode==='generate_only'}
+          onClick={()=>setAiSubMode('generate_only')}
+         >
+          Generate Only (Preview &amp; Save)
+         </button>
+        </div>
+       </div>
+
+       {aiSubMode==='generate_and_run'?(
+        <GenerateAndRunPrepPanel
+         targets={targets}
+         config={genConfig}
+         onChangeConfig={next=>{
+          setGenConfig(next);
+          if(next.targetId&&next.targetId!==selectedTargetId){
+           setSelectedTargetId(next.targetId);
+           onSelectTarget?.(next.targetId);
+          }
+         }}
+         nonce={nonce}
+         secret={secret}
+         generateAndRunAvailable={genAndRunAvailable}
+         providerStatus={genProviderStatus}
+         judgeStatus={genJudgeStatus}
+         providerStatusError={genProviderError}
+         readiness={genReadiness}
+         readinessLoading={genReadinessLoading}
+         readinessError={genReadinessError}
+         onCheckReadiness={handleCheckGenReadiness}
+         onSwitchToGenerateOnly={()=>setAiSubMode('generate_only')}
+         onSwitchToRunExisting={()=>setTestSource('existing_dataset')}
+         onOpenDatasetLibrary={()=>{if(onNavigate)onNavigate('datasets');else location.hash='datasets';}}
+         onOpenRunReport={rid=>{void openExistingRun(rid);}}
+         onWorkflowStarted={handleWorkflowStarted}
+         onOpenActiveWorkflow={openActiveExecution}
+         externalActiveReservation={activeTargetReservation}
+         compactMode={true}
+         hideInlinePipeline={true}
+        />
        ):(
-        <div className="empty-box" style={{marginTop:'0.75rem'}}>
-         {selectedTargetId==='generic-stored-target'
-          ?'Using offline stored-response target binding (0 live HTTP requests).'
-          :'Select a Target agent profile to continue.'}
-        </div>
+        <GeneratorOnlyPanel
+         targets={targets}
+         config={genConfig}
+         onChangeConfig={next=>{
+          setGenConfig(next);
+          if(next.targetId&&next.targetId!==selectedTargetId){
+           setSelectedTargetId(next.targetId);
+           onSelectTarget?.(next.targetId);
+          }
+         }}
+         nonce={nonce}
+         secret={secret}
+         providerStatus={genProviderStatus}
+         providerStatusError={genProviderError}
+         readiness={genReadiness}
+         readinessLoading={genReadinessLoading}
+         readinessError={genReadinessError}
+         onCheckReadiness={handleCheckGenReadiness}
+         onDatasetSaved={handleInlineDatasetSaved}
+         onOpenDatasetLibrary={()=>{if(onNavigate)onNavigate('datasets');else location.hash='datasets';}}
+         compactMode={true}
+        />
        )}
       </div>
+     )}
 
-      <div className="card">
-       <div className="card-head-row">
-        <h3>Test Dataset</h3>
-        <a className="btn ghost sm" href="#datasets">Import Dataset →</a>
-       </div>
-       <label htmlFor="scan-dataset-select">Select Imported Dataset
-        <select
-         id="scan-dataset-select"
-         value={selectedDatasetId}
-         disabled={isSubmissionLocked}
-         onChange={e=>{
-          if(isActionLocked())return;
-          setSelectedDatasetId(e.target.value);
-         }}
-        >
-         {datasets.length===0&&<option value="">-- No imported datasets --</option>}
-         {datasets.map(d=>(
-          <option key={d.dataset_id} value={d.dataset_id}>
-           {d.name} ({d.total_testcases} cases · {d.source_tool}{d.has_stored_responses?' · Stored Responses':''})
-          </option>
-         ))}
-        </select>
-       </label>
+     {/* Source 2: Use Existing Dataset */}
+     {testSource==='existing_dataset'&&(
+      <>
+       <div className="card">
+        <div className="card-head-row">
+         <h3>Test Dataset</h3>
+         <div style={{display:'flex',gap:8}}>
+          <button type="button" className="btn ghost sm" onClick={()=>setTestSource('import_dataset')}>
+           Import Testcases →
+          </button>
+          <a className="btn ghost sm" href="#datasets">Manage Library →</a>
+         </div>
+        </div>
+        <label htmlFor="scan-dataset-select">Select Imported Dataset
+         <select
+          id="scan-dataset-select"
+          value={selectedDatasetId}
+          disabled={isSubmissionLocked}
+          onChange={e=>{
+           if(isActionLocked())return;
+           setSelectedDatasetId(e.target.value);
+          }}
+         >
+          {datasets.length===0&&<option value="">-- No imported datasets --</option>}
+          {datasets.map(d=>(
+           <option key={d.dataset_id} value={d.dataset_id}>
+            {d.name} ({d.total_testcases} cases · {d.source_tool} · {d.dataset_id.slice(0,6)}{d.has_stored_responses?' · Stored Responses':''})
+           </option>
+          ))}
+         </select>
+        </label>
 
-       {datasetDetail?(
-        <div className="detail-grid compact" aria-label="Selected Dataset Summary" style={{marginTop:'0.75rem'}}>
-         <div className="detail-pair">
-          <span>Dataset Name</span>
-          <strong>{datasetDetail.name}</strong>
-         </div>
-         <div className="detail-pair">
-          <span>Total Testcases</span>
-          <strong>{datasetDetail.total_testcases} testcases</strong>
-         </div>
-         <div className="detail-pair">
-          <span>Source / Format</span>
-          <strong className="mono">{datasetDetail.source_tool}</strong>
-         </div>
-         <div className="detail-pair">
-          <span>Available Modes</span>
-          <div className="badge-wrap">
-           <span className="batch-cell-pill ready">Live Test</span>
-           {datasetHasStoredResponses&&(
-            <span className="batch-cell-pill ready">Offline Evaluation (Stored Responses)</span>
-           )}
+        {datasetDetail?(
+         <div className="detail-grid compact" aria-label="Selected Dataset Summary" style={{marginTop:'0.75rem'}}>
+          <div className="detail-pair">
+           <span>Dataset Name</span>
+           <strong>{datasetDetail.name}</strong>
+          </div>
+          <div className="detail-pair">
+           <span>Total Testcases</span>
+           <strong>{datasetDetail.total_testcases} testcases</strong>
+          </div>
+          <div className="detail-pair">
+           <span>Source / Format</span>
+           <strong className="mono">{datasetDetail.source_tool}</strong>
+          </div>
+          <div className="detail-pair">
+           <span>Available Modes</span>
+           <div className="badge-wrap">
+            <span className="batch-cell-pill ready">Live Test</span>
+            {datasetHasStoredResponses&&(
+             <span className="batch-cell-pill ready">Offline Evaluation (Stored Responses)</span>
+            )}
+           </div>
           </div>
          </div>
+        ):(
+         <div className="empty-box" style={{marginTop:'0.75rem'}}>
+          Select an imported security dataset to inspect testcase metadata.
+         </div>
+        )}
+       </div>
+
+       <div className="notice info" role="note" style={{marginTop:'0.9rem'}}>
+        <strong>Judge Engine Readiness:</strong>{' '}
+        {piJudgeReady&&judgeSetupReason!=='credential_missing'
+         ?'Hybrid LLM Judge + Rules is ready on the server (selectable in Step 2 Preview).'
+         :judgeSetupReason==='credential_missing'
+          ?'Server Judge credential is missing; Deterministic Rules / Evidence Only remains available in Step 2.'
+          :'Judge setup unavailable; Deterministic Rules / Evidence Only remains available in Step 2.'}
+       </div>
+
+       <div className="scan-step-actions">
+        <button
+         type="button"
+         className="btn primary"
+         disabled={isSubmissionLocked||!selectedTargetId||!selectedDatasetId||selectedCaseIds.length===0}
+         onClick={()=>{
+          if(isActionLocked())return;
+          void loadPreview();
+         }}
+        >
+         {busy?'Checking Readiness...':'Continue to Scan Preview →'}
+        </button>
+       </div>
+      </>
+     )}
+
+     {/* Source 3: Inline Import Testcases */}
+     {testSource==='import_dataset'&&(
+      <div className="card" data-testid="inline-import-panel">
+       <div className="card-head-row">
+        <div>
+         <h3 style={{margin:0}}>Import Testcase File</h3>
+         <p className="caption" style={{margin:'4px 0 0'}}>
+          Upload a SecAgent JSON envelope or Promptfoo export (max 5 MB, up to 100 cases). The imported dataset is automatically selected for Scan Preview.
+         </p>
         </div>
-       ):(
-        <div className="empty-box" style={{marginTop:'0.75rem'}}>
-         Select an imported security dataset to inspect testcase metadata.
+        <a className="btn ghost sm" href="#datasets">Open Dataset Library →</a>
+       </div>
+       {importError&&<div className="notice error" role="alert" style={{marginTop:'0.65rem'}}>{importError}</div>}
+       <div style={{marginTop:'0.75rem',display:'flex',gap:10,alignItems:'center',flexWrap:'wrap'}}>
+        <input
+         ref={importInputRef}
+         type="file"
+         aria-label="Upload testcase dataset file"
+         accept=".json,.jsonl,.yaml,.yml,application/json"
+         disabled={importBusy||!nonce}
+         onChange={e=>{void handleInlineImportFile(e);}}
+        />
+        {importBusy&&<span className="caption">Validating file…</span>}
+       </div>
+       {importPreview&&(
+        <div className="panel" data-testid="inline-import-preview" style={{marginTop:'0.75rem',padding:12}}>
+         <strong>Validated Preview: {importPreview.name}</strong>
+         <p className="caption" style={{margin:'4px 0'}}>
+          Source: <code>{importPreview.source_tool}</code> · Cases: <strong>{importPreview.total_testcases}</strong> · SHA-256: <code>{importPreview.file_sha256.slice(0,12)}</code>
+         </p>
+         <div style={{display:'flex',gap:8,marginTop:8}}>
+          <button type="button" className="btn primary sm" data-testid="confirm-inline-import-btn" disabled={importBusy} onClick={()=>{void handleConfirmInlineImport();}}>
+           Import &amp; Use in Scan
+          </button>
+          <button type="button" className="btn ghost sm" disabled={importBusy} onClick={()=>{setImportFile(null);setImportPreview(null);}}>
+           Discard
+          </button>
+         </div>
         </div>
        )}
       </div>
-     </div>
-
-     <div className="notice info" role="note" style={{marginTop:'0.9rem'}}>
-      <strong>Judge Engine Readiness:</strong>{' '}
-      {piJudgeReady&&judgeSetupReason!=='credential_missing'
-       ?'Hybrid LLM Judge + Rules is ready on the server (selectable in Step 2 Preview).'
-       :judgeSetupReason==='credential_missing'
-        ?'Server Judge credential is missing; Deterministic Rules / Evidence Only remains available in Step 2.'
-        :'Judge setup unavailable; Deterministic Rules / Evidence Only remains available in Step 2.'}
-     </div>
-
-     <div className="scan-step-actions">
-      <button
-       type="button"
-       className="btn primary"
-       disabled={isSubmissionLocked||!selectedTargetId||!selectedDatasetId||selectedCaseIds.length===0}
-       onClick={()=>{
-        if(isActionLocked())return;
-        void loadPreview();
-       }}
-      >
-       {busy?'Checking Readiness...':'Continue to Scan Preview →'}
-      </button>
-     </div>
+     )}
 
      <details className="target-advanced" style={{marginTop:'1rem'}} aria-label="Recover or open saved Scan Run">
       <summary>Open or Recover a Saved Generic Scan Run ({savedRuns.length} saved)</summary>
@@ -1010,7 +1642,58 @@ export default function SecurityScanWizard({
       if(isActionLocked())return;
       void startScan();
      }}
+     onOpenActiveConflict={openActiveExecution}
     />
+   )}
+
+   {/* Step 3 Pre-Run Pipeline Strip for Generate & Run workflows */}
+   {canOperatorAct&&step===3&&workflowSnapshot&&(
+    <section className="card" data-testid="unified-workflow-pipeline-strip" aria-label="AI Generate and Run pipeline progress" style={{marginBottom:'0.9rem'}}>
+     <div className="card-head-row" style={{marginBottom:'0.55rem'}}>
+      <div>
+       <span className="eyebrow">AI GENERATE &amp; RUN PIPELINE</span>
+       <h3 style={{margin:'2px 0 0'}}>
+        Workflow <code className="mono">{workflowSnapshot.workflow_id}</code> · Status:{' '}
+        <strong data-testid="unified-workflow-status">{workflowSnapshot.status}</strong>
+       </h3>
+      </div>
+      <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+       {workflowSnapshot.dataset_id&&(
+        <a className="btn ghost sm" href="#datasets">
+         Dataset: {workflowSnapshot.dataset_name||workflowSnapshot.dataset_id.slice(0,10)}
+        </a>
+       )}
+       {!runRecord&&TERMINAL_WORKFLOW_STATUSES.has(workflowSnapshot.status)&&(
+        <button type="button" className="btn ghost sm" onClick={resetToNewScan}>
+         Back to New Scan
+        </button>
+       )}
+      </div>
+     </div>
+     <ol style={{display:'grid',gridTemplateColumns:'repeat(auto-fit, minmax(125px, 1fr))',gap:6,listStyle:'none',padding:0,margin:0}}>
+      {LIVE_GENERATE_AND_RUN_STAGES.map((st,idx)=>{
+       const live=workflowSnapshot.stages.find(s=>s.stage===st.id);
+       const status:StageStatus=live?.status??'pending';
+       return (
+        <li key={st.id} data-testid={`unified-stage-${st.id}`} style={{border:'1px solid var(--line)',borderRadius:6,padding:'6px 8px',fontSize:12}}>
+         <div style={{fontWeight:700}}>{idx+1}. {st.label}</div>
+         <div style={{color:stageChipColor(status),fontWeight:600,marginTop:2}}>{status}</div>
+        </li>
+       );
+      })}
+     </ol>
+     {workflowSnapshot.error_message&&(
+      <div className="notice error" role="alert" style={{marginTop:'0.65rem'}}>
+       <strong>Stopped at <code>{workflowSnapshot.error_stage||workflowSnapshot.current_stage}</code> (<code>{workflowSnapshot.error_code||'error'}</code>):</strong>{' '}
+       {workflowSnapshot.error_message}
+      </div>
+     )}
+     {!runRecord&&!TERMINAL_WORKFLOW_STATUSES.has(workflowSnapshot.status)&&(
+      <p className="caption" style={{marginTop:'0.6rem',marginBottom:0}}>
+       Preparing generated testcases ({workflowSnapshot.current_stage})… Live per-case execution progress will attach automatically once the Generic Runner starts.
+      </p>
+     )}
+    </section>
    )}
 
    {canOperatorAct&&step===3&&runRecord&&isRunningRecord&&(()=>{
@@ -1030,6 +1713,7 @@ export default function SecurityScanWizard({
       </div>
       <ProgressMetadata record={runRecord}/>
       <ScanProgressBar record={runRecord}/>
+      <TechnicalDiagnosticsNotice record={runRecord}/>
       <ExecutionCounters record={runRecord}/>
       <div className="split live-work-grid">
        <CurrentTestcase record={runRecord}/>
@@ -1067,6 +1751,13 @@ export default function SecurityScanWizard({
       onExportError={setError}
       onResumeScan={()=>{void openResumePreview();}}
       onOpenRun={id=>{void openExistingRun(id);}}
+      workflowId={workflowSnapshot?.workflow_id??runRecord.workflow_id??null}
+      onRerunSavedDataset={
+       (workflowSnapshot?.rerun_supported&&workflowSnapshot?.dataset_id)||runRecord.workflow_id
+        ?()=>{void handleRerunWorkflowSavedDataset();}
+        :undefined
+      }
+      rerunBusy={rerunBusy}
       resumeBusy={resumeLoading||resumeStarting||busy}
       resumePanelOpen={resumeOpen}
      />

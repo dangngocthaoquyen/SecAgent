@@ -23,6 +23,8 @@ export type GeneratorConfigFormProps = {
   readinessError?: string;
   onCheckReadiness: () => void;
   showExecutionScopeSelector?: boolean;
+  hideTargetSelector?: boolean;
+  compactAdvanced?: boolean;
   disabled?: boolean;
 };
 
@@ -37,6 +39,8 @@ export default function GeneratorConfigForm({
   readinessError = '',
   onCheckReadiness,
   showExecutionScopeSelector = false,
+  hideTargetSelector = false,
+  compactAdvanced = false,
   disabled = false,
 }: GeneratorConfigFormProps) {
   const { total, error: countError } = extractActiveCounts(config);
@@ -129,32 +133,68 @@ export default function GeneratorConfigForm({
         )}
       </section>
 
-      {/* Target selection */}
-      <section aria-label="Target selection" className="panel" style={{ marginBottom: 14, padding: 14 }}>
-        <div style={{ display: 'flex', gap: 12, alignItems: 'flex-end', flexWrap: 'wrap' }}>
-          <label style={{ flex: '1 1 280px', display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <span>Target</span>
-            <select
-              aria-label="Target"
-              value={config.targetId}
-              disabled={disabled || targets.length === 0}
-              onChange={(e) =>
-                onChange({
-                  ...config,
-                  targetId: e.target.value,
-                  requestedScopes: {},
-                  policyIdsByAsi: {},
-                })
-              }
+      {/* Target selection (hidden when parent unified scan step already renders the Target selector) */}
+      {!hideTargetSelector ? (
+        <section aria-label="Target selection" className="panel" style={{ marginBottom: 14, padding: 14 }}>
+          <div style={{ display: 'flex', gap: 12, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+            <label style={{ flex: '1 1 280px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <span>Target</span>
+              <select
+                aria-label="Target"
+                value={config.targetId}
+                disabled={disabled || targets.length === 0}
+                onChange={(e) =>
+                  onChange({
+                    ...config,
+                    targetId: e.target.value,
+                    requestedScopes: {},
+                    policyIdsByAsi: {},
+                  })
+                }
+              >
+                {targets.length === 0 && <option value="">No targets available</option>}
+                {targets.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name} ({t.protocol}) — {t.authorization_status === 'reviewed_for_offline_configuration' ? 'Reviewed' : 'Unreviewed'}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              type="button"
+              disabled={disabled || !config.targetId || readinessLoading}
+              onClick={onCheckReadiness}
             >
-              {targets.length === 0 && <option value="">No targets available</option>}
-              {targets.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.name} ({t.protocol}) — {t.authorization_status === 'reviewed_for_offline_configuration' ? 'Reviewed' : 'Unreviewed'}
-                </option>
-              ))}
-            </select>
-          </label>
+              {readinessLoading ? 'Checking Readiness…' : 'Check Context Readiness'}
+            </button>
+          </div>
+          {selectedTarget && selectedTarget.protocol === 'mcp-jsonrpc' && (
+            <p style={{ color: 'var(--warn)', marginTop: 8, marginBottom: 0 }}>
+              Protocol <code>mcp-jsonrpc</code> is blocked for natural-language prompt generation; select an <code>openai-chat</code> or <code>http-json</code> target.
+            </p>
+          )}
+          {readinessError && (
+            <p role="alert" style={{ color: 'var(--fail)', marginTop: 8, marginBottom: 0 }}>
+              {readinessError}
+            </p>
+          )}
+        </section>
+      ) : (
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
+          <div style={{ fontSize: 13, color: 'var(--muted)' }}>
+            {selectedTarget && selectedTarget.protocol === 'mcp-jsonrpc' ? (
+              <span style={{ color: 'var(--warn)' }}>
+                Protocol <code>mcp-jsonrpc</code> is blocked for natural-language prompt generation; choose an <code>openai-chat</code> or <code>http-json</code> target above.
+              </span>
+            ) : (
+              <span>Check target Application Context readiness before generation.</span>
+            )}
+            {readinessError && (
+              <span role="alert" style={{ color: 'var(--fail)', marginLeft: 8 }}>
+                {readinessError}
+              </span>
+            )}
+          </div>
           <button
             type="button"
             disabled={disabled || !config.targetId || readinessLoading}
@@ -163,17 +203,7 @@ export default function GeneratorConfigForm({
             {readinessLoading ? 'Checking Readiness…' : 'Check Context Readiness'}
           </button>
         </div>
-        {selectedTarget && selectedTarget.protocol === 'mcp-jsonrpc' && (
-          <p style={{ color: 'var(--warn)', marginTop: 8, marginBottom: 0 }}>
-            Protocol <code>mcp-jsonrpc</code> is blocked for natural-language prompt generation; select an <code>openai-chat</code> or <code>http-json</code> target.
-          </p>
-        )}
-        {readinessError && (
-          <p role="alert" style={{ color: 'var(--fail)', marginTop: 8, marginBottom: 0 }}>
-            {readinessError}
-          </p>
-        )}
-      </section>
+      )}
 
       {/* OWASP ASI selection, independent counts & per-ASI readiness */}
       <section aria-label="OWASP ASI configuration" className="panel" style={{ marginBottom: 14, padding: 14 }}>
@@ -323,50 +353,55 @@ export default function GeneratorConfigForm({
         )}
       </section>
 
-      {/* Generation Options: Language, Focus Note, Cross-ASI Dedup (default false) */}
+      {/* Generation Options: Language, Focus Note, Cross-ASI Dedup (collapsible in unified scan mode) */}
       <section aria-label="Generation options" className="panel" style={{ padding: 14 }}>
-        <div style={{ display: 'grid', gap: 10 }}>
-          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'center' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span>Language</span>
-              <select
-                aria-label="Generation language"
-                value={config.language}
-                disabled={disabled}
-                onChange={(e) => updateField('language', e.target.value as SupportedLanguage)}
-              >
-                <option value="en">English (en)</option>
-                <option value="vi">Vietnamese (vi)</option>
-              </select>
-            </label>
+        <details open={!compactAdvanced} data-testid="advanced-generation-options">
+          <summary style={{ cursor: 'pointer', fontWeight: 600 }}>
+            Advanced Generation Options (Language: {config.language}, Focus Note, Deduplication)
+          </summary>
+          <div style={{ display: 'grid', gap: 10, marginTop: 10 }}>
+            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'center' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span>Language</span>
+                <select
+                  aria-label="Generation language"
+                  value={config.language}
+                  disabled={disabled}
+                  onChange={(e) => updateField('language', e.target.value as SupportedLanguage)}
+                >
+                  <option value="en">English (en)</option>
+                  <option value="vi">Vietnamese (vi)</option>
+                </select>
+              </label>
 
-            <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input
+                  type="checkbox"
+                  aria-label="Deduplicate prompts across different ASI categories"
+                  checked={config.deduplicateAcrossAsi}
+                  disabled={disabled}
+                  onChange={(e) => updateField('deduplicateAcrossAsi', e.target.checked)}
+                />
+                <span>Deduplicate across ASI categories (default: off for independent per-ASI evaluation)</span>
+              </label>
+            </div>
+
+            <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <span>
+                Optional Focus Note ({config.focusNote.length} / {GENERATOR_LIMITS.maxFocusNoteChars} chars — treated as untrusted data)
+              </span>
               <input
-                type="checkbox"
-                aria-label="Deduplicate prompts across different ASI categories"
-                checked={config.deduplicateAcrossAsi}
+                type="text"
+                aria-label="Focus note"
+                maxLength={GENERATOR_LIMITS.maxFocusNoteChars}
+                value={config.focusNote}
                 disabled={disabled}
-                onChange={(e) => updateField('deduplicateAcrossAsi', e.target.checked)}
+                placeholder="e.g., Focus on synthetic ticket triage escalation boundaries"
+                onChange={(e) => updateField('focusNote', e.target.value)}
               />
-              <span>Deduplicate across ASI categories (default: off for independent per-ASI evaluation)</span>
             </label>
           </div>
-
-          <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <span>
-              Optional Focus Note ({config.focusNote.length} / {GENERATOR_LIMITS.maxFocusNoteChars} chars — treated as untrusted data)
-            </span>
-            <input
-              type="text"
-              aria-label="Focus note"
-              maxLength={GENERATOR_LIMITS.maxFocusNoteChars}
-              value={config.focusNote}
-              disabled={disabled}
-              placeholder="e.g., Focus on synthetic ticket triage escalation boundaries"
-              onChange={(e) => updateField('focusNote', e.target.value)}
-            />
-          </label>
-        </div>
+        </details>
       </section>
     </div>
   );

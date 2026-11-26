@@ -6,11 +6,14 @@ import {
   GeneratorApiError,
   LIVE_GENERATE_AND_RUN_STAGES,
   SUPPORTED_ASI_CODES,
+  clearActiveWorkflowId,
   clearPendingGenerateAndRunSubmission,
   extractActiveCounts,
   generatorApi,
   loadPendingGenerateAndRunSubmission,
+  saveActiveWorkflowId,
   savePendingGenerateAndRunSubmission,
+  type ActiveTargetReservation,
   type GenerateAndRunContractDraft,
   type GenerateAndRunSnapshot,
   type GeneratorConfigState,
@@ -40,6 +43,11 @@ export type GenerateAndRunPrepPanelProps = {
   onOpenDatasetLibrary?: (datasetId?: string) => void;
   onOpenRunReport?: (runId: string) => void;
   onDatasetPersisted?: (datasetId: string) => void;
+  onWorkflowStarted?: (workflow: GenerateAndRunSnapshot) => void;
+  onOpenActiveWorkflow?: (workflowId?: string | null, runId?: string | null) => void;
+  externalActiveReservation?: ActiveTargetReservation | null;
+  compactMode?: boolean;
+  hideInlinePipeline?: boolean;
 };
 
 type RecoveryState = 'idle' | 'uncertain' | 'checking' | 'not_found_retryable' | 'expired';
@@ -49,6 +57,7 @@ const TERMINAL_WORKFLOW_STATUSES = new Set([
   'failed',
   'blocked',
   'partial_stopped',
+  'interrupted',
 ]);
 
 function randomHex32(): string {
@@ -146,6 +155,11 @@ export default function GenerateAndRunPrepPanel({
   onOpenDatasetLibrary,
   onOpenRunReport,
   onDatasetPersisted,
+  onWorkflowStarted,
+  onOpenActiveWorkflow,
+  externalActiveReservation = null,
+  compactMode = false,
+  hideInlinePipeline = false,
 }: GenerateAndRunPrepPanelProps) {
   const [evaluationMode, setEvaluationMode] = useState<'rule_only' | 'hybrid'>(() =>
     judgeStatus ? 'hybrid' : 'rule_only',
@@ -159,6 +173,9 @@ export default function GenerateAndRunPrepPanel({
   const [submitError, setSubmitError] = useState('');
   const [recoveryNotice, setRecoveryNotice] = useState('');
   const [rerunMessage, setRerunMessage] = useState('');
+  const [discoveredReservation, setDiscoveredReservation] =
+    useState<ActiveTargetReservation | null>(null);
+  const [conflictDetail, setConflictDetail] = useState<ActiveTargetReservation | null>(null);
 
   const [pendingSubmission, setPendingSubmission] =
     useState<PendingGenerateAndRunSubmission | null>(() => loadPendingGenerateAndRunSubmission());
@@ -197,11 +214,57 @@ export default function GenerateAndRunPrepPanel({
   );
   const recoveryLocksSubmit =
     recoveryState === 'uncertain' || recoveryState === 'checking' || recoveryState === 'expired';
+  const isWorkflowActive = Boolean(workflow && !TERMINAL_WORKFLOW_STATUSES.has(workflow.status));
+  const activeTargetConflict = externalActiveReservation ?? conflictDetail ?? discoveredReservation;
   const orchestrationLive = Boolean(generateAndRunAvailable && nonce);
+
+  // Discover active backend workflows/reservations on mount or target switch (P0 navigation/refresh lock).
+  useEffect(() => {
+    setConflictDetail(null);
+    if (!orchestrationLive || !config.targetId || typeof generatorApi.listGenerateAndRunWorkflows !== 'function') {
+      setDiscoveredReservation(null);
+      return;
+    }
+    const controller = new AbortController();
+    generatorApi
+      .listGenerateAndRunWorkflows(nonce, secret, controller.signal)
+      .then((res) => {
+        if (controller.signal.aborted) return;
+        const activeRes =
+          (res.active_reservations ?? []).find((r) => r.target_id === config.targetId) ?? null;
+        if (activeRes) {
+          setDiscoveredReservation(activeRes);
+          return;
+        }
+        const runningWf =
+          (res.workflows ?? []).find(
+            (w) => w.target_id === config.targetId && !TERMINAL_WORKFLOW_STATUSES.has(w.status),
+          ) ?? null;
+        if (runningWf) {
+          setDiscoveredReservation({
+            target_id: runningWf.target_id,
+            owner_kind: 'generate_and_run',
+            workflow_id: runningWf.workflow_id,
+            run_id: runningWf.run_id,
+            reserved_at: runningWf.created_at,
+          });
+        } else {
+          setDiscoveredReservation(null);
+        }
+      })
+      .catch(() => {
+        // Non-fatal in legacy mocks/offline environments without workflow listing route.
+      });
+    return () => controller.abort();
+  }, [orchestrationLive, config.targetId, nonce, secret]);
+
+  const formLocked = recoveryLocksSubmit || submitting || isWorkflowActive;
 
   const canSubmit = Boolean(
     orchestrationLive &&
       !submitting &&
+      !isWorkflowActive &&
+      !activeTargetConflict &&
       !recoveryLocksSubmit &&
       !readinessLoading &&
       config.targetId &&
@@ -214,9 +277,16 @@ export default function GenerateAndRunPrepPanel({
       !hybridBlockedByJudge,
   );
 
-  // Poll running Generate & Run workflow until terminal state.
+  // Poll running Generate & Run workflow until terminal state (when not handed off to unified progress view).
   useEffect(() => {
-    if (!workflow || TERMINAL_WORKFLOW_STATUSES.has(workflow.status) || !nonce) {
+    if (!workflow || !nonce) return;
+    if (TERMINAL_WORKFLOW_STATUSES.has(workflow.status)) {
+      clearActiveWorkflowId();
+      setDiscoveredReservation(null);
+      setConflictDetail(null);
+      return;
+    }
+    if (hideInlinePipeline) {
       return;
     }
     const controller = new AbortController();
@@ -236,7 +306,7 @@ export default function GenerateAndRunPrepPanel({
       window.clearInterval(timer);
       controller.abort();
     };
-  }, [workflow?.workflow_id, workflow?.status, nonce, secret]);
+  }, [workflow?.workflow_id, workflow?.status, nonce, secret, hideInlinePipeline]);
 
   // Notify parent when a dataset is auto-persisted so Mode 3 list can refresh.
   useEffect(() => {
@@ -366,7 +436,12 @@ export default function GenerateAndRunPrepPanel({
         secret,
       );
       clearRecovery();
+      setConflictDetail(null);
+      if (!TERMINAL_WORKFLOW_STATUSES.has(result.status)) {
+        saveActiveWorkflowId(result.workflow_id);
+      }
       setWorkflow(result);
+      onWorkflowStarted?.(result);
     } catch (err) {
       if (isUncertainNetworkError(err)) {
         // R02: Network/timeout drop — keep exact submission_id and attempt automatic status recovery.
@@ -383,6 +458,9 @@ export default function GenerateAndRunPrepPanel({
       }
       // Definitive 4xx rejection from server — safe to clear pending submission.
       clearRecovery();
+      if (err instanceof GeneratorApiError && err.status === 409 && err.conflict) {
+        setConflictDetail(err.conflict);
+      }
       setSubmitError(
         err instanceof GeneratorApiError
           ? `${err.code}: ${err.message}`
@@ -452,7 +530,7 @@ export default function GenerateAndRunPrepPanel({
       aria-label="Generate and Run workflow"
     >
       {/* Status banner: live when G11.6 backend orchestration is active; fail-closed otherwise */}
-      {orchestrationLive ? (
+      {!compactMode && (orchestrationLive ? (
         <div
           role="status"
           data-testid="g11-6-active-banner"
@@ -522,6 +600,56 @@ export default function GenerateAndRunPrepPanel({
             )}
           </div>
         </div>
+      ))}
+
+      {/* P0 Active Target Reservation / Conflict Banner */}
+      {activeTargetConflict && !isWorkflowActive && (
+        <div
+          role="alert"
+          data-testid="active-target-conflict-banner"
+          style={{
+            padding: 12,
+            marginBottom: 14,
+            borderRadius: 8,
+            border: '1px solid var(--warn)',
+            background: 'var(--warn-soft)',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: 12,
+            flexWrap: 'wrap',
+          }}
+        >
+          <div style={{ fontSize: 13 }}>
+            <strong>Active Live Execution on Target <code>{activeTargetConflict.target_id}</code>:</strong>{' '}
+            Another workflow or scan is currently running on this live target (
+            {activeTargetConflict.workflow_id
+              ? <>Workflow <code>{activeTargetConflict.workflow_id}</code></>
+              : activeTargetConflict.run_id
+                ? <>Run <code>{activeTargetConflict.run_id}</code></>
+                : 'active execution'}
+            ). Concurrent live execution on the same target is blocked to prevent conflicting runs.
+          </div>
+          {(activeTargetConflict.workflow_id || activeTargetConflict.run_id) && (
+            <button
+              type="button"
+              data-testid="open-active-conflict-btn"
+              onClick={() => {
+                if (onOpenActiveWorkflow) {
+                  onOpenActiveWorkflow(activeTargetConflict.workflow_id, activeTargetConflict.run_id);
+                } else if (activeTargetConflict.run_id && onOpenRunReport) {
+                  onOpenRunReport(activeTargetConflict.run_id);
+                } else if (typeof window !== 'undefined') {
+                  window.location.hash = activeTargetConflict.workflow_id
+                    ? `#scan/wf/${activeTargetConflict.workflow_id}`
+                    : `#scan/${activeTargetConflict.run_id}`;
+                }
+              }}
+            >
+              Open Active Progress →
+            </button>
+          )}
+        </div>
       )}
 
       {/* Shared Context-aware Generation Form (reused cleanly across Mode 1 & Mode 2) */}
@@ -536,7 +664,9 @@ export default function GenerateAndRunPrepPanel({
         readinessError={readinessError}
         onCheckReadiness={onCheckReadiness}
         showExecutionScopeSelector={true}
-        disabled={recoveryLocksSubmit}
+        hideTargetSelector={compactMode}
+        compactAdvanced={compactMode}
+        disabled={formLocked}
       />
 
       {/* Execution, Authorization & Fail-Closed Guardrails */}
@@ -552,7 +682,7 @@ export default function GenerateAndRunPrepPanel({
               <span>Evaluation Mode</span>
               <select
                 aria-label="Planned evaluation mode"
-                disabled={recoveryLocksSubmit}
+                disabled={formLocked}
                 value={evaluationMode}
                 onChange={(e) => {
                   userSelectedEvalModeRef.current = true;
@@ -585,7 +715,7 @@ export default function GenerateAndRunPrepPanel({
               <input
                 type="text"
                 aria-label="Auto-saved dataset label"
-                disabled={recoveryLocksSubmit}
+                disabled={formLocked}
                 value={datasetName}
                 onChange={(e) => setDatasetName(e.target.value)}
                 placeholder="Auto-generated if blank"
@@ -642,7 +772,7 @@ export default function GenerateAndRunPrepPanel({
             <input
               type="checkbox"
               aria-label="Confirm authorized Generate and Run scope"
-              disabled={recoveryLocksSubmit}
+              disabled={formLocked}
               checked={authorizationConfirmed}
               onChange={(e) => setAuthorizationConfirmed(e.target.checked)}
             />
@@ -735,10 +865,14 @@ export default function GenerateAndRunPrepPanel({
               ? 'Generate & Run (Unavailable until G11.6)'
               : submitting
                 ? 'Starting Generate & Run…'
-                : recoveryState === 'not_found_retryable' &&
-                    pendingSubmission?.config_digest === configDigest
-                  ? 'Retry Generate & Run (Same Submission ID)'
-                  : 'Generate & Run'}
+                : isWorkflowActive
+                  ? 'Workflow Running…'
+                  : activeTargetConflict
+                    ? 'Target Busy — Active Execution in Progress'
+                    : recoveryState === 'not_found_retryable' &&
+                        pendingSubmission?.config_digest === configDigest
+                      ? 'Retry Generate & Run (Same Submission ID)'
+                      : 'Generate & Run'}
           </button>
           {countError && <span style={{ color: 'var(--fail)', fontSize: 13 }}>{countError}</span>}
           {!isTargetReviewed && selectedTarget && (
@@ -771,7 +905,8 @@ export default function GenerateAndRunPrepPanel({
         )}
       </section>
 
-      {/* Pipeline Stages & Live Status */}
+      {/* Pipeline Stages & Live Status (hidden when unified #scan handles live progress) */}
+      {!hideInlinePipeline && (
       <section
         aria-label={
           orchestrationLive ? 'Automated orchestration pipeline' : 'Planned orchestration pipeline'
@@ -988,6 +1123,11 @@ export default function GenerateAndRunPrepPanel({
                       ? JSON.stringify(workflow.verdict_counts)
                       : 'Pending / None'}
                   </code>
+                  {(workflow.evaluation_summary?.technical_failure_count ?? 0) > 0 && (
+                    <span style={{ marginLeft: 8, color: 'var(--fail)', fontWeight: 600 }}>
+                      · Technical Failures: {workflow.evaluation_summary!.technical_failure_count}
+                    </span>
+                  )}
                 </div>
               </div>
             </div>
@@ -1110,6 +1250,7 @@ export default function GenerateAndRunPrepPanel({
           </div>
         )}
       </section>
+      )}
     </form>
   );
 }

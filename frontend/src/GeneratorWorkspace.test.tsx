@@ -1014,7 +1014,7 @@ describe('G11.6 — Live Generate & Run UI & App.tsx Integration', () => {
     expect(screen.getByTestId('workflow-run-id')).toHaveTextContent('Not started');
   });
 
-  it('integrates GeneratorModeWorkspace into real App.tsx at #generator and never triggers execution on mode switch', async () => {
+  it('routes legacy #generator bookmark cleanly into unified #scan (AI Generate source) and never triggers execution on source switch', async () => {
     location.hash = '#generator';
     const postUrls: string[] = [];
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
@@ -1046,27 +1046,36 @@ describe('G11.6 — Live Generate & Run UI & App.tsx Integration', () => {
       if (url.endsWith('/api/testing/datasets')) {
         return new Response(JSON.stringify({ workflow_schema_version: '1.0.0', datasets: [] }));
       }
+      if (url.endsWith('/api/testing/generic-runs')) {
+        return new Response(JSON.stringify({ workflow_schema_version: '1.0.0', runs: [] }));
+      }
       if (url.endsWith('/api/testing/generator/status')) {
         return new Response(
           JSON.stringify({ ...mockStatusResponse(true), generate_and_run_available: true }),
+        );
+      }
+      if (url.endsWith('/api/testing/generator/generate-and-run/workflows')) {
+        return new Response(
+          JSON.stringify({ workflow_schema_version: '1.0.0', workflows: [], active_reservations: [] }),
         );
       }
       return new Response('{}', { status: 404 });
     });
 
     render(<App />);
-    // AI Generator nav link is active and workspace renders inside real App
-    expect(screen.getByRole('link', { name: /AI Generator/i })).toHaveAttribute('aria-current', 'page');
-    await screen.findByTestId('generator-mode-workspace');
-    await screen.findByTestId('g11-6-active-banner');
-
-    // Switching across all 3 operating modes NEVER triggers generation or execution POSTs
-    fireEvent.click(screen.getByTestId('mode-tab-generate_only'));
-    await screen.findByTestId('generate-only-submit-btn');
-    fireEvent.click(screen.getByTestId('mode-tab-run_existing_dataset'));
-    await screen.findByTestId('run-existing-dataset-panel');
-    fireEvent.click(screen.getByTestId('mode-tab-generate_and_run'));
+    // Legacy #generator bookmark highlights unified New Scan and opens on Source #1 (AI Generate)
+    expect(screen.getByRole('link', { name: /New Scan/i })).toHaveAttribute('aria-current', 'page');
     await screen.findByTestId('generate-and-run-panel');
+
+    // Switching across all unified test sources NEVER triggers generation or execution POSTs
+    fireEvent.click(screen.getByTestId('ai-submode-generate_only'));
+    await screen.findByTestId('generate-only-submit-btn');
+    fireEvent.click(screen.getByTestId('source-tab-existing_dataset'));
+    await screen.findByLabelText(/Select Imported Dataset/i);
+    fireEvent.click(screen.getByTestId('source-tab-import_dataset'));
+    await screen.findByTestId('inline-import-panel');
+    fireEvent.click(screen.getByTestId('source-tab-ai_generate'));
+    await screen.findByTestId('generate-only-submit-btn');
 
     expect(postUrls).toEqual([]);
     location.hash = '';

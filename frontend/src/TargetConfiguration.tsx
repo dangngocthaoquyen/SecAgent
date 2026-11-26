@@ -1,5 +1,5 @@
 import { useCallback,useEffect,useRef,useState } from 'react';
-import { testingApi,draftFor,type TargetPreset,type ValidationResult } from './testingApi';
+import { testingApi,draftFor,saveScanHandoff,type TargetPreset,type ValidationResult } from './testingApi';
 import TargetManager,{targetKey,type ConnectionState} from './TargetManager';
 import AgentOnboardingPanel from './AgentOnboardingPanel';
 import { Facts,value } from './EvidenceViews';
@@ -73,7 +73,7 @@ export default function TargetConfiguration({initialTargetId='',onSelectDataset}
     </div>
     <div className="target-next">
      <a className="target-primary-link" href="#datasets" onClick={()=>onSelectDataset?.(target.id)}>Select Dataset</a>
-     <button className="primary" disabled={!configValid} onClick={()=>{onSelectDataset?.(target.id);location.hash='scan';}}>New Scan</button>
+     <button className="primary" disabled={!configValid} onClick={()=>{onSelectDataset?.(target.id);saveScanHandoff({target_id:target.id});location.hash='scan';}}>New Scan</button>
     </div>
    </section>
   </>}

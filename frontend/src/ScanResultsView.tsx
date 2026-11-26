@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { TechnicalDiagnosticsNotice } from './ScanProgressComponents';
 import TestcaseDetailDrawer from './TestcaseDetailDrawer';
 import {
   classifyJudgeFault,
@@ -35,6 +36,9 @@ export interface ScanResultsViewProps {
   onExportError?: (message: string) => void;
   onResumeScan?: () => void;
   onOpenRun?: (runId: string) => void;
+  workflowId?: string | null;
+  onRerunSavedDataset?: () => void;
+  rerunBusy?: boolean;
   resumeBusy?: boolean;
   resumePanelOpen?: boolean;
 }
@@ -47,6 +51,9 @@ export default function ScanResultsView({
   onExportError,
   onResumeScan,
   onOpenRun,
+  workflowId = null,
+  onRerunSavedDataset,
+  rerunBusy = false,
   resumeBusy = false,
   resumePanelOpen = false,
 }: ScanResultsViewProps) {
@@ -211,8 +218,27 @@ export default function ScanResultsView({
           </div>
           <h2>3 · Scan Results: {runRecord.target_name}</h2>
           <div className="results-meta-row">
-            <span>Target: <code className="mono">{runRecord.target_id}</code></span>
-            <span>· Dataset: <strong>{runRecord.dataset_name || runRecord.dataset_id || 'Not recorded'}</strong></span>
+            <span>
+              Target:{' '}
+              <a href="#targets" className="mono">
+                {runRecord.target_id}
+              </a>
+            </span>
+            <span>
+              · Dataset:{' '}
+              {runRecord.dataset_id ? (
+                <a href="#datasets">
+                  <strong>{runRecord.dataset_name || runRecord.dataset_id}</strong>
+                </a>
+              ) : (
+                <strong>{runRecord.dataset_name || 'Not recorded'}</strong>
+              )}
+            </span>
+            {(runRecord.workflow_id || workflowId) && (
+              <span>
+                · Workflow: <code className="mono">{runRecord.workflow_id || workflowId}</code>
+              </span>
+            )}
             <span>· ASI: <strong>{asiSummary.label}</strong></span>
             <span>· Mode: <strong>{runRecord.mode === 'offline' ? 'Offline' : 'Live'}</strong></span>
             <span>· Engine: <strong>{runRecord.use_judge ? 'Hybrid LLM Judge' : 'Rule-Only'}</strong></span>
@@ -239,6 +265,17 @@ export default function ScanResultsView({
               onClick={onResumeScan}
             >
               {resumePanelOpen ? 'Resume Preview Open' : resumeBusy ? 'Loading Resume…' : 'Resume Scan'}
+            </button>
+          )}
+          {onRerunSavedDataset && (
+            <button
+              type="button"
+              className="btn ghost"
+              data-testid="results-rerun-dataset-btn"
+              disabled={rerunBusy}
+              onClick={onRerunSavedDataset}
+            >
+              {rerunBusy ? 'Starting Rerun…' : 'Rerun Saved Dataset'}
             </button>
           )}
           <a
@@ -434,6 +471,8 @@ export default function ScanResultsView({
           )}
         </div>
       )}
+
+      <TechnicalDiagnosticsNotice record={runRecord} />
 
       {/* Distinct Binary PASS/FAIL & Technical Failure KPI Cards */}
       {evalMetrics.isBinarySchema && evalMetrics.legacyInconclusiveCount === 0 ? (
@@ -843,6 +882,12 @@ export default function ScanResultsView({
                             </span>
                             {!c.verdict && c.evaluation_reason_code && (
                               <span className="sublabel mono">{c.evaluation_reason_code}</span>
+                            )}
+                            {typeof c.http_status_code === 'number' && c.http_status_code >= 400 && (
+                              <span className="sublabel mono">
+                                HTTP {c.http_status_code}
+                                {typeof c.duration_ms === 'number' ? ` · ${(c.duration_ms / 1000).toFixed(1)}s` : ''}
+                              </span>
                             )}
                           </div>
                         </td>

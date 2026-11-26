@@ -251,6 +251,7 @@ export default function DatasetLibrary({nonce:propNonce,secret:propSecret='',tar
               dataset_id:d.dataset_id,
               target_id:activeTarget?.id,
               testcase_ids:selectedTestcaseIds,
+              source:'existing_dataset',
              });
             }}
            >

@@ -712,7 +712,10 @@ def register_target_routes(app, ctx) -> None:
         if gen_svc is not None:
             if target_id is not None and gen_svc.is_active_for_target(target_id):
                 return True
-            if target_id is None and bool(getattr(gen_svc, "_active_target_counts", None)):
+            if target_id is None and (
+                bool(getattr(gen_svc, "_active_target_counts", None))
+                or bool(getattr(gen_svc, "_live_target_reservations", None))
+            ):
                 return True
         if mcp_act_svc is not None and getattr(mcp_act_svc, "_lock", None) is not None and mcp_act_svc._lock.locked():
             return True

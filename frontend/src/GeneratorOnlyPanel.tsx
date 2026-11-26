@@ -72,6 +72,7 @@ export type GeneratorOnlyPanelProps = {
   onCheckReadiness: () => void;
   onDatasetSaved?: (record: PreviewSaveRecord) => void;
   onOpenDatasetLibrary?: (datasetId: string) => void;
+  compactMode?: boolean;
 };
 
 const STALE_PREVIEW_CODES = new Set([
@@ -115,6 +116,7 @@ export default function GeneratorOnlyPanel({
   onCheckReadiness,
   onDatasetSaved,
   onOpenDatasetLibrary,
+  compactMode = false,
 }: GeneratorOnlyPanelProps) {
   const [generating, setGenerating] = useState(false);
   const [updatingPreview, setUpdatingPreview] = useState(false);
@@ -444,6 +446,8 @@ export default function GeneratorOnlyPanel({
         readinessError={readinessError}
         onCheckReadiness={onCheckReadiness}
         showExecutionScopeSelector={false}
+        hideTargetSelector={compactMode}
+        compactAdvanced={compactMode}
         disabled={anyBusy}
       />
 

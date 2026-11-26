@@ -290,6 +290,11 @@ def create_app(catalog, *, port=8092, admission_policy=None,
             "resume_policy_changed": "The reviewed response policy changed since the original scan started.",
             "resume_application_context_changed": "The target Application Context changed since the original scan started.",
             "unified_report_integrity_failed": "Unified lineage report export is blocked because persisted checkpoint state failed integrity validation. Individual session reports remain accessible.",
+            "generic_target_execution_in_progress": "Another live security test is already active for this Target. Wait for it to finish or open the active progress view instead of launching a concurrent run.",
+            "target_execution_in_progress": "Another live security test is already active for this Target. Open the active workflow/run progress instead of starting a duplicate.",
+            "workflow_persistence_failed": "Failed to persist durable workflow state safely; operation aborted.",
+            "worker_startup_failed": "Failed to start background workflow worker; live target lock was released safely.",
+            "runner_worker_startup_failed": "Failed to start background scan worker; live target lock was released safely.",
         }
         message = preview_messages.get(code) or ("Controlled run request rejected; inspect the local run record before retrying."
                    if request.path == "/api/testing/runs" else
@@ -553,6 +558,11 @@ def create_app(catalog, *, port=8092, admission_policy=None,
             policy_store=gen_policy_store,
         )
     gen_preview_store = GeneratorPreviewStore()
+    default_workflows_dir = (
+        (generic_run_service.runs_root.parent / "generator-workflows")
+        if generic_run_service is not None and getattr(generic_run_service, "runs_root", None) is not None
+        else ((catalog.data_dir / "generator-workflows") if managed else None)
+    )
     gen_orchestrator = (
         GenerateAndRunOrchestrator(
             generator_service=resolved_gen_service,
@@ -561,6 +571,7 @@ def create_app(catalog, *, port=8092, admission_policy=None,
             application_contexts=application_contexts,
             generic_run_service=generic_run_service,
             policy_store=gen_policy_store,
+            workflows_root=default_workflows_dir,
         )
         if gen_dataset_repo is not None
         else None

@@ -1226,7 +1226,7 @@ describe('Post UI/UX Redesign Targeted Correctness Fixes (P0 / P1 / P2)', () => 
 
     // Clicking New Scan while pendingSubmission is still unresolved must preserve pendingSubmission and keep Step 1 locked
     fireEvent.click(screen.getByRole('button', { name: 'New Scan' }));
-    expect(await screen.findByRole('heading', { name: '1 · Select Target and Dataset' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '1 · Select Target and Test Source' })).toBeInTheDocument();
     expect(JSON.parse(sessionStorage.getItem('secagent_pending_generic_submission') || 'null')?.submission_id).toBe(
       originalSubmissionId,
     );

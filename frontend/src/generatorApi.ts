@@ -441,7 +441,16 @@ export type WorkflowOverallStatus =
   | 'completed'
   | 'failed'
   | 'blocked'
-  | 'partial_stopped';
+  | 'partial_stopped'
+  | 'interrupted';
+
+export type ActiveTargetReservation = {
+  target_id: string;
+  owner_kind: 'workflow' | 'generic_run' | string;
+  workflow_id: string | null;
+  run_id: string | null;
+  reserved_at: string | null;
+};
 
 export const LIVE_GENERATE_AND_RUN_STAGES: readonly {
   id: WorkflowStageName;
@@ -548,6 +557,34 @@ export type PendingGenerateAndRunSubmission = {
 };
 
 const PENDING_GNR_SUBMISSION_KEY = 'secagent_pending_gnr_submission';
+const ACTIVE_GNR_WORKFLOW_KEY = 'secagent_active_gnr_workflow_id';
+
+export function saveActiveWorkflowId(workflowId: string): void {
+  try {
+    if (/^gnr-[a-f0-9]{32}$/.test(workflowId)) {
+      sessionStorage.setItem(ACTIVE_GNR_WORKFLOW_KEY, workflowId);
+    }
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+export function loadActiveWorkflowId(): string | null {
+  try {
+    const val = sessionStorage.getItem(ACTIVE_GNR_WORKFLOW_KEY);
+    return val && /^gnr-[a-f0-9]{32}$/.test(val) ? val : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearActiveWorkflowId(): void {
+  try {
+    sessionStorage.removeItem(ACTIVE_GNR_WORKFLOW_KEY);
+  } catch {
+    // Ignore storage errors.
+  }
+}
 
 export function savePendingGenerateAndRunSubmission(
   entry: PendingGenerateAndRunSubmission,
@@ -656,6 +693,20 @@ export type GenerateAndRunSnapshot = {
   total_cases: number;
   progress_percent: number;
   verdict_counts: Record<string, number>;
+  verdict_schema_version?: string | null;
+  verdict_policy_version?: string | null;
+  evaluation_summary?: {
+    schema_version?: string;
+    policy_version?: string;
+    total_cases?: number;
+    evaluated_cases?: number;
+    pass_count?: number;
+    fail_count?: number;
+    technical_failure_count?: number;
+    technical_failure_reasons?: Record<string, number>;
+    not_evaluated_count?: number;
+    not_evaluated_reasons?: Record<string, number>;
+  } | null;
   evidence_summary: Record<string, unknown>;
   judge_metadata: Record<string, unknown> | null;
   evaluation_error_code: string | null;
@@ -744,12 +795,19 @@ export function extractActiveCounts(
 export class GeneratorApiError extends Error {
   readonly code: string;
   readonly status: number;
+  readonly conflict: ActiveTargetReservation | null;
 
-  constructor(code: string, message: string, status: number) {
+  constructor(
+    code: string,
+    message: string,
+    status: number,
+    conflict: ActiveTargetReservation | null = null,
+  ) {
     super(message);
     this.name = 'GeneratorApiError';
     this.code = code;
     this.status = status;
+    this.conflict = conflict;
   }
 }
 
@@ -797,14 +855,34 @@ async function generatorFetch<T>(
       'error' in parsed &&
       parsed.error &&
       typeof parsed.error === 'object'
-        ? (parsed.error as { code?: unknown; message?: unknown })
+        ? (parsed.error as { code?: unknown; message?: unknown; conflict?: unknown })
         : null;
     const code = typeof errObj?.code === 'string' ? errObj.code : `http_${res.status}`;
     const message =
       typeof errObj?.message === 'string'
         ? errObj.message
         : `Generator API request failed (HTTP ${res.status}).`;
-    throw new GeneratorApiError(code, message, res.status);
+    const rawConflict = errObj?.conflict;
+    const conflict: ActiveTargetReservation | null =
+      rawConflict && typeof rawConflict === 'object' && 'target_id' in rawConflict
+        ? {
+            target_id: String((rawConflict as Record<string, unknown>).target_id ?? ''),
+            owner_kind: String((rawConflict as Record<string, unknown>).owner_kind ?? 'workflow'),
+            workflow_id:
+              typeof (rawConflict as Record<string, unknown>).workflow_id === 'string'
+                ? String((rawConflict as Record<string, unknown>).workflow_id)
+                : null,
+            run_id:
+              typeof (rawConflict as Record<string, unknown>).run_id === 'string'
+                ? String((rawConflict as Record<string, unknown>).run_id)
+                : null,
+            reserved_at:
+              typeof (rawConflict as Record<string, unknown>).reserved_at === 'string'
+                ? String((rawConflict as Record<string, unknown>).reserved_at)
+                : null,
+          }
+        : null;
+    throw new GeneratorApiError(code, message, res.status, conflict);
   }
 
   if (!parsed || typeof parsed !== 'object') {
@@ -926,6 +1004,22 @@ export const generatorApi = {
         signal,
       },
     ).then((r) => r.workflow),
+
+  listGenerateAndRunWorkflows: (
+    nonce: string,
+    secret = '',
+    signal?: AbortSignal,
+  ) =>
+    generatorFetch<{
+      workflow_schema_version: '1.0.0';
+      workflows: GenerateAndRunSnapshot[];
+      active_reservations?: ActiveTargetReservation[];
+    }>('generate-and-run/workflows', {
+      method: 'GET',
+      nonce,
+      secret,
+      signal,
+    }),
 
   getGenerateAndRunStatus: (
     workflowId: string,

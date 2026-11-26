@@ -18,6 +18,7 @@ export interface ScanPreviewPanelProps {
   onSelectCases: (nextIds: string[]) => void;
   onToggleAuthorized: (checked: boolean) => void;
   onStartScan: () => void;
+  onOpenActiveConflict?: (workflowId?: string | null, runId?: string | null) => void;
 }
 
 export default function ScanPreviewPanel({
@@ -37,6 +38,7 @@ export default function ScanPreviewPanel({
   onSelectCases,
   onToggleAuthorized,
   onStartScan,
+  onOpenActiveConflict,
 }: ScanPreviewPanelProps) {
   const judgeReadyFromPreview = preview.judge_status
     ? preview.judge_status.judge_ready
@@ -55,8 +57,9 @@ export default function ScanPreviewPanel({
   const targetBudget = preview.target_request_budget ?? (scanMode === 'offline' ? 0 : preview.ready_count);
   const judgeBudget = preview.judge_request_budget ?? (useJudge ? preview.ready_count : 0);
   const selectedSet = new Set(selectedCaseIds);
+  const activeTargetConflict = scanMode === 'live' ? (preview.active_target_reservation ?? null) : null;
   const isLocked = busy || Boolean(submissionLocked);
-  const canStart = authorized && !preview.blocker && preview.ready_count > 0 && !isLocked;
+  const canStart = authorized && !preview.blocker && !activeTargetConflict && preview.ready_count > 0 && !isLocked;
 
   return (
     <section className="panel preview-shell" aria-label="Step 2: Scan Preview">
@@ -242,6 +245,32 @@ export default function ScanPreviewPanel({
           )}
         </section>
       </div>
+
+      {activeTargetConflict && (
+        <div className="notice warn" role="alert" data-testid="preview-target-conflict-banner">
+          <strong>
+            Active Live Execution on Target <code>{activeTargetConflict.target_id}</code>:
+          </strong>{' '}
+          Another workflow or live scan is currently running on this target (
+          {activeTargetConflict.workflow_id
+            ? `Workflow ${activeTargetConflict.workflow_id}`
+            : activeTargetConflict.run_id
+              ? `Run ${activeTargetConflict.run_id}`
+              : 'active execution'}
+          ). Wait for it to finish or switch to Offline Evaluation.
+          {(activeTargetConflict.workflow_id || activeTargetConflict.run_id) && onOpenActiveConflict && (
+            <div style={{ marginTop: '0.5rem' }}>
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => onOpenActiveConflict(activeTargetConflict.workflow_id, activeTargetConflict.run_id)}
+              >
+                Open Active Progress →
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       {preview.blocker && (
         <div className="notice error" role="alert">

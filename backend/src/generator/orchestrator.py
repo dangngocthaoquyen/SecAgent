@@ -26,8 +26,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
+import os
+from pathlib import Path
 import re
+import secrets
 from threading import Event, RLock, Thread
+import time
 from typing import Any, Callable, Literal, Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -79,6 +83,7 @@ WorkflowOverallStatus = Literal[
     "failed",
     "blocked",
     "partial_stopped",
+    "interrupted",
 ]
 EvaluationMode = Literal["rule_only", "hybrid"]
 ExecutionMode = Literal["live"]
@@ -121,6 +126,8 @@ _PREFLIGHT_ERROR_CODES: frozenset[str] = frozenset({
     "unreviewed_inline_rules_rejected",
     "invalid_evaluation_rule_contract",
     "partial_execution_not_authorized",
+    "generic_target_execution_in_progress",
+    "target_execution_in_progress",
 })
 
 _EVALUATION_ERROR_CODES: frozenset[str] = frozenset({
@@ -137,6 +144,10 @@ _EXECUTION_ERROR_CODES: frozenset[str] = frozenset({
     "runner_failed",
     "runner_interrupted",
     "runner_cancelled",
+    "workflow_interrupted_by_restart",
+    "workflow_persistence_failed",
+    "worker_startup_failed",
+    "runner_worker_startup_failed",
     "dispatch_checkpoint_write_failed",
     "persistence_integrity_failed",
 })
@@ -175,6 +186,12 @@ _SAFE_PUBLIC_ERROR_MESSAGES: dict[str, str] = {
     "runner_failed": "Generic Runner ended in failed state.",
     "runner_interrupted": "Generic Runner execution was interrupted; inspect checkpoint resume eligibility.",
     "runner_cancelled": "Generic Runner execution was cancelled.",
+    "workflow_interrupted_by_restart": "Backend process restarted before this workflow completed. Inspect saved datasets or start a fresh scan instead of auto-retrying.",
+    "workflow_persistence_failed": "Failed to persist durable workflow state safely; operation aborted.",
+    "worker_startup_failed": "Failed to start background workflow worker; live target reservation was released safely.",
+    "runner_worker_startup_failed": "Failed to start background scan worker; live target reservation was released safely.",
+    "generic_target_execution_in_progress": "Another live security test is already active for this Target. Wait for it to finish or open the active progress view.",
+    "target_execution_in_progress": "Another live security test is already active for this Target. Open the active workflow or run progress instead of starting a duplicate.",
     "dispatch_checkpoint_write_failed": "Runner failed to write execution checkpoint safely.",
     "persistence_integrity_failed": "Run report persistence integrity verification failed.",
 }
@@ -260,12 +277,14 @@ class OrchestrationError(ValueError):
         *,
         status_code: int = 400,
         stage: WorkflowStageName | None = None,
+        conflict: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status_code = status_code
         self.stage = stage
+        self.conflict = dict(conflict) if isinstance(conflict, dict) else None
 
 
 class GenerateAndRunRequest(StrictGeneratorModel):
@@ -653,6 +672,18 @@ def _summarize_cases(run_record: dict[str, Any]) -> tuple[dict[str, Any], ...]:
                 "semantic_invoked": bool(item["semantic_invoked"]) if "semantic_invoked" in item else None,
                 "provider_fault_code": safe_fault,
                 "json_validation_status": safe_val_status,
+                "http_status_code": (
+                    int(item["http_status_code"])
+                    if isinstance(item.get("http_status_code"), int)
+                    and not isinstance(item.get("http_status_code"), bool)
+                    else None
+                ),
+                "duration_ms": (
+                    round(float(item["duration_ms"]), 1)
+                    if isinstance(item.get("duration_ms"), (int, float))
+                    and not isinstance(item.get("duration_ms"), bool)
+                    else None
+                ),
                 "reason": safe_reason,
             }
         )
@@ -787,11 +818,18 @@ class _WorkflowEntry:
         self.runner_policy_id: str | None = None
         self.runner_policy_ids_by_asi: dict[str, str] = {}
         self.rerun_history: list[RerunHistoryEntry] = []
+        self.rerun_submissions: dict[str, tuple[str, str]] = {}  # sub_id -> (rerun_digest, run_id)
         self.rerun_starting: bool = False
 
         self.error_stage: WorkflowStageName | None = None
         self.error_code: str | None = None
         self.error_message: str | None = None
+
+        # G13-R05: Per-workflow persistence lock + monotonic revision prevent out-of-order disk overwrites
+        # without holding the global orchestrator lock during disk I/O or LLM/Target execution.
+        self._persist_lock = RLock()
+        self.persist_revision: int = 0
+        self._last_persisted_revision: int = 0
 
     def mark_stage(
         self,
@@ -942,7 +980,7 @@ class _WorkflowEntry:
         else:
             self.mark_stage("executing", "failed", now_iso, error_code=safe_code, error_message=safe_msg)
             self.skip_remaining_after("executing", now_iso)
-        self.status = "failed"
+        self.status = "interrupted" if run_status == "interrupted" else "failed"
         self.error_stage = stage
         self.error_code = safe_code
         self.error_message = safe_msg
@@ -1074,6 +1112,233 @@ class _WorkflowEntry:
             provenance=provenance,
         )
 
+    def to_persisted_doc(self) -> dict[str, Any]:
+        """Serialize secret-free durable workflow state for restart recovery."""
+        return {
+            "storage_version": 1,
+            "persist_revision": int(self.persist_revision),
+            "owner_digest": self.owner_digest,
+            "request_digest": self.request_digest,
+            "req_meta": {
+                "target_id": self.req.target_id,
+                "counts_by_asi": dict(self.req.counts_by_asi),
+                "language": self.req.language,
+                "requested_scopes": dict(self.req.requested_scopes),
+                "policy_ids_by_asi": dict(self.req.policy_ids_by_asi),
+                "deduplicate_across_asi": bool(self.req.deduplicate_across_asi),
+                "max_calls_per_asi": int(self.req.max_calls_per_asi),
+                "evaluation_mode": self.req.evaluation_mode,
+                "execution_mode": self.req.execution_mode,
+                "allow_partial_execution": bool(self.req.allow_partial_execution),
+                "dataset_name": self.req.dataset_name,
+            },
+            "runner_asi_category": self.runner_asi_category,
+            "runner_policy_id": self.runner_policy_id,
+            "runner_policy_ids_by_asi": dict(self.runner_policy_ids_by_asi),
+            "reviewed_policies": dict(self.reviewed_policies),
+            "rerun_submissions": {
+                k: {"digest": v[0], "run_id": v[1]}
+                for k, v in self.rerun_submissions.items()
+            },
+            "snapshot": self.to_snapshot().model_dump(mode="json"),
+        }
+
+    @classmethod
+    def from_persisted_doc(cls, doc: dict[str, Any]) -> "_WorkflowEntry | None":
+        """Reconstruct a workflow entry from durable storage fail-closed."""
+        try:
+            if not isinstance(doc, dict) or doc.get("storage_version") != 1:
+                return None
+            owner_digest = str(doc.get("owner_digest") or "")
+            request_digest = str(doc.get("request_digest") or "")
+            snap = doc.get("snapshot")
+            req_meta = doc.get("req_meta")
+            if (
+                not _HEX64_RE.fullmatch(owner_digest)
+                or not _HEX64_RE.fullmatch(request_digest)
+                or not isinstance(snap, dict)
+                or not isinstance(req_meta, dict)
+            ):
+                return None
+            wf_id = str(snap.get("workflow_id") or "")
+            if not _WORKFLOW_ID_RE.fullmatch(wf_id):
+                return None
+            raw_sub = snap.get("submission_id")
+            sub_id = str(raw_sub) if isinstance(raw_sub, str) and _HEX32_RE.fullmatch(raw_sub) else None
+            counts = req_meta.get("counts_by_asi")
+            if not isinstance(counts, dict) or not counts:
+                counts = {str(code): 1 for code in (snap.get("selected_asi") or ["ASI01"])}
+            req = GenerateAndRunRequest(
+                target_id=str(req_meta.get("target_id") or snap.get("target_id") or ""),
+                counts_by_asi={str(k): int(v) for k, v in counts.items()},
+                language=req_meta.get("language", "en"),
+                requested_scopes=dict(req_meta.get("requested_scopes") or {}),
+                policy_ids_by_asi=dict(req_meta.get("policy_ids_by_asi") or {}),
+                deduplicate_across_asi=bool(req_meta.get("deduplicate_across_asi", False)),
+                max_calls_per_asi=int(req_meta.get("max_calls_per_asi", 1)),
+                evaluation_mode=req_meta.get("evaluation_mode", snap.get("initial_evaluation_mode", "rule_only")),
+                execution_mode=req_meta.get("execution_mode", "live"),
+                authorization_confirmed=True,
+                allow_partial_execution=bool(req_meta.get("allow_partial_execution", False)),
+                dataset_name=req_meta.get("dataset_name"),
+                submission_id=sub_id,
+            )
+            selected_asi = tuple(normalize_asi_code(c) for c in (snap.get("selected_asi") or list(counts.keys())))
+            entry = cls(
+                workflow_id=wf_id,
+                owner_digest=owner_digest,
+                submission_id=sub_id,
+                request_digest=request_digest,
+                req=req,
+                selected_asi=selected_asi,
+                requested_count=int(snap.get("requested_count") or sum(req.counts_by_asi.values())),
+                created_at=str(snap.get("created_at") or datetime.now(timezone.utc).isoformat()),
+            )
+            entry.updated_at = str(snap.get("updated_at") or entry.created_at)
+            entry.completed_at = snap.get("completed_at")
+            entry.status = snap.get("status", "failed")
+            entry.current_stage = snap.get("current_stage", "generating")
+            entry.active_evaluation_mode = snap.get("evaluation_mode", req.evaluation_mode)
+            stages_raw = snap.get("stages")
+            if isinstance(stages_raw, list):
+                for st in stages_raw:
+                    if isinstance(st, dict) and st.get("stage") in entry.stages:
+                        entry.stages[st["stage"]] = {
+                            "stage": st["stage"],
+                            "status": st.get("status", "pending"),
+                            "started_at": st.get("started_at"),
+                            "finished_at": st.get("finished_at"),
+                            "detail": st.get("detail"),
+                            "error_code": st.get("error_code"),
+                            "error_message": st.get("error_message"),
+                        }
+            entry.target_revision_sha256 = snap.get("target_revision_sha256")
+            entry.application_context_revision_sha256 = snap.get("application_context_revision_sha256")
+            entry.context_snapshot_sha256 = snap.get("context_snapshot_sha256")
+            entry.generation_id = snap.get("generation_id")
+            entry.provider_id = snap.get("provider_id")
+            entry.model = snap.get("model")
+            entry.generation_overall_status = snap.get("generation_overall_status")
+            entry.generated_count = int(snap.get("generated_count") or 0)
+            entry.accepted_count = int(snap.get("accepted_count") or 0)
+            entry.rejected_count = int(snap.get("rejected_count") or 0)
+            entry.meets_requested_counts = bool(snap.get("meets_requested_counts", False))
+            entry.partial_generation = bool(snap.get("partial_generation", False))
+            entry.rejection_reason_counts = dict(snap.get("rejection_reason_counts") or {})
+            entry.asi_generation_summaries = dict(snap.get("asi_generation_summaries") or {})
+            tok = snap.get("generation_token_usage")
+            entry.generation_token_usage = TokenUsage.model_validate(tok) if isinstance(tok, dict) else None
+            entry.quality_summary = dict(snap["quality_summary"]) if isinstance(snap.get("quality_summary"), dict) else None
+            entry.reviewed_policies = dict(doc.get("reviewed_policies") or {})
+            entry.auto_persisted = bool(snap.get("auto_persisted", False))
+            entry.dataset_id = snap.get("dataset_id")
+            entry.dataset_name = snap.get("dataset_name")
+            entry.dataset_file_sha256 = snap.get("dataset_file_sha256")
+            entry.testcase_ids = tuple(str(x) for x in (snap.get("testcase_ids") or []))
+            entry.partial_execution = bool(snap.get("partial_execution", False))
+            entry.preflight_selected_cases = int(snap.get("preflight_selected_cases") or 0)
+            entry.preflight_ready_count = int(snap.get("preflight_ready_count") or 0)
+            entry.preflight_skipped_count = int(snap.get("preflight_skipped_count") or 0)
+            entry.preflight_unsupported_count = int(snap.get("preflight_unsupported_count") or 0)
+            entry.preflight_skipped_reasons = tuple(
+                dict(x) for x in (snap.get("preflight_skipped_reasons") or []) if isinstance(x, dict)
+            )
+            entry.run_id = snap.get("run_id")
+            entry.run_status = snap.get("run_status")
+            entry.executed_cases = int(snap.get("executed_cases") or 0)
+            entry.total_cases = int(snap.get("total_cases") or 0)
+            entry.progress_percent = int(snap.get("progress_percent") or 0)
+            entry.verdict_counts = {str(k): int(v) for k, v in (snap.get("verdict_counts") or {}).items()}
+            entry.verdict_schema_version = snap.get("verdict_schema_version")
+            entry.verdict_policy_version = snap.get("verdict_policy_version")
+            entry.evaluation_summary = (
+                dict(snap["evaluation_summary"]) if isinstance(snap.get("evaluation_summary"), dict) else None
+            )
+            entry.evidence_summary = dict(snap.get("evidence_summary") or {})
+            entry.judge_metadata = (
+                dict(snap["judge_metadata"]) if isinstance(snap.get("judge_metadata"), dict) else None
+            )
+            entry.evaluation_error_code = snap.get("evaluation_error_code")
+            entry.cases_summary = tuple(
+                dict(x) for x in (snap.get("cases_summary") or []) if isinstance(x, dict)
+            )
+            entry.runner_asi_category = str(doc.get("runner_asi_category") or "auto")
+            entry.runner_policy_id = doc.get("runner_policy_id")
+            entry.runner_policy_ids_by_asi = dict(doc.get("runner_policy_ids_by_asi") or {})
+            entry.rerun_history = [
+                RerunHistoryEntry.model_validate(item)
+                for item in (snap.get("rerun_history") or [])
+                if isinstance(item, dict)
+            ]
+            raw_rerun_subs = doc.get("rerun_submissions")
+            if isinstance(raw_rerun_subs, dict):
+                for sub_k, sub_v in raw_rerun_subs.items():
+                    if (
+                        isinstance(sub_k, str)
+                        and _HEX32_RE.fullmatch(sub_k)
+                        and isinstance(sub_v, dict)
+                        and isinstance(sub_v.get("digest"), str)
+                        and isinstance(sub_v.get("run_id"), str)
+                        and _HEX32_RE.fullmatch(sub_v["run_id"])
+                    ):
+                        entry.rerun_submissions[sub_k] = (sub_v["digest"], sub_v["run_id"])
+            entry.error_stage = snap.get("error_stage")
+            entry.error_code = snap.get("error_code")
+            entry.error_message = snap.get("error_message")
+            raw_rev = doc.get("persist_revision")
+            if isinstance(raw_rev, int) and not isinstance(raw_rev, bool) and raw_rev >= 0:
+                entry.persist_revision = raw_rev
+                entry._last_persisted_revision = raw_rev
+            return entry
+        except Exception:
+            return None
+
+
+def _write_json_atomic(target_file: Path, payload: dict[str, Any]) -> None:
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = target_file.parent / f".{target_file.name}.{secrets.token_hex(6)}.tmp"
+    data = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    tmp_file.write_bytes(data)
+    last_err: OSError | None = None
+    for _ in range(10):
+        try:
+            os.replace(tmp_file, target_file)
+            return
+        except OSError as exc:
+            last_err = exc
+            time.sleep(0.005)
+    try:
+        tmp_file.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if last_err is not None:
+        raise last_err
+
+
+class _LocalReservationHandle:
+    """Fallback server-owned handle when GenericRunService mock lacks reserve_live_target."""
+
+    __slots__ = ("_target_id", "_capability_token", "_adopted_run_id", "_released")
+
+    def __init__(self, target_id: str) -> None:
+        self._target_id = target_id
+        self._capability_token = secrets.token_hex(32)
+        self._adopted_run_id: str | None = None
+        self._released: bool = False
+
+    @property
+    def adopted(self) -> bool:
+        return self._adopted_run_id is not None
+
+
+def _rerun_fingerprint(eval_mode: EvaluationMode, allow_partial: bool) -> str:
+    encoded = json.dumps(
+        {"evaluation_mode": eval_mode, "allow_partial_execution": bool(allow_partial)},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
 
 class GenerateAndRunOrchestrator:
     """Thread-safe coordinator for Mode 1 (Generate & Run) backed by existing SecAgent services."""
@@ -1090,6 +1355,7 @@ class GenerateAndRunOrchestrator:
         normalizer: Callable[[bytes, str], Any] = normalize_dataset,
         max_workflows: int = DEFAULT_MAX_WORKFLOWS,
         wall_clock: Callable[[], datetime] | None = None,
+        workflows_root: Path | None = None,
     ) -> None:
         self._generator_service = generator_service
         self._dataset_repo = dataset_repo
@@ -1100,10 +1366,321 @@ class GenerateAndRunOrchestrator:
         self._normalizer = normalizer
         self._max_workflows = max_workflows
         self._wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
+        self._workflows_root = Path(workflows_root).resolve() if workflows_root is not None else None
         self._lock = RLock()
         self._workflows: dict[str, _WorkflowEntry] = {}
+        self._live_workflow_ids: set[str] = set()
+        self._local_live_reservations: dict[str, dict[str, Any]] = {}
         self._submissions: dict[str, tuple[str, str, str]] = {}  # sub_id -> (owner_digest, req_digest, workflow_id)
         self._in_flight_submissions: dict[str, tuple[str, str, Event]] = {}
+        if self._workflows_root is not None:
+            self._workflows_root.mkdir(parents=True, exist_ok=True)
+            self._hydrate_from_disk()
+
+    def _workflow_file(self, workflow_id: str) -> Path | None:
+        if self._workflows_root is None or not _WORKFLOW_ID_RE.fullmatch(workflow_id):
+            return None
+        return self._workflows_root / f"{workflow_id}.json"
+
+    def _submission_file(self, sub_id: str) -> Path | None:
+        if self._workflows_root is None or not _HEX32_RE.fullmatch(sub_id):
+            return None
+        return self._workflows_root / "submissions" / f"{sub_id}.json"
+
+    def _persist_entry(self, entry: _WorkflowEntry) -> None:
+        """Persist secret-free durable workflow state fail-closed with per-workflow serialization.
+
+        G13-R05: Acquires only the per-workflow `_persist_lock` around snapshot+atomic-write,
+        and advances a monotonic `persist_revision`, so concurrent persistence calls for the
+        same workflow can never overwrite a newer committed state with an older snapshot,
+        while never holding the global `_lock` during disk I/O or LLM/Target execution.
+        """
+        wf_path = self._workflow_file(entry.workflow_id)
+        if wf_path is None:
+            return
+        with entry._persist_lock:
+            with self._lock:
+                entry.persist_revision += 1
+                target_rev = entry.persist_revision
+                doc = entry.to_persisted_doc()
+                stage = entry.current_stage
+            if target_rev < entry._last_persisted_revision:
+                return
+            try:
+                _write_json_atomic(wf_path, doc)
+            except OSError as exc:
+                raise OrchestrationError(
+                    "workflow_persistence_failed",
+                    _SAFE_PUBLIC_ERROR_MESSAGES["workflow_persistence_failed"],
+                    status_code=500,
+                    stage=stage,
+                ) from exc
+            entry._last_persisted_revision = target_rev
+
+    def _persist_submission(
+        self,
+        sub_id: str,
+        owner_digest: str,
+        req_digest: str,
+        workflow_id: str,
+        created_at: str,
+    ) -> None:
+        """Persist secret-free submission idempotency index fail-closed."""
+        sub_path = self._submission_file(sub_id)
+        if sub_path is None:
+            return
+        try:
+            _write_json_atomic(
+                sub_path,
+                {
+                    "submission_id": sub_id,
+                    "owner_digest": owner_digest,
+                    "request_digest": req_digest,
+                    "workflow_id": workflow_id,
+                    "created_at": created_at,
+                },
+            )
+        except OSError as exc:
+            raise OrchestrationError(
+                "workflow_persistence_failed",
+                _SAFE_PUBLIC_ERROR_MESSAGES["workflow_persistence_failed"],
+                status_code=500,
+                stage="preflight",
+            ) from exc
+
+    def _record_persistence_failure(
+        self,
+        entry: _WorkflowEntry,
+        stage: WorkflowStageName,
+    ) -> None:
+        """Transition workflow cleanly to failed when durable checkpoint persistence fails."""
+        now = self._now_iso()
+        msg = _SAFE_PUBLIC_ERROR_MESSAGES["workflow_persistence_failed"]
+        with self._lock:
+            entry.mark_stage(
+                stage,
+                "failed",
+                now,
+                error_code="workflow_persistence_failed",
+                error_message=msg,
+            )
+            entry.skip_remaining_after(stage, now)
+            entry.status = "failed"
+            entry.error_stage = stage
+            entry.error_code = "workflow_persistence_failed"
+            entry.error_message = msg
+            entry.completed_at = now
+
+    def _reconcile_non_live_entry(self, entry: _WorkflowEntry) -> bool:
+        """Never leave an orphaned running workflow as a ghost after process restart."""
+        changed = False
+        with self._lock:
+            if entry.workflow_id in self._live_workflow_ids or entry.status != "running":
+                return False
+            run_id = entry.run_id
+        now_iso = self._now_iso()
+        if run_id and self._generic_run_service is not None:
+            latest = self._generic_run_service.get_run(run_id)
+            with self._lock:
+                if entry.workflow_id in self._live_workflow_ids:
+                    return False
+                if isinstance(latest, dict):
+                    entry.sync_from_run_record(latest, now_iso)
+                    changed = True
+                else:
+                    entry.mark_stage(
+                        "executing",
+                        "failed",
+                        now_iso,
+                        error_code="workflow_interrupted_by_restart",
+                        error_message=_SAFE_PUBLIC_ERROR_MESSAGES["workflow_interrupted_by_restart"],
+                    )
+                    entry.skip_remaining_after("executing", now_iso)
+                    entry.status = "interrupted"
+                    entry.error_stage = "executing"
+                    entry.error_code = "workflow_interrupted_by_restart"
+                    entry.error_message = _SAFE_PUBLIC_ERROR_MESSAGES["workflow_interrupted_by_restart"]
+                    entry.completed_at = now_iso
+                    changed = True
+        else:
+            with self._lock:
+                if entry.workflow_id in self._live_workflow_ids:
+                    return False
+                active_stage: WorkflowStageName = entry.current_stage
+                for st_name in WORKFLOW_STAGES:
+                    if entry.stages[st_name]["status"] == "running":
+                        active_stage = st_name  # type: ignore[assignment]
+                        break
+                msg = _SAFE_PUBLIC_ERROR_MESSAGES["workflow_interrupted_by_restart"]
+                entry.mark_stage(
+                    active_stage,
+                    "failed",
+                    now_iso,
+                    error_code="workflow_interrupted_by_restart",
+                    error_message=msg,
+                )
+                entry.skip_remaining_after(active_stage, now_iso)
+                entry.status = "interrupted"
+                entry.error_stage = active_stage
+                entry.error_code = "workflow_interrupted_by_restart"
+                entry.error_message = msg
+                entry.completed_at = now_iso
+                changed = True
+        if changed:
+            try:
+                self._persist_entry(entry)
+            except OrchestrationError:
+                # Reconciled status remains interrupted (never ghost-running) and records persistence failure.
+                with self._lock:
+                    entry.error_code = "workflow_persistence_failed"
+                    entry.error_message = _SAFE_PUBLIC_ERROR_MESSAGES["workflow_persistence_failed"]
+        return changed
+
+    def _load_persisted_entry(self, workflow_id: str) -> _WorkflowEntry | None:
+        wf_path = self._workflow_file(workflow_id)
+        if wf_path is None or not wf_path.is_file():
+            return None
+        try:
+            raw = json.loads(wf_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        entry = _WorkflowEntry.from_persisted_doc(raw)
+        if entry is None:
+            return None
+        self._reconcile_non_live_entry(entry)
+        with self._lock:
+            if workflow_id not in self._workflows:
+                self._workflows[workflow_id] = entry
+            return self._workflows[workflow_id]
+
+    def _load_persisted_submission(self, sub_id: str) -> tuple[str, str, str] | None:
+        sub_path = self._submission_file(sub_id)
+        if sub_path is None or not sub_path.is_file():
+            return None
+        try:
+            raw = json.loads(sub_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(raw, dict):
+            return None
+        owner_d = raw.get("owner_digest")
+        req_d = raw.get("request_digest")
+        wf_id = raw.get("workflow_id")
+        if (
+            isinstance(owner_d, str)
+            and _HEX64_RE.fullmatch(owner_d)
+            and isinstance(req_d, str)
+            and _HEX64_RE.fullmatch(req_d)
+            and isinstance(wf_id, str)
+            and _WORKFLOW_ID_RE.fullmatch(wf_id)
+        ):
+            rec = (owner_d, req_d, wf_id)
+            with self._lock:
+                self._submissions[sub_id] = rec
+            return rec
+        return None
+
+    def _hydrate_from_disk(self) -> None:
+        if self._workflows_root is None or not self._workflows_root.is_dir():
+            return
+        sub_dir = self._workflows_root / "submissions"
+        if sub_dir.is_dir():
+            for sub_p in sorted(sub_dir.glob("*.json")):
+                if _HEX32_RE.fullmatch(sub_p.stem):
+                    self._load_persisted_submission(sub_p.stem)
+        loaded: list[_WorkflowEntry] = []
+        for wf_p in sorted(self._workflows_root.glob("gnr-*.json")):
+            if not _WORKFLOW_ID_RE.fullmatch(wf_p.stem):
+                continue
+            entry = self._load_persisted_entry(wf_p.stem)
+            if entry is not None:
+                loaded.append(entry)
+        loaded.sort(key=lambda e: e.created_at, reverse=True)
+        with self._lock:
+            for entry in loaded[: self._max_workflows]:
+                self._workflows[entry.workflow_id] = entry
+
+    def _reserve_live_target(
+        self,
+        target_id: str,
+        *,
+        workflow_id: str,
+    ) -> Any:
+        """Acquire shared live target ownership via GenericRunService and return a server-owned handle."""
+        if self._generic_run_service is not None and hasattr(self._generic_run_service, "reserve_live_target"):
+            try:
+                return self._generic_run_service.reserve_live_target(
+                    target_id,
+                    owner_kind="workflow",
+                    workflow_id=workflow_id,
+                )
+            except Exception as exc:
+                conflict = getattr(exc, "conflict", None)
+                if isinstance(conflict, dict) or str(exc) == "generic_target_execution_in_progress":
+                    raise OrchestrationError(
+                        "target_execution_in_progress",
+                        _SAFE_PUBLIC_ERROR_MESSAGES["target_execution_in_progress"],
+                        status_code=409,
+                        stage="preflight",
+                        conflict=conflict if isinstance(conflict, dict) else {"target_id": target_id},
+                    ) from None
+                raise
+        now_iso = self._now_iso()
+        with self._lock:
+            existing = self._local_live_reservations.get(target_id)
+            if existing is not None:
+                raise OrchestrationError(
+                    "target_execution_in_progress",
+                    _SAFE_PUBLIC_ERROR_MESSAGES["target_execution_in_progress"],
+                    status_code=409,
+                    stage="preflight",
+                    conflict={
+                        "target_id": existing.get("target_id"),
+                        "owner_kind": existing.get("owner_kind"),
+                        "workflow_id": existing.get("workflow_id"),
+                        "run_id": existing.get("run_id"),
+                        "reserved_at": existing.get("reserved_at"),
+                    },
+                )
+            local_handle = _LocalReservationHandle(target_id)
+            rec = {
+                "target_id": target_id,
+                "handle": local_handle,
+                "owner_kind": "workflow",
+                "workflow_id": workflow_id,
+                "run_id": None,
+                "reserved_at": now_iso,
+            }
+            self._local_live_reservations[target_id] = rec
+            return local_handle
+
+    def _release_live_target(self, target_id: str, *, handle: Any) -> None:
+        if handle is None:
+            return
+        if self._generic_run_service is not None and hasattr(self._generic_run_service, "release_live_target"):
+            self._generic_run_service.release_live_target(target_id, handle=handle)
+            return
+        with self._lock:
+            existing = self._local_live_reservations.get(target_id)
+            if existing is not None and existing.get("handle") is handle:
+                self._local_live_reservations.pop(target_id, None)
+                if hasattr(handle, "_released"):
+                    handle._released = True
+
+    def list_active_reservations(self) -> list[dict[str, Any]]:
+        if self._generic_run_service is not None and hasattr(self._generic_run_service, "list_live_target_reservations"):
+            return list(self._generic_run_service.list_live_target_reservations())
+        with self._lock:
+            return [
+                {
+                    "target_id": v.get("target_id"),
+                    "owner_kind": v.get("owner_kind"),
+                    "workflow_id": v.get("workflow_id"),
+                    "run_id": v.get("run_id"),
+                    "reserved_at": v.get("reserved_at"),
+                }
+                for v in self._local_live_reservations.values()
+            ]
 
     @property
     def available(self) -> bool:
@@ -1171,7 +1748,9 @@ class GenerateAndRunOrchestrator:
         if len(self._workflows) < self._max_workflows:
             return
         completed = [
-            w for w in self._workflows.values() if w.status in {"completed", "failed", "blocked", "partial_stopped"}
+            w
+            for w in self._workflows.values()
+            if w.status in {"completed", "failed", "blocked", "partial_stopped", "interrupted"}
         ]
         if completed:
             oldest = min(completed, key=lambda w: w.created_at)
@@ -1298,13 +1877,18 @@ class GenerateAndRunOrchestrator:
         requested_total = sum(service_req.counts_by_asi.values())
         req_digest = _request_fingerprint(req, service_req)
 
-        # R02: Idempotency & concurrent duplicate-submit guard
+        # R02: Idempotency & concurrent duplicate-submit guard (in-memory + durable disk)
         sub_id = req.submission_id
         in_flight_event: Event | None = None
         if sub_id is not None:
             wait_event: Event | None = None
             with self._lock:
                 existing = self._submissions.get(sub_id)
+            if existing is None:
+                existing = self._load_persisted_submission(sub_id)
+            with self._lock:
+                if existing is None:
+                    existing = self._submissions.get(sub_id)
                 if existing is not None:
                     prev_owner, prev_digest, prev_wf_id = existing
                     if prev_owner != owner_digest or prev_digest != req_digest:
@@ -1314,6 +1898,8 @@ class GenerateAndRunOrchestrator:
                             status_code=409,
                         )
                     wf = self._workflows.get(prev_wf_id)
+                    if wf is None:
+                        wf = self._load_persisted_entry(prev_wf_id)
                     if wf is not None:
                         return self._refresh_and_snapshot(wf, idempotent_replay=True)
                     raise OrchestrationError(
@@ -1339,16 +1925,21 @@ class GenerateAndRunOrchestrator:
                 wait_event.wait(timeout=30.0)
                 with self._lock:
                     existing = self._submissions.get(sub_id)
-                    if existing is not None:
-                        _, _, prev_wf_id = existing
+                if existing is None:
+                    existing = self._load_persisted_submission(sub_id)
+                if existing is not None:
+                    _, _, prev_wf_id = existing
+                    with self._lock:
                         wf = self._workflows.get(prev_wf_id)
-                        if wf is not None:
-                            return self._refresh_and_snapshot(wf, idempotent_replay=True)
-                        raise OrchestrationError(
-                            "workflow_submission_expired",
-                            "This submission_id was already used, but its in-memory workflow snapshot expired.",
-                            status_code=410,
-                        )
+                    if wf is None:
+                        wf = self._load_persisted_entry(prev_wf_id)
+                    if wf is not None:
+                        return self._refresh_and_snapshot(wf, idempotent_replay=True)
+                    raise OrchestrationError(
+                        "workflow_submission_expired",
+                        "This submission_id was already used, but its in-memory workflow snapshot expired.",
+                        status_code=410,
+                    )
                 raise OrchestrationError(
                     "generate_and_run_submission_in_progress",
                     "An identical Generate & Run submission is still initializing.",
@@ -1445,53 +2036,55 @@ class GenerateAndRunOrchestrator:
                     stage="preflight",
                 )
 
-        readiness = assess_target_readiness(
-            target_id=req.target_id,
-            catalog=self._catalog,
-            application_contexts=self._application_contexts,
-            policy_store=self._policy_store,
-            selected_asi=selected_asi,
-            requested_scopes=service_req.requested_scopes or None,
-            policy_ids_by_asi=service_req.policy_ids_by_asi or None,
-        )
-
         now_iso = self._now_iso()
         workflow_id = f"gnr-{uuid4().hex}"
-        entry = _WorkflowEntry(
-            workflow_id=workflow_id,
-            owner_digest=owner_digest,
-            submission_id=req.submission_id,
-            request_digest=req_digest,
-            req=req,
-            selected_asi=selected_asi,
-            requested_count=requested_total,
-            created_at=now_iso,
-        )
-        entry.target_revision_sha256 = snapshot.target_revision_sha256
-        entry.application_context_revision_sha256 = snapshot.application_context_revision_sha256
-        entry.context_snapshot_sha256 = snapshot.snapshot_sha256
-        entry.provider_id = provider_status.provider_id
-        entry.model = provider_status.model
 
-        with self._lock:
-            self._evict_if_full_locked()
-            self._workflows[workflow_id] = entry
-            if req.submission_id is not None:
-                self._submissions[req.submission_id] = (owner_digest, req_digest, workflow_id)
+        # Atomically reserve live target ownership BEFORE creating workflow state or calling LLM.
+        # Conflicting concurrent requests fail closed with HTTP 409 and 0 LLM/Judge/Target calls.
+        reservation_handle = self._reserve_live_target(req.target_id, workflow_id=workflow_id)
+        reservation_handed_to_worker = False
+        persisted_wf_file = False
+        persisted_sub_file = False
+        committed_in_memory = False
+        try:
+            readiness = assess_target_readiness(
+                target_id=req.target_id,
+                catalog=self._catalog,
+                application_contexts=self._application_contexts,
+                policy_store=self._policy_store,
+                selected_asi=selected_asi,
+                requested_scopes=service_req.requested_scopes or None,
+                policy_ids_by_asi=service_req.policy_ids_by_asi or None,
+            )
 
-        blocked_asis = [
-            code
-            for code in selected_asi
-            if code in readiness.asi_assessments and readiness.asi_assessments[code].status == "blocked"
-        ]
-        if blocked_asis:
-            blockers = [
-                f"{code}:{b}"
-                for code in blocked_asis
-                for b in readiness.asi_assessments[code].blockers
+            entry = _WorkflowEntry(
+                workflow_id=workflow_id,
+                owner_digest=owner_digest,
+                submission_id=req.submission_id,
+                request_digest=req_digest,
+                req=req,
+                selected_asi=selected_asi,
+                requested_count=requested_total,
+                created_at=now_iso,
+            )
+            entry.target_revision_sha256 = snapshot.target_revision_sha256
+            entry.application_context_revision_sha256 = snapshot.application_context_revision_sha256
+            entry.context_snapshot_sha256 = snapshot.snapshot_sha256
+            entry.provider_id = provider_status.provider_id
+            entry.model = provider_status.model
+
+            blocked_asis = [
+                code
+                for code in selected_asi
+                if code in readiness.asi_assessments and readiness.asi_assessments[code].status == "blocked"
             ]
-            reason = blockers[0] if blockers else "readiness_blocked"
-            with self._lock:
+            if blocked_asis:
+                blockers = [
+                    f"{code}:{b}"
+                    for code in blocked_asis
+                    for b in readiness.asi_assessments[code].blockers
+                ]
+                reason = blockers[0] if blockers else "readiness_blocked"
                 entry.mark_stage(
                     "generating",
                     "blocked",
@@ -1505,10 +2098,22 @@ class GenerateAndRunOrchestrator:
                 entry.error_code = reason
                 entry.error_message = f"Blocked before generation: {', '.join(blockers[:4])}"
                 entry.completed_at = self._now_iso()
-                return entry.to_snapshot()
+                snap_out = entry.to_snapshot()
+                # G13-R03: Fail closed if critical initial durable persistence fails.
+                self._persist_entry(entry)
+                persisted_wf_file = True
+                if req.submission_id is not None:
+                    self._persist_submission(req.submission_id, owner_digest, req_digest, workflow_id, now_iso)
+                    persisted_sub_file = True
+                with self._lock:
+                    self._evict_if_full_locked()
+                    self._workflows[workflow_id] = entry
+                    if req.submission_id is not None:
+                        self._submissions[req.submission_id] = (owner_digest, req_digest, workflow_id)
+                    committed_in_memory = True
+                return snap_out
 
-        # Mark generating running immediately so status is observable from acceptance (R02)
-        with self._lock:
+            # Mark generating running immediately so status is observable from acceptance (R02)
             entry.mark_stage(
                 "generating",
                 "running",
@@ -1517,19 +2122,90 @@ class GenerateAndRunOrchestrator:
             )
             initial_snap = entry.to_snapshot()
 
-        if req.async_execution:
-            worker = Thread(
-                target=self._run_pipeline_stages,
-                args=(entry, req, service_req, selected_asi),
-                name=f"secagent-gnr-{workflow_id[:12]}",
-                daemon=True,
-            )
-            worker.start()
-            return initial_snap
+            # G13-R03: Critical initial workflow + submission persistence MUST succeed BEFORE
+            # confirming HTTP 202 or spawning any background worker. On failure, roll back & release lock.
+            self._persist_entry(entry)
+            persisted_wf_file = True
+            if req.submission_id is not None:
+                self._persist_submission(req.submission_id, owner_digest, req_digest, workflow_id, now_iso)
+                persisted_sub_file = True
 
-        self._run_pipeline_stages(entry, req, service_req, selected_asi)
-        with self._lock:
-            return entry.to_snapshot()
+            with self._lock:
+                self._evict_if_full_locked()
+                self._workflows[workflow_id] = entry
+                if req.submission_id is not None:
+                    self._submissions[req.submission_id] = (owner_digest, req_digest, workflow_id)
+                self._live_workflow_ids.add(workflow_id)
+                committed_in_memory = True
+
+            if req.async_execution:
+                worker = Thread(
+                    target=self._run_pipeline_stages,
+                    args=(entry, req, service_req, selected_asi, reservation_handle),
+                    name=f"secagent-gnr-{workflow_id[:12]}",
+                    daemon=True,
+                )
+                try:
+                    # G13-R04: Only mark ownership handed off AFTER worker.start() succeeds.
+                    worker.start()
+                    reservation_handed_to_worker = True
+                except Exception as start_exc:
+                    fail_iso = self._now_iso()
+                    msg = _SAFE_PUBLIC_ERROR_MESSAGES["worker_startup_failed"]
+                    with self._lock:
+                        self._live_workflow_ids.discard(workflow_id)
+                        entry.mark_stage(
+                            "generating",
+                            "failed",
+                            fail_iso,
+                            error_code="worker_startup_failed",
+                            error_message=msg,
+                        )
+                        entry.skip_remaining_after("generating", fail_iso)
+                        entry.status = "failed"
+                        entry.error_stage = "generating"
+                        entry.error_code = "worker_startup_failed"
+                        entry.error_message = msg
+                        entry.completed_at = fail_iso
+                    try:
+                        self._persist_entry(entry)
+                    except OrchestrationError:
+                        pass
+                    raise OrchestrationError(
+                        "worker_startup_failed",
+                        msg,
+                        status_code=500,
+                        stage="generating",
+                    ) from start_exc
+                return initial_snap
+
+            reservation_handed_to_worker = True
+            self._run_pipeline_stages(entry, req, service_req, selected_asi, reservation_handle)
+            with self._lock:
+                return entry.to_snapshot()
+        except Exception:
+            if not reservation_handed_to_worker:
+                if not committed_in_memory:
+                    if persisted_wf_file:
+                        wf_p = self._workflow_file(workflow_id)
+                        if wf_p is not None:
+                            try:
+                                wf_p.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                    if persisted_sub_file and req.submission_id is not None:
+                        sub_p = self._submission_file(req.submission_id)
+                        if sub_p is not None:
+                            try:
+                                sub_p.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+            raise
+        finally:
+            if not reservation_handed_to_worker:
+                with self._lock:
+                    self._live_workflow_ids.discard(workflow_id)
+                self._release_live_target(req.target_id, handle=reservation_handle)
 
     def _run_pipeline_stages(
         self,
@@ -1537,7 +2213,32 @@ class GenerateAndRunOrchestrator:
         req: GenerateAndRunRequest,
         service_req: GenerationServiceRequest,
         selected_asi: tuple[AsiCode, ...],
+        reservation_handle: Any,
     ) -> None:
+        handed_off_to_runner = False
+        try:
+            handed_off_to_runner = bool(
+                self._run_pipeline_stages_body(entry, req, service_req, selected_asi, reservation_handle)
+            )
+        finally:
+            with self._lock:
+                self._live_workflow_ids.discard(entry.workflow_id)
+            try:
+                self._persist_entry(entry)
+            except OrchestrationError:
+                # G13-R03: Never report false completion if final durable checkpoint fails.
+                self._record_persistence_failure(entry, "reporting")
+            if not handed_off_to_runner:
+                self._release_live_target(req.target_id, handle=reservation_handle)
+
+    def _run_pipeline_stages_body(
+        self,
+        entry: _WorkflowEntry,
+        req: GenerateAndRunRequest,
+        service_req: GenerationServiceRequest,
+        selected_asi: tuple[AsiCode, ...],
+        reservation_handle: Any,
+    ) -> bool:
         assert self._generic_run_service is not None
 
         # ---------------- STAGE 1: GENERATING ----------------
@@ -1791,6 +2492,11 @@ class GenerateAndRunOrchestrator:
                 self._now_iso(),
                 detail="Running Generic Runner preflight checks.",
             )
+        try:
+            self._persist_entry(entry)
+        except OrchestrationError:
+            self._record_persistence_failure(entry, "saving_dataset")
+            return False
 
         # ---------------- STAGE 4: PREFLIGHT ----------------
         runner_asi, runner_policy, runner_policies_by_asi = self._build_runner_asi_and_policy(
@@ -1914,6 +2620,11 @@ class GenerateAndRunOrchestrator:
             entry.mark_stage("executing", "running", self._now_iso(), detail="Starting Generic Runner execution.")
 
         # ---------------- STAGE 5-7: EXECUTE -> EVALUATE -> REPORT ----------------
+        try:
+            self._persist_entry(entry)
+        except OrchestrationError:
+            self._record_persistence_failure(entry, "executing")
+            return False
         run_submission_id = sha256(f"gnr-run:{entry.workflow_id}:0".encode("utf-8")).hexdigest()[:32]
         start_payload: dict[str, Any] = {
             **preview_payload,
@@ -1928,7 +2639,14 @@ class GenerateAndRunOrchestrator:
             start_payload["expected_session_credential_generation"] = sess_gen
 
         try:
-            run_record = self._generic_run_service.start_run(start_payload)
+            if hasattr(self._generic_run_service, "internal_reservation_context"):
+                with self._generic_run_service.internal_reservation_context(
+                    reservation_handle,
+                    workflow_id=entry.workflow_id,
+                ):
+                    run_record = self._generic_run_service.start_run(start_payload)
+            else:
+                run_record = self._generic_run_service.start_run(start_payload)
         except Exception as exc:
             now = self._now_iso()
             safe_code, stage, _, safe_msg = _sanitize_runner_error_code(
@@ -1950,27 +2668,33 @@ class GenerateAndRunOrchestrator:
                 entry.error_code = safe_code
                 entry.error_message = safe_msg
                 entry.completed_at = now
-            return
+            return False
 
+        is_replay = bool(run_record.get("idempotent_replay"))
         with self._lock:
             entry.run_id = str(run_record.get("generic_run_id") or "")
             entry.sync_from_run_record(run_record, self._now_iso(), evaluation_mode=req.evaluation_mode)
+        # G13-R02: Only consider ownership handed off if GenericRunService actually adopted the handle.
+        return (not is_replay) and bool(getattr(reservation_handle, "adopted", False))
 
     def _get_owned_workflow(self, workflow_id: str, owner_id: str) -> _WorkflowEntry:
         owner_digest = _hash_owner(owner_id)
         if not isinstance(workflow_id, str) or not _WORKFLOW_ID_RE.fullmatch(workflow_id.strip()):
             raise OrchestrationError("workflow_not_found", "Generate & Run workflow was not found.", status_code=404)
+        clean_wf_id = workflow_id.strip()
         with self._lock:
-            entry = self._workflows.get(workflow_id.strip())
-            if entry is None:
-                raise OrchestrationError("workflow_not_found", "Generate & Run workflow was not found.", status_code=404)
-            if entry.owner_digest != owner_digest:
-                raise OrchestrationError(
-                    "workflow_access_denied",
-                    "Generate & Run workflow belongs to a different operator session.",
-                    status_code=403,
-                )
-            return entry
+            entry = self._workflows.get(clean_wf_id)
+        if entry is None:
+            entry = self._load_persisted_entry(clean_wf_id)
+        if entry is None:
+            raise OrchestrationError("workflow_not_found", "Generate & Run workflow was not found.", status_code=404)
+        if entry.owner_digest != owner_digest:
+            raise OrchestrationError(
+                "workflow_access_denied",
+                "Generate & Run workflow belongs to a different operator session.",
+                status_code=403,
+            )
+        return entry
 
     def _refresh_and_snapshot(
         self,
@@ -1978,19 +2702,51 @@ class GenerateAndRunOrchestrator:
         *,
         idempotent_replay: bool = False,
     ) -> GenerateAndRunSnapshot:
-        run_id = entry.run_id
+        with self._lock:
+            prev_status = entry.status
+            prev_executed = entry.executed_cases
+            run_id = entry.run_id
         if run_id and self._generic_run_service is not None:
             latest = self._generic_run_service.get_run(run_id)
             if isinstance(latest, dict):
                 with self._lock:
                     if entry.run_id == run_id:
                         entry.sync_from_run_record(latest, self._now_iso())
+        else:
+            self._reconcile_non_live_entry(entry)
         with self._lock:
-            return entry.to_snapshot(idempotent_replay=idempotent_replay)
+            changed = entry.status != prev_status or entry.executed_cases != prev_executed
+            snap = entry.to_snapshot(idempotent_replay=idempotent_replay)
+        if changed:
+            try:
+                self._persist_entry(entry)
+            except OrchestrationError:
+                # G13-R03: Do not return a false completed snapshot if durable persistence failed.
+                self._record_persistence_failure(entry, "reporting")
+                with self._lock:
+                    snap = entry.to_snapshot(idempotent_replay=idempotent_replay)
+        return snap
 
     def get_workflow(self, *, workflow_id: str, owner_id: str) -> GenerateAndRunSnapshot:
         entry = self._get_owned_workflow(workflow_id, owner_id)
         return self._refresh_and_snapshot(entry)
+
+    def list_workflows(self, *, owner_id: str) -> list[GenerateAndRunSnapshot]:
+        """List all owned workflows (in-memory + durable disk), newest-first, with zero ghost-running states."""
+        owner_digest = _hash_owner(owner_id)
+        if self._workflows_root is not None and self._workflows_root.is_dir():
+            for wf_p in sorted(self._workflows_root.glob("gnr-*.json")):
+                if not _WORKFLOW_ID_RE.fullmatch(wf_p.stem):
+                    continue
+                with self._lock:
+                    present = wf_p.stem in self._workflows
+                if not present:
+                    self._load_persisted_entry(wf_p.stem)
+        with self._lock:
+            owned = [e for e in self._workflows.values() if e.owner_digest == owner_digest]
+        snapshots = [self._refresh_and_snapshot(e) for e in owned]
+        snapshots.sort(key=lambda s: (s.created_at, s.workflow_id), reverse=True)
+        return snapshots
 
     def get_workflow_by_submission(self, *, submission_id: str, owner_id: str) -> GenerateAndRunSnapshot:
         """Look up a Generate & Run workflow by client submission_id for idempotent network recovery (R02).
@@ -2011,6 +2767,9 @@ class GenerateAndRunOrchestrator:
         sub_id = submission_id.strip()
         with self._lock:
             rec = self._submissions.get(sub_id)
+        if rec is None:
+            rec = self._load_persisted_submission(sub_id)
+        with self._lock:
             if rec is None:
                 in_flight = self._in_flight_submissions.get(sub_id)
                 if in_flight is not None:
@@ -2039,13 +2798,15 @@ class GenerateAndRunOrchestrator:
                     status_code=403,
                 )
             entry = self._workflows.get(wf_id)
-            if entry is None:
-                raise OrchestrationError(
-                    "workflow_submission_expired",
-                    "This submission_id was already used, but its in-memory workflow snapshot has expired. "
-                    "Inspect Dataset Library or Scan Runs instead of re-executing.",
-                    status_code=410,
-                )
+        if entry is None:
+            entry = self._load_persisted_entry(wf_id)
+        if entry is None:
+            raise OrchestrationError(
+                "workflow_submission_expired",
+                "This submission_id was already used, but its in-memory workflow snapshot has expired. "
+                "Inspect Dataset Library or Scan Runs instead of re-executing.",
+                status_code=410,
+            )
         return self._refresh_and_snapshot(entry)
 
     def rerun_workflow(
@@ -2087,6 +2848,49 @@ class GenerateAndRunOrchestrator:
                     if entry.run_id == fetched_run_id and not entry.rerun_starting:
                         entry.sync_from_run_record(latest_run, self._now_iso())
 
+        # G13-R02: Check exact-once rerun idempotency by submission_id BEFORE locking or rejecting
+        # an active rerun so retrying the same submission_id (while active or after completion)
+        # returns the existing run with 0 reservations acquired, 0 Target/Generator calls, and no duplicate history.
+        with self._lock:
+            candidate_eval_mode: EvaluationMode = rerun_req.evaluation_mode or entry.active_evaluation_mode
+            candidate_allow_partial = (
+                rerun_req.allow_partial_execution
+                if rerun_req.allow_partial_execution is not None
+                else entry.req.allow_partial_execution
+            )
+            rerun_digest = _rerun_fingerprint(candidate_eval_mode, candidate_allow_partial)
+            existing_rerun_sub = (
+                entry.rerun_submissions.get(rerun_req.submission_id)
+                if rerun_req.submission_id is not None
+                else None
+            )
+            existing_dataset_id = entry.dataset_id
+        if existing_rerun_sub is not None:
+            prev_digest, existing_run_id = existing_rerun_sub
+            if prev_digest != rerun_digest:
+                raise OrchestrationError(
+                    "generate_and_run_submission_conflict",
+                    "submission_id was already used with a different Rerun request.",
+                    status_code=409,
+                    stage="preflight",
+                )
+            latest_existing = self._generic_run_service.get_run(existing_run_id)
+            with self._lock:
+                if isinstance(latest_existing, dict) and entry.run_id == existing_run_id:
+                    entry.sync_from_run_record(latest_existing, self._now_iso(), evaluation_mode=candidate_eval_mode)
+                prev_hist = next((h for h in entry.rerun_history if h.run_id == existing_run_id), None)
+                snap = entry.to_snapshot(idempotent_replay=True)
+            return {
+                "operation": "rerun",
+                "idempotent_replay": True,
+                "generator_called": False,
+                "regenerated": False,
+                "dataset_id": existing_dataset_id,
+                "previous_run_id": prev_hist.previous_run_id if prev_hist else None,
+                "new_run_id": existing_run_id,
+                "workflow": snap.model_dump(mode="json"),
+            }
+
         # Issue A: Atomically verify no original execution or concurrent rerun is active and reserve rerun lock.
         with self._lock:
             if (
@@ -2115,12 +2919,15 @@ class GenerateAndRunOrchestrator:
                 if rerun_req.allow_partial_execution is not None
                 else entry.req.allow_partial_execution
             )
+            rerun_digest = _rerun_fingerprint(eval_mode, allow_partial)
             exec_mode = entry.req.execution_mode
             target_id = entry.req.target_id
             runner_asi = entry.runner_asi_category
             runner_policy = entry.runner_policy_id
             runner_policies_by_asi = dict(entry.runner_policy_ids_by_asi)
 
+        rerun_handle: Any = None
+        rerun_handed_off = False
         try:
             preset = self._lookup_target(target_id)
             if preset is None:
@@ -2156,6 +2963,8 @@ class GenerateAndRunOrchestrator:
                         status_code=409,
                         stage="preflight",
                     )
+
+            rerun_handle = self._reserve_live_target(target_id, workflow_id=workflow_id)
 
             preview_payload: dict[str, Any] = {
                 "mode": exec_mode,
@@ -2216,7 +3025,14 @@ class GenerateAndRunOrchestrator:
                 start_payload["expected_session_credential_generation"] = sess_gen
 
             try:
-                run_record = self._generic_run_service.start_run(start_payload)
+                if hasattr(self._generic_run_service, "internal_reservation_context"):
+                    with self._generic_run_service.internal_reservation_context(
+                        rerun_handle,
+                        workflow_id=workflow_id,
+                    ):
+                        run_record = self._generic_run_service.start_run(start_payload)
+                else:
+                    run_record = self._generic_run_service.start_run(start_payload)
             except Exception as exc:
                 safe_code, stage, status, safe_msg = _sanitize_runner_error_code(
                     exc,
@@ -2225,47 +3041,73 @@ class GenerateAndRunOrchestrator:
                 )
                 raise OrchestrationError(safe_code, safe_msg, status_code=status, stage=stage) from None
 
+            is_replay = bool(run_record.get("idempotent_replay"))
+            # G13-R02: Only treat reservation as handed off when GenericRunService actually adopted
+            # the handle for a newly started run. On idempotent replay, handle.adopted is False,
+            # so finally MUST release rerun_handle and NO duplicate rerun_history entry is appended.
+            rerun_handed_off = (not is_replay) and bool(getattr(rerun_handle, "adopted", False))
             new_run_id = str(run_record.get("generic_run_id") or "")
             now = self._now_iso()
             with self._lock:
-                prev_run_id = entry.run_id
-                entry.run_id = new_run_id
-                entry.active_evaluation_mode = eval_mode
-                entry.partial_execution = effective_skipped > 0
-                entry.preflight_selected_cases = selected_cases
-                entry.preflight_ready_count = ready_count
-                entry.preflight_skipped_count = effective_skipped
-                entry.preflight_unsupported_count = unsupported_count
-                entry.preflight_skipped_reasons = skipped_reasons
-                entry.error_stage = None
-                entry.error_code = None
-                entry.error_message = None
-                entry.evaluation_error_code = None
-                entry.mark_stage(
-                    "preflight",
-                    "completed",
-                    now,
-                    detail=f"Rerun preflight passed ({ready_count}/{selected_cases} ready, mode={eval_mode}).",
-                )
-                entry.rerun_history.append(
-                    RerunHistoryEntry(
-                        run_id=new_run_id,
-                        previous_run_id=prev_run_id,
-                        dataset_id=dataset_id,
-                        evaluation_mode=eval_mode,
-                        started_at=now,
-                        run_status=str(run_record.get("status") or "running"),
+                already_recorded = any(h.run_id == new_run_id for h in entry.rerun_history)
+                if is_replay or already_recorded:
+                    prev_hist = next((h for h in entry.rerun_history if h.run_id == new_run_id), None)
+                    prev_run_id = prev_hist.previous_run_id if prev_hist else entry.run_id
+                    if rerun_req.submission_id is not None and new_run_id:
+                        entry.rerun_submissions[rerun_req.submission_id] = (rerun_digest, new_run_id)
+                    if entry.run_id == new_run_id:
+                        entry.sync_from_run_record(run_record, now, evaluation_mode=eval_mode)
+                    entry.rerun_starting = False
+                    snap = entry.to_snapshot(idempotent_replay=True)
+                else:
+                    prev_run_id = entry.run_id
+                    entry.run_id = new_run_id
+                    entry.active_evaluation_mode = eval_mode
+                    entry.partial_execution = effective_skipped > 0
+                    entry.preflight_selected_cases = selected_cases
+                    entry.preflight_ready_count = ready_count
+                    entry.preflight_skipped_count = effective_skipped
+                    entry.preflight_unsupported_count = unsupported_count
+                    entry.preflight_skipped_reasons = skipped_reasons
+                    entry.error_stage = None
+                    entry.error_code = None
+                    entry.error_message = None
+                    entry.evaluation_error_code = None
+                    entry.mark_stage(
+                        "preflight",
+                        "completed",
+                        now,
+                        detail=f"Rerun preflight passed ({ready_count}/{selected_cases} ready, mode={eval_mode}).",
                     )
-                )
-                entry.sync_from_run_record(run_record, now, evaluation_mode=eval_mode)
-                entry.rerun_starting = False
-                snap = entry.to_snapshot()
+                    entry.rerun_history.append(
+                        RerunHistoryEntry(
+                            run_id=new_run_id,
+                            previous_run_id=prev_run_id,
+                            dataset_id=dataset_id,
+                            evaluation_mode=eval_mode,
+                            started_at=now,
+                            run_status=str(run_record.get("status") or "running"),
+                        )
+                    )
+                    if rerun_req.submission_id is not None and new_run_id:
+                        entry.rerun_submissions[rerun_req.submission_id] = (rerun_digest, new_run_id)
+                    entry.sync_from_run_record(run_record, now, evaluation_mode=eval_mode)
+                    entry.rerun_starting = False
+                    snap = entry.to_snapshot()
+            try:
+                self._persist_entry(entry)
+            except OrchestrationError:
+                self._record_persistence_failure(entry, "reporting")
+                raise
         finally:
+            if rerun_handle is not None and not rerun_handed_off:
+                self._release_live_target(target_id, handle=rerun_handle)
             with self._lock:
                 entry.rerun_starting = False
 
         return {
             "operation": "rerun",
+            **({"idempotent_replay": True} if is_replay else {}),
             "generator_called": False,
             "regenerated": False,
             "dataset_id": dataset_id,
