@@ -1737,18 +1737,16 @@ class GenericRunService:
         if not isinstance(v_counts, dict):
             raise RuntimeError("completion_invariant_verdict_sum_mismatch")
         actual_verdicts: Counter[str] = Counter()
-        not_evaluated_count = 0
         for c in cases:
             if not isinstance(c, dict):
                 raise RuntimeError("completion_invariant_invalid_case_entry")
             verdict_val = c.get("verdict")
             ev_status_val = c.get("evaluation_status")
-            if isinstance(verdict_val, str) and verdict_val:
-                actual_verdicts[verdict_val] += 1
-            elif verdict_val is None and isinstance(ev_status_val, str) and ev_status_val in VALID_CASE_EVALUATION_STATUSES:
-                not_evaluated_count += 1
-            else:
+            if verdict_val not in {"PASS", "FAIL"}:
+                raise RuntimeError("completion_invariant_non_binary_verdict")
+            if isinstance(ev_status_val, str) and ev_status_val not in VALID_CASE_EVALUATION_STATUSES:
                 raise RuntimeError("completion_invariant_invalid_case_entry")
+            actual_verdicts[verdict_val] += 1
             c_case_id = str(c.get("case_id") or "")
             c_run_id = str(c.get("run_id") or "")
             if not c_case_id or not c_run_id:
@@ -1811,10 +1809,21 @@ class GenericRunService:
                     raise RuntimeError("completion_invariant_controlled_report_missing")
                 if sha256(ctrl_rep_path.read_bytes()).hexdigest() != rep_sha:
                     raise RuntimeError("completion_invariant_controlled_report_sha256_mismatch")
-        if sum(int(v) for v in v_counts.values()) + not_evaluated_count != expected_cases_count:
+        if any(k not in {"PASS", "FAIL"} for k, v in v_counts.items() if int(v) > 0):
+            raise RuntimeError("completion_invariant_non_binary_verdict_counts")
+        if sum(int(v) for v in v_counts.values()) != expected_cases_count:
             raise RuntimeError("completion_invariant_verdict_sum_mismatch")
         if dict(sorted(actual_verdicts.items())) != dict(sorted((k, int(v)) for k, v in v_counts.items() if int(v) > 0)):
             raise RuntimeError("completion_invariant_verdict_distribution_mismatch")
+        selected_count = record.get("selected_cases")
+        skipped_count = int(record.get("skipped_count") or 0)
+        if (
+            isinstance(selected_count, int)
+            and not isinstance(selected_count, bool)
+            and selected_count > 0
+            and expected_cases_count + skipped_count != selected_count
+        ):
+            raise RuntimeError("completion_invariant_preflight_accounting_mismatch")
 
     def start_run(
         self,
@@ -2222,6 +2231,8 @@ class GenericRunService:
                     "status": "queued" if item["status"] == "ready" else item["status"],
                     "stage": "queued" if item["status"] == "ready" else "skipped",
                     "verdict": None,
+                    "evaluation_status": None if item["status"] == "ready" else "SKIPPED_PREFLIGHT",
+                    "evaluation_reason_code": None if item["status"] == "ready" else "SKIPPED_PREFLIGHT",
                     "reason": item["reason"],
                     "evidence_level": None,
                     "run_id": None,
@@ -2288,6 +2299,8 @@ class GenericRunService:
                 "evaluation_summary": build_evaluation_summary(
                     [],
                     total_cases=len(pairs),
+                    selected_cases=len(preview_meta["items"]),
+                    skipped_cases=len(preview_meta["skipped_cases"]),
                     schema_version=VERDICT_SCHEMA_VERSION,
                     policy_version=VERDICT_POLICY_VERSION,
                 ),
@@ -2489,11 +2502,18 @@ class GenericRunService:
                         record["evaluation_summary"] = build_evaluation_summary(
                             enriched_cases,
                             total_cases=len(pairs),
+                            selected_cases=len(preview_meta["items"]),
+                            skipped_cases=len(preview_meta["skipped_cases"]),
                             schema_version=VERDICT_SCHEMA_VERSION,
                             policy_version=VERDICT_POLICY_VERSION,
                         )
                         record["evidence_summary"] = dict(sorted(evidence_counter.items()))
-                        record["progress_percent"] = int(round((len(enriched_cases) / max(1, len(pairs))) * 100))
+                        progress_denom = (
+                            len(preview_meta["items"])
+                            if len(preview_meta["skipped_cases"]) > 0
+                            else len(pairs)
+                        )
+                        record["progress_percent"] = int(round((len(enriched_cases) / max(1, progress_denom)) * 100))
                         for row in record["case_statuses"]:
                             if row["case_id"] == cid:
                                 row["status"] = (
@@ -2556,6 +2576,8 @@ class GenericRunService:
                         record["evaluation_summary"] = build_evaluation_summary(
                             record["cases"],
                             total_cases=len(pairs),
+                            selected_cases=len(preview_meta["items"]),
+                            skipped_cases=len(preview_meta["skipped_cases"]),
                             schema_version=VERDICT_SCHEMA_VERSION,
                             policy_version=VERDICT_POLICY_VERSION,
                         )
@@ -2567,13 +2589,23 @@ class GenericRunService:
                             expected_cases_count=len(pairs),
                         )
                         tech_failures = int(record["evaluation_summary"].get("technical_failure_count", 0))
+                        skipped_preflight = len(preview_meta["skipped_cases"])
                         record["status"] = "completed"
+                        if skipped_preflight > 0:
+                            record["completion_scope"] = "partial_preflight_blocked"
+                        else:
+                            record["completion_scope"] = "full"
                         if tech_failures > 0 and not record.get("error_code"):
                             record["error_code"] = "technical_evaluation_failure"
                         record["completed_at"] = done_iso
                         record["current_case_id"] = None
                         record["current_stage"] = "completed"
-                        record["progress_percent"] = 100
+                        final_denom = (
+                            len(preview_meta["items"])
+                            if skipped_preflight > 0
+                            else len(pairs)
+                        )
+                        record["progress_percent"] = int(round((len(record["cases"]) / max(1, final_denom)) * 100))
                         record["judge_metadata"] = self._build_judge_metadata(
                             use_judge=use_judge,
                             run_status="completed",
@@ -2801,6 +2833,18 @@ class GenericRunService:
         record["evaluation_summary"] = build_evaluation_summary(
             cases,
             total_cases=ready_count if ready_count >= len(cases) else len(cases),
+            selected_cases=(
+                record.get("selected_cases")
+                if isinstance(record.get("selected_cases"), int)
+                and not isinstance(record.get("selected_cases"), bool)
+                else None
+            ),
+            skipped_cases=(
+                int(record.get("skipped_count") or 0)
+                if isinstance(record.get("skipped_count"), int)
+                and not isinstance(record.get("skipped_count"), bool)
+                else 0
+            ),
             schema_version=record.get("verdict_schema_version"),
             policy_version=record.get("verdict_policy_version"),
         )

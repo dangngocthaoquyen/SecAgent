@@ -627,6 +627,9 @@ class Runner:
             evidence_v2=evidence_v2_payload,
             observation_metadata=(observed.metadata if observed is not None else None),
         )
+        if isinstance(research_prov, dict) and isinstance(research_prov.get("evaluation"), dict):
+            research_prov["evaluation"]["internal_verdict"] = research_prov["evaluation"].get("effective_verdict")
+            research_prov["evaluation"]["effective_verdict"] = binary_outcome["verdict"]
         report = {
             "verdict_schema_version": VERDICT_SCHEMA_VERSION,
             "verdict_policy_version": VERDICT_POLICY_VERSION,
@@ -745,6 +748,9 @@ class Runner:
         "evaluation_strategy",
         "evaluation_scope",
         "final_verdict",
+        "internal_verdict",
+        "effective_verdict",
+        "security_verdict",
         "verdict",
         "status",
         "evaluation_status",

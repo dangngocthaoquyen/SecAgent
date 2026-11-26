@@ -1698,10 +1698,11 @@ def test_unified_scan_lineage_completed_with_errors_and_report_export(tmp_path, 
         assert ul["execution_completed"] is True
         assert ul["has_evaluation_errors"] is True
         # Legacy parent cases preserve historical FAIL/INCONCLUSIVE verdicts;
-        # new v2.0 continuation cases record execution errors in evaluation_summary (never polluting verdict_counts).
-        assert ul["verdict_counts"] == {"FAIL": 1, "INCONCLUSIVE": 5}
-        assert ul["evaluation_summary"]["evaluated_cases"] == 1
-        assert ul["evaluation_summary"]["not_evaluated_count"] == 34
+        # new v2.0 continuation cases emit observation-based binary PASS with EXECUTION_ERROR diagnostics preserved.
+        assert ul["verdict_counts"] == {"FAIL": 1, "INCONCLUSIVE": 5, "PASS": 29}
+        assert ul["evaluation_summary"]["evaluated_cases"] == 30
+        assert ul["evaluation_summary"]["not_evaluated_count"] == 5
+        assert ul["evaluation_summary"]["technical_failure_count"] == 29
         assert ul["evaluation_summary"]["not_evaluated_reasons"]["EXECUTION_ERROR"] == 29
         assert len(ul["cases"]) == 35
         assert len({c["case_id"] for c in ul["cases"]}) == 35  # Zero double-counting!
@@ -1714,7 +1715,7 @@ def test_unified_scan_lineage_completed_with_errors_and_report_export(tmp_path, 
         assert tc11["case_id"] == "TC0011" and tc11["verdict"] == "FAIL" and tc11["source_generic_run_id"] == root_id
         assert (
             tc17["case_id"] == "TC0017"
-            and tc17["verdict"] is None
+            and tc17["verdict"] == "PASS"
             and tc17["evaluation_status"] == "EXECUTION_ERROR"
             and tc17["source_generic_run_id"] == child_id
         )
@@ -1728,7 +1729,7 @@ def test_unified_scan_lineage_completed_with_errors_and_report_export(tmp_path, 
     assert rep_a["logical_scan_id"] == root_id == rep_b["logical_scan_id"]
     assert rep_a["selected_cases"] == 35
     assert rep_a["recorded_outcomes"] == 35
-    assert rep_a["verdict_counts"] == {"FAIL": 1, "INCONCLUSIVE": 5}
+    assert rep_a["verdict_counts"] == {"FAIL": 1, "INCONCLUSIVE": 5, "PASS": 29}
     assert rep_a["evaluation_summary"]["not_evaluated_reasons"]["EXECUTION_ERROR"] == 29
     assert rep_a["logical_status"] == "completed_with_errors"
     assert rep_a["session_count"] == 2

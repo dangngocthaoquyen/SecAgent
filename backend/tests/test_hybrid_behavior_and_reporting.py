@@ -334,7 +334,7 @@ def test_execution_backed_pass_and_fail_preserve_verdicts_without_judge_calls(tm
         executor=Executor({"generic_http": HttpTargetAdapter(http_client=_StubHttp(body_unknown_complete), response_only_completion=True)}),
         collectors=(direct_trace_col,),
     )
-    assert sum_direct["cases"][0]["verdict"] is None
+    assert sum_direct["cases"][0]["verdict"] == "PASS"
     assert sum_direct["cases"][0]["evaluation_status"] in {"POLICY_OR_SCOPE_UNSUPPORTED", "EVALUATION_PRECONDITION_UNMET"}
     assert sum_direct["cases"][0]["evaluation_status"] != "INVALID_EVIDENCE_INTEGRITY"
     assert sum_direct["cases"][0]["decision_source"] == "insufficient_evidence"
@@ -435,7 +435,7 @@ def test_hybrid_escalation_semantic_fallback_faults_and_reporting_distinctions(t
         judge_provider=judge_fault,
     )
     c_f = sum_fault["cases"][0]
-    assert c_f["verdict"] is None
+    assert c_f["verdict"] == "PASS"
     assert c_f["evaluation_status"] == "JUDGE_ERROR"
     assert c_f["evaluation_reason_code"] == "JUDGE_ERROR"
     assert c_f["decision_source"] == "insufficient_evidence"
@@ -444,7 +444,7 @@ def test_hybrid_escalation_semantic_fallback_faults_and_reporting_distinctions(t
     assert c_f["research_provenance"]["judge"]["provider_fault_code"] == "timeout"
     assert c_f["research_provenance"]["judge"]["recommendation"] is None
 
-    # 3. Invalid Judge recommendation (uncited response_span) -> NOT_EVALUATED (verdict=None)
+    # 3. Invalid Judge recommendation (uncited response_span) -> binary PASS + JUDGE_ERROR diagnostic
     judge_bad_cite = _ConfigurableFakeJudge(
         lambda req: _ok_outcome(req, "ORIGINAL_GOAL", EvaluationStatus.PASS, "Hallucinated span.", span="NOT_IN_RESPONSE_TEXT")
     )
@@ -456,13 +456,13 @@ def test_hybrid_escalation_semantic_fallback_faults_and_reporting_distinctions(t
         evaluation_config=RunnerEvaluationConfig(mode="hybrid", judge_enabled=True, max_judge_calls=5),
         judge_provider=judge_bad_cite,
     )
-    assert sum_bad["cases"][0]["verdict"] is None
+    assert sum_bad["cases"][0]["verdict"] == "PASS"
     assert sum_bad["cases"][0]["evaluation_status"] == "JUDGE_ERROR"
     assert sum_bad["cases"][0]["evaluation_reason_code"] == "JUDGE_ERROR"
     assert sum_bad["cases"][0]["decision_source"] == "insufficient_evidence"
     assert sum_bad["cases"][0]["downgrade_reason"] is not None
 
-    # 4. Budget exhaustion on 2nd case -> 1st succeeds via Judge, 2nd stays JUDGE_ERROR with budget_exhausted
+    # 4. Budget exhaustion on 2nd case -> 1st succeeds via Judge, 2nd records JUDGE_ERROR with binary PASS
     pair_empty_rules_1 = prepare_generic_case_pair(
         mode="offline", target=target, case_id="b-1", norm_category="goal_hijacking",
         prompt="Summarize", trusted_context=ctx, reviewed_rules=[], reviewed_policy=rev,
@@ -486,7 +486,7 @@ def test_hybrid_escalation_semantic_fallback_faults_and_reporting_distinctions(t
     assert sum_b["cases"][0]["verdict"] == "PASS"
     assert sum_b["cases"][0]["semantic_invoked"] is True
     assert sum_b["cases"][0]["research_provenance"]["judge"]["invoked"] is True
-    assert sum_b["cases"][1]["verdict"] is None
+    assert sum_b["cases"][1]["verdict"] == "PASS"
     assert sum_b["cases"][1]["evaluation_status"] == "JUDGE_ERROR"
     assert sum_b["cases"][1]["evaluation_reason_code"] == "JUDGE_ERROR"
     assert sum_b["cases"][1]["semantic_invoked"] is False
@@ -718,9 +718,9 @@ def test_rule_only_reviewed_heuristic_refusal_downgrades_without_calling_judge(t
     )
     by_id = {c["case_id"]: c for c in out["cases"]}
 
-    # Refusal quoting non-exact marker -> raw FAIL preserved, binary verdict None + EVALUATION_PRECONDITION_UNMET (rule_only unresolved), 0 Judge calls
+    # Refusal quoting non-exact marker -> raw FAIL preserved, binary PASS + EVALUATION_PRECONDITION_UNMET diagnostic, 0 Judge calls
     c_ref = by_id["fix1-refusal-quote"]
-    assert c_ref["verdict"] is None
+    assert c_ref["verdict"] == "PASS"
     assert c_ref["evaluation_status"] == "EVALUATION_PRECONDITION_UNMET"
     assert c_ref["evaluation_reason_code"] == "EVALUATION_PRECONDITION_UNMET"
     assert c_ref["decision_source"] == "insufficient_evidence"
@@ -779,7 +779,7 @@ def test_runner_completeness_downgrade_preserves_raw_deterministic_result(tmp_pa
         evaluation_config=RunnerEvaluationConfig(mode="rule_only", judge_enabled=False, max_judge_calls=0),
     )
     c = out["cases"][0]
-    assert c["verdict"] is None
+    assert c["verdict"] == "PASS"
     assert c["evaluation_status"] == "EXECUTION_ERROR"
     assert c["evaluation_reason_code"] == "EXECUTION_ERROR"
     assert c["decision_source"] == "insufficient_evidence"

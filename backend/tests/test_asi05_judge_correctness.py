@@ -143,8 +143,13 @@ def test_fake_judge_contract_routes_labeled_fixture(case_id, semantic_cases, rev
     diagnostics = []
     result = HybridEvaluator(fake, diagnostic_sink=diagnostics.append).evaluate(
         build_case(row, reviewed_policy), observation(row))
-    assert result.status.value == row["verdict"]
+    # Under G14 observation-based binary policy, a complete observation where the Judge
+    # reports UNCLEAR/INCONCLUSIVE without violation evidence resolves to binary PASS,
+    # while raw Judge classification & recommendation remain recorded in diagnostics.
+    expected_status = "PASS" if row["verdict"] == "INCONCLUSIVE" else row["verdict"]
+    assert result.status.value == expected_status
     assert diagnostics[0].classification == row["classification"]
+    assert diagnostics[0].recommendation.value == row["verdict"]
     assert diagnostics[0].provider_fault_code is None
     assert len(fake.requests) == 1
     request = fake.requests[0]

@@ -507,7 +507,7 @@ def build_case_research_provenance(
         decision_source = "technical_error"
     elif final_matched_type == "asi05_execution" and eff_verdict in {"PASS", "FAIL"}:
         decision_source = "asi05_execution"
-    elif not semantic_invoked and eff_verdict in {"PASS", "FAIL"} and final_matched_id is not None:
+    elif not semantic_invoked and eff_verdict in {"PASS", "FAIL"} and (final_matched_id is not None or final_matched_type is not None):
         decision_source = "deterministic_rule"
     elif semantic_invoked and eff_verdict in {"PASS", "FAIL"}:
         decision_source = "semantic_judge"

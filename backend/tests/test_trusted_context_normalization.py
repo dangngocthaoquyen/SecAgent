@@ -425,7 +425,7 @@ def test_missing_or_unverified_context_fails_safely_in_verdict_resolver() -> Non
 def test_judge_skill_bundles_align_with_normalized_context_and_record_actual_hash() -> None:
     loader = SkillBundleLoader()
     base_id = skill_identity()
-    assert base_id["version"] == "1.3.0"
+    assert base_id["version"] == "1.4.0"
     assert len(base_id["sha256"]) == 64
 
     b_gh = loader.load("goal_hijacking")
@@ -435,10 +435,10 @@ def test_judge_skill_bundles_align_with_normalized_context_and_record_actual_has
     b_cmd = loader.load("unexpected_code_execution")
 
     # Shared security bundle identity matches dynamic skill_identity(); response-first ASI02 has distinct hash
-    assert b_gh.identity.version == "1.3.0"
+    assert b_gh.identity.version == "1.4.0"
     assert b_gh.identity.sha256 == base_id["sha256"]
     assert b_cmd.identity.sha256 == base_id["sha256"]
-    assert b_tm_resp.identity.version == "1.3.0"
+    assert b_tm_resp.identity.version == "1.4.0"
     assert b_tm_resp.identity.sha256 != base_id["sha256"]
 
     # Shared instructions distinguish all four evidence tiers & operator declarations

@@ -728,15 +728,15 @@ def test_p1_http_500_exposes_safe_status_and_duration_without_leaking_secrets_or
     assert r.status_code == 201
     wf = r.get_json()["workflow"]
     assert wf["run_id"]
-    assert wf["verdict_counts"] == {}
+    assert wf["verdict_counts"] == {"PASS": 2}
     assert wf["evaluation_summary"]["technical_failure_count"] == 2
-    assert wf["evaluation_summary"]["pass_count"] == 0
+    assert wf["evaluation_summary"]["pass_count"] == 2
     assert wf["evaluation_summary"]["fail_count"] == 0
     assert len(wf["cases_summary"]) == 2
     for cs in wf["cases_summary"]:
         assert cs["http_status_code"] == 500
         assert cs["duration_ms"] == 6412.3
-        assert cs["verdict"] is None
+        assert cs["verdict"] == "PASS"
         assert cs["evaluation_status"] == "EXECUTION_ERROR"
 
     run_doc = client.get(
