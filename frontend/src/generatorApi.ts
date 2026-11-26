@@ -75,9 +75,20 @@ export type GeneratorSkillSummary = {
   sha256: string;
 };
 
+export type GeneratorJudgeStatus = {
+  judge_configured: boolean;
+  credential_available: boolean;
+  judge_ready: boolean;
+  provider: string | null;
+  model: string | null;
+  reason: string;
+};
+
 export type GeneratorStatusResponse = {
   workflow_schema_version: '1.0.0';
   provider: GeneratorProviderStatus;
+  generate_and_run_available?: boolean;
+  judge?: GeneratorJudgeStatus | null;
   supported_asi: AsiCode[];
   limits: {
     min_per_asi: number;
@@ -405,13 +416,274 @@ export const GENERATE_AND_RUN_STAGES: readonly {
 export type GenerateAndRunContractDraft = {
   mode: 'generate_and_run';
   requiresPreviewOrManualSave: false;
-  orchestrationAvailable: false;
+  orchestrationAvailable: boolean;
   generationConfig: GeneratorConfigState;
   evaluationMode: 'rule_only' | 'hybrid';
   authorizationConfirmed: boolean;
   plannedStages: readonly GenerateAndRunStage[];
   plannedDatasetLink: string | null;
   plannedRunLink: string | null;
+};
+
+export type WorkflowStageName =
+  | 'generating'
+  | 'validating'
+  | 'saving_dataset'
+  | 'preflight'
+  | 'executing'
+  | 'evaluating'
+  | 'reporting';
+
+export type StageStatus = 'pending' | 'running' | 'completed' | 'failed' | 'blocked' | 'skipped';
+
+export type WorkflowOverallStatus =
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'blocked'
+  | 'partial_stopped';
+
+export const LIVE_GENERATE_AND_RUN_STAGES: readonly {
+  id: WorkflowStageName;
+  label: string;
+  description: string;
+}[] = [
+  {
+    id: 'generating',
+    label: 'Generating',
+    description: 'Context-aware generation per selected ASI via server-owned provider.',
+  },
+  {
+    id: 'validating',
+    label: 'Validating',
+    description: 'Strict JSON contract, ASI alignment, confirmed context_basis & dedup.',
+  },
+  {
+    id: 'saving_dataset',
+    label: 'Saving Dataset',
+    description: 'Automatic immutable dataset persistence before any Target execution.',
+  },
+  {
+    id: 'preflight',
+    label: 'Preflight',
+    description: 'Target authorization, revision binding, policy & scope verification.',
+  },
+  {
+    id: 'executing',
+    label: 'Executing',
+    description: 'Generic Runner bounded Target execution on persisted dataset.',
+  },
+  {
+    id: 'evaluating',
+    label: 'Evaluating',
+    description: 'Rule / Evidence / Hybrid Judge evaluation & Verdict Resolver.',
+  },
+  {
+    id: 'reporting',
+    label: 'Reporting',
+    description: 'Persisted report with generation provenance, dataset ID & run lineage.',
+  },
+] as const;
+
+export type WorkflowStageRecord = {
+  stage: WorkflowStageName;
+  status: StageStatus;
+  started_at: string | null;
+  finished_at: string | null;
+  detail: string | null;
+  error_code: string | null;
+  error_message: string | null;
+};
+
+export type RerunHistoryEntry = {
+  operation: 'rerun';
+  run_id: string;
+  previous_run_id: string | null;
+  dataset_id: string;
+  evaluation_mode: 'rule_only' | 'hybrid';
+  started_at: string;
+  run_status: string;
+  generator_called: false;
+  regenerated: false;
+};
+
+export type GenerateAndRunRequestPayload = {
+  target_id: string;
+  counts_by_asi: Partial<Record<AsiCode, number>>;
+  language: SupportedLanguage;
+  focus_note?: string | null;
+  requested_scopes?: Partial<Record<AsiCode, string>>;
+  policy_ids_by_asi?: Partial<Record<AsiCode, string>>;
+  deduplicate_across_asi: boolean;
+  max_calls_per_asi?: 1 | 2;
+  evaluation_mode: 'rule_only' | 'hybrid';
+  execution_mode?: 'live';
+  authorization_confirmed: true;
+  allow_partial_execution?: boolean;
+  dataset_name?: string | null;
+  submission_id?: string;
+  async_execution?: boolean;
+  expected_target_revision?: string | null;
+};
+
+export type GenerateAndRunRerunPayload = {
+  authorization_confirmed: true;
+  evaluation_mode?: 'rule_only' | 'hybrid';
+  allow_partial_execution?: boolean;
+  submission_id?: string;
+  async_execution?: boolean;
+};
+
+export type PreflightSkippedReason = {
+  case_id: string;
+  status: string;
+  reason: string;
+};
+
+export type PendingGenerateAndRunSubmission = {
+  submission_id: string;
+  target_id: string;
+  config_digest: string;
+  created_at: string;
+};
+
+const PENDING_GNR_SUBMISSION_KEY = 'secagent_pending_gnr_submission';
+
+export function savePendingGenerateAndRunSubmission(
+  entry: PendingGenerateAndRunSubmission,
+): void {
+  // Store ONLY non-sensitive recovery coordinates (never credentials, prompts, or focus notes).
+  try {
+    sessionStorage.setItem(
+      PENDING_GNR_SUBMISSION_KEY,
+      JSON.stringify({
+        submission_id: entry.submission_id,
+        target_id: entry.target_id,
+        config_digest: entry.config_digest,
+        created_at: entry.created_at,
+      }),
+    );
+  } catch {
+    // Ignore storage unavailability in constrained browser contexts.
+  }
+}
+
+export function loadPendingGenerateAndRunSubmission(): PendingGenerateAndRunSubmission | null {
+  try {
+    const raw = sessionStorage.getItem(PENDING_GNR_SUBMISSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PendingGenerateAndRunSubmission>;
+    if (
+      parsed &&
+      typeof parsed.submission_id === 'string' &&
+      /^[a-f0-9]{32}$/.test(parsed.submission_id) &&
+      typeof parsed.target_id === 'string' &&
+      typeof parsed.config_digest === 'string' &&
+      typeof parsed.created_at === 'string'
+    ) {
+      return {
+        submission_id: parsed.submission_id,
+        target_id: parsed.target_id,
+        config_digest: parsed.config_digest,
+        created_at: parsed.created_at,
+      };
+    }
+  } catch {
+    // Ignore malformed storage entries.
+  }
+  return null;
+}
+
+export function clearPendingGenerateAndRunSubmission(): void {
+  try {
+    sessionStorage.removeItem(PENDING_GNR_SUBMISSION_KEY);
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+export type GenerateAndRunSnapshot = {
+  workflow_id: string;
+  mode: 'generate_and_run';
+  submission_id: string | null;
+  idempotent_replay: boolean;
+  status: WorkflowOverallStatus;
+  current_stage: WorkflowStageName;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  target_id: string;
+  target_revision_sha256: string | null;
+  application_context_revision_sha256: string | null;
+  context_snapshot_sha256: string | null;
+  selected_asi: AsiCode[];
+  requested_scopes: Partial<Record<AsiCode, string>>;
+  policy_ids_by_asi: Partial<Record<AsiCode, string>>;
+  language: SupportedLanguage;
+  evaluation_mode: 'rule_only' | 'hybrid';
+  initial_evaluation_mode?: 'rule_only' | 'hybrid';
+  execution_mode: 'live';
+  allow_partial_execution: boolean;
+  stages: WorkflowStageRecord[];
+  generation_id: string | null;
+  provider_id: string | null;
+  model: string | null;
+  generation_overall_status: string | null;
+  requested_count: number;
+  generated_count: number;
+  accepted_count: number;
+  rejected_count: number;
+  meets_requested_counts: boolean;
+  partial_generation: boolean;
+  rejection_reason_counts: Record<string, number>;
+  asi_generation_summaries: Record<string, Record<string, unknown>>;
+  generation_token_usage: TokenUsage | null;
+  quality_summary: Record<string, unknown> | null;
+  auto_persisted: boolean;
+  dataset_id: string | null;
+  dataset_name: string | null;
+  dataset_file_sha256: string | null;
+  testcase_ids: string[];
+  partial_execution?: boolean;
+  preflight_selected_cases?: number;
+  preflight_ready_count?: number;
+  preflight_skipped_count?: number;
+  preflight_unsupported_count?: number;
+  preflight_skipped_reasons?: PreflightSkippedReason[];
+  run_id: string | null;
+  run_status: string | null;
+  executed_cases: number;
+  total_cases: number;
+  progress_percent: number;
+  verdict_counts: Record<string, number>;
+  evidence_summary: Record<string, unknown>;
+  judge_metadata: Record<string, unknown> | null;
+  evaluation_error_code: string | null;
+  cases_summary: Array<Record<string, unknown>>;
+  dataset_url: string | null;
+  report_url: string | null;
+  report_export_url: string | null;
+  rerun_supported: boolean;
+  rerun_history: RerunHistoryEntry[];
+  resume_supported: boolean;
+  resume_endpoint: string | null;
+  resume_note: string;
+  error_stage: WorkflowStageName | null;
+  error_code: string | null;
+  error_message: string | null;
+  provenance: Record<string, unknown>;
+};
+
+export type GenerateAndRunRerunResponse = {
+  workflow_schema_version: '1.0.0';
+  operation: 'rerun';
+  generator_called: false;
+  regenerated: false;
+  dataset_id: string;
+  previous_run_id: string | null;
+  new_run_id: string;
+  evaluation_mode?: 'rule_only' | 'hybrid';
+  workflow: GenerateAndRunSnapshot;
 };
 
 export function utf8ByteLength(text: string): number {
@@ -635,6 +907,71 @@ export const generatorApi = {
         nonce,
         secret,
         signal,
+      },
+    ),
+
+  startGenerateAndRun: (
+    payload: GenerateAndRunRequestPayload,
+    nonce: string,
+    secret = '',
+    signal?: AbortSignal,
+  ) =>
+    generatorFetch<{ workflow_schema_version: '1.0.0'; workflow: GenerateAndRunSnapshot }>(
+      'generate-and-run',
+      {
+        method: 'POST',
+        nonce,
+        secret,
+        body: payload,
+        signal,
+      },
+    ).then((r) => r.workflow),
+
+  getGenerateAndRunStatus: (
+    workflowId: string,
+    nonce: string,
+    secret = '',
+    signal?: AbortSignal,
+  ) =>
+    generatorFetch<{ workflow_schema_version: '1.0.0'; workflow: GenerateAndRunSnapshot }>(
+      `generate-and-run/${encodeURIComponent(workflowId)}`,
+      {
+        method: 'GET',
+        nonce,
+        secret,
+        signal,
+      },
+    ).then((r) => r.workflow),
+
+  getGenerateAndRunBySubmission: (
+    submissionId: string,
+    nonce: string,
+    secret = '',
+    signal?: AbortSignal,
+  ) =>
+    generatorFetch<{ workflow_schema_version: '1.0.0'; workflow: GenerateAndRunSnapshot }>(
+      `generate-and-run/submission/${encodeURIComponent(submissionId)}`,
+      {
+        method: 'GET',
+        nonce,
+        secret,
+        signal,
+      },
+    ).then((r) => r.workflow),
+
+  rerunGenerateAndRun: (
+    workflowId: string,
+    payload: GenerateAndRunRerunPayload,
+    nonce: string,
+    secret = '',
+  ) =>
+    generatorFetch<GenerateAndRunRerunResponse>(
+      `generate-and-run/${encodeURIComponent(workflowId)}/rerun`,
+      {
+        method: 'POST',
+        nonce,
+        secret,
+        body: payload,
       },
     ),
 };

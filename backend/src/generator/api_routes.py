@@ -42,6 +42,12 @@ from generator.constants import (
     SUPPORTED_ASI_CODES,
 )
 from generator.models import StrictGeneratorModel, normalize_asi_code
+from generator.orchestrator import (
+    GenerateAndRunOrchestrator,
+    GenerateAndRunRequest,
+    GenerateAndRunRerunRequest,
+    OrchestrationError,
+)
 from generator.preview_store import (
     GeneratorPreviewStore,
     PreviewEditRequest,
@@ -65,17 +71,21 @@ DEFAULT_GENERATOR_MAX_BODY_BYTES: int = 256 * 1024  # 256 KiB
 DEFAULT_GENERATE_RATE_LIMIT_MAX: int = 30
 DEFAULT_GENERATE_RATE_LIMIT_WINDOW_SECONDS: float = 60.0
 
-# Exact route table exported for future minimal wiring into workflow/api.py boundary().
+# Exact route table exported for wiring into workflow/api.py boundary().
 GENERATOR_EXACT_ROUTES: dict[str, str] = {
     "/api/testing/generator/status": "GET",
     "/api/testing/generator/readiness": "POST",
     "/api/testing/generator/generate": "POST",
+    "/api/testing/generator/generate-and-run": "POST",
 }
 GENERATOR_REGEX_ROUTES: tuple[tuple[str, str], ...] = (
     (r"/api/testing/generator/previews/prev-[a-f0-9]{32}", "GET"),
     (r"/api/testing/generator/previews/prev-[a-f0-9]{32}/edit", "POST"),
     (r"/api/testing/generator/previews/prev-[a-f0-9]{32}/save", "POST"),
     (r"/api/testing/generator/previews/prev-[a-f0-9]{32}/save-status", "GET"),
+    (r"/api/testing/generator/generate-and-run/gnr-[a-f0-9]{32}", "GET"),
+    (r"/api/testing/generator/generate-and-run/gnr-[a-f0-9]{32}/rerun", "POST"),
+    (r"/api/testing/generator/generate-and-run/submission/[a-f0-9]{32}", "GET"),
 )
 
 
@@ -259,6 +269,7 @@ class GeneratorApiContext:
     operator_authorized: Callable[[], bool]
     operator_identity: Callable[[], str]
     policy_store: Any | None = None
+    orchestrator: GenerateAndRunOrchestrator | None = None
     skill_loader: GeneratorSkillLoader | None = None
     fail: Callable[[str, int], Any] | None = None
     max_body_bytes: int = DEFAULT_GENERATOR_MAX_BODY_BYTES
@@ -306,6 +317,20 @@ _GENERATOR_ERROR_MESSAGES: dict[str, str] = {
     "preview_policy_revision_stale": "Reviewed ResponsePolicy changed after generation; generate a fresh preview.",
     "dataset_normalization_failed": "Dataset normalization failed before persistence.",
     "dataset_save_failed": "Dataset persistence failed; preview remains unsaved.",
+    "generic_runner_unavailable": "Generic Runner service is unavailable for Generate & Run orchestration.",
+    "authorization_required": "Explicit operator authorization_confirmed=true is required before execution.",
+    "target_not_authorized": "Selected target has not been reviewed and authorized for live execution.",
+    "target_revision_stale": "Target profile revision changed; refresh target configuration before starting.",
+    "judge_provider_unavailable": "Hybrid evaluation requested but Judge provider is unavailable.",
+    "generate_and_run_submission_conflict": "This submission_id was already used with different Generate & Run parameters.",
+    "generate_and_run_submission_in_progress": "An identical Generate & Run submission is currently initializing.",
+    "workflow_not_found": "Generate & Run workflow record was not found.",
+    "workflow_submission_not_found": "No Generate & Run workflow was found for this submission_id.",
+    "workflow_submission_expired": "This submission_id was already used, but its in-memory workflow snapshot has expired.",
+    "workflow_execution_in_progress": "Cannot start a rerun while an execution or rerun for this workflow is still active.",
+    "workflow_access_denied": "Generate & Run workflow belongs to a different operator session.",
+    "dataset_not_available_for_rerun": "Workflow has no persisted dataset available for rerun.",
+    "dataset_not_found": "Persisted dataset was not found in DatasetRepository.",
     "internal_error": "Internal Generator API error occurred.",
 }
 
@@ -384,9 +409,16 @@ def register_generator_routes(app: Flask, ctx: GeneratorApiContext) -> None:
         except GeneratorSkillError as exc:
             skill_error = exc.code
 
+        judge_status = (
+            ctx.orchestrator.judge_status()
+            if ctx.orchestrator is not None and ctx.orchestrator.available
+            else None
+        )
         return jsonify(
             workflow_schema_version="1.0.0",
             provider=provider_status.model_dump(mode="json"),
+            generate_and_run_available=bool(ctx.orchestrator is not None and ctx.orchestrator.available),
+            judge=judge_status,
             supported_asi=list(SUPPORTED_ASI_CODES),
             limits={
                 "min_per_asi": DEFAULT_MIN_PER_ASI,
@@ -588,6 +620,125 @@ def register_generator_routes(app: Flask, ctx: GeneratorApiContext) -> None:
             return _error(exc.code, exc.status_code, exc.message)
 
         return jsonify(workflow_schema_version="1.0.0", **status_payload)
+
+    @app.post("/api/testing/generator/generate-and-run")
+    def generator_generate_and_run():
+        denied = _require_auth()
+        if denied:
+            return denied
+
+        if ctx.orchestrator is None or not ctx.orchestrator.available:
+            return _error("generic_runner_unavailable", 503)
+
+        if not rate_limiter.allow():
+            return _error("generator_rate_limited", 429)
+
+        payload, err = _read_checked_json()
+        if err:
+            return err
+        assert payload is not None
+
+        try:
+            run_req = GenerateAndRunRequest.model_validate(payload)
+        except ValidationError:
+            return _error("invalid_request", 400)
+
+        try:
+            snapshot = ctx.orchestrator.start_workflow(
+                req=run_req,
+                owner_id=ctx.operator_identity(),
+            )
+        except OrchestrationError as exc:
+            return _error(exc.code, exc.status_code, exc.message)
+
+        if snapshot.idempotent_replay:
+            status_code = 200
+        elif snapshot.status == "running":
+            status_code = 202
+        else:
+            status_code = 201
+        return jsonify(
+            workflow_schema_version="1.0.0",
+            workflow=snapshot.model_dump(mode="json"),
+        ), status_code
+
+    @app.get("/api/testing/generator/generate-and-run/<workflow_id>")
+    def generator_get_generate_and_run(workflow_id: str):
+        denied = _require_auth()
+        if denied:
+            return denied
+
+        if ctx.orchestrator is None:
+            return _error("generic_runner_unavailable", 503)
+
+        try:
+            snapshot = ctx.orchestrator.get_workflow(
+                workflow_id=workflow_id,
+                owner_id=ctx.operator_identity(),
+            )
+        except OrchestrationError as exc:
+            return _error(exc.code, exc.status_code, exc.message)
+
+        return jsonify(
+            workflow_schema_version="1.0.0",
+            workflow=snapshot.model_dump(mode="json"),
+        )
+
+    @app.get("/api/testing/generator/generate-and-run/submission/<submission_id>")
+    def generator_get_generate_and_run_by_submission(submission_id: str):
+        denied = _require_auth()
+        if denied:
+            return denied
+
+        if ctx.orchestrator is None:
+            return _error("generic_runner_unavailable", 503)
+
+        try:
+            snapshot = ctx.orchestrator.get_workflow_by_submission(
+                submission_id=submission_id,
+                owner_id=ctx.operator_identity(),
+            )
+        except OrchestrationError as exc:
+            return _error(exc.code, exc.status_code, exc.message)
+
+        return jsonify(
+            workflow_schema_version="1.0.0",
+            workflow=snapshot.model_dump(mode="json"),
+        )
+
+    @app.post("/api/testing/generator/generate-and-run/<workflow_id>/rerun")
+    def generator_rerun_generate_and_run(workflow_id: str):
+        denied = _require_auth()
+        if denied:
+            return denied
+
+        if ctx.orchestrator is None or not ctx.orchestrator.available:
+            return _error("generic_runner_unavailable", 503)
+
+        payload, err = _read_checked_json()
+        if err:
+            return err
+        assert payload is not None
+
+        try:
+            rerun_req = GenerateAndRunRerunRequest.model_validate(payload)
+        except ValidationError:
+            return _error("invalid_request", 400)
+
+        try:
+            result_payload = ctx.orchestrator.rerun_workflow(
+                workflow_id=workflow_id,
+                owner_id=ctx.operator_identity(),
+                rerun_req=rerun_req,
+            )
+        except OrchestrationError as exc:
+            return _error(exc.code, exc.status_code, exc.message)
+
+        status_code = 202 if rerun_req.async_execution else 201
+        return jsonify(
+            workflow_schema_version="1.0.0",
+            **result_payload,
+        ), status_code
 
 
 def create_standalone_generator_app(

@@ -46,6 +46,16 @@ from workflow.response_policies import ResponsePolicyStore
 from workflow.routes_generic_runner import GenericRunService, register_generic_runner_routes
 from workflow.routes_targets import (DiscoveryProbeRequest, LocalProbeRequest,
     register_target_routes)
+from generator.api_routes import (
+    GENERATOR_EXACT_ROUTES,
+    GENERATOR_REGEX_ROUTES,
+    GeneratorApiContext,
+    register_generator_routes,
+)
+from generator.orchestrator import GenerateAndRunOrchestrator
+from generator.preview_store import GeneratorPreviewStore
+from generator.provider_factory import create_server_generator_provider
+from generator.service import GeneratorService
 
 
 @dataclass(frozen=True)
@@ -88,7 +98,9 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
                mcp_action_service: McpActionWorkflow | None = None,
                response_policy_dir: Path | None = None,
                generic_runs_dir: Path | None = None,
-               generic_run_service: GenericRunService | None = None):
+               generic_run_service: GenericRunService | None = None,
+               generator_provider=None,
+               generator_service: GeneratorService | None = None):
     if lab_preparer is not None and dispatcher is None and (not isinstance(operator_secret,str) or len(operator_secret)<32):
         raise ValueError('Lab preparation requires a separate operator secret.')
     managed = isinstance(catalog, ManagedTargetCatalog)
@@ -358,6 +370,11 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
         routes["/api/testing/generic-runs"] = "GET"
         routes["/api/testing/generic-runs/preview"] = "POST"
         routes["/api/testing/generic-runs/start"] = "POST"
+        routes.update(GENERATOR_EXACT_ROUTES)
+        for gen_pattern, gen_method in GENERATOR_REGEX_ROUTES:
+            if re.fullmatch(gen_pattern, request.path):
+                routes[request.path] = gen_method
+                break
         if re.fullmatch(r'/api/testing/evidence-sources/target/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', request.path):
             routes[request.path] = 'GET'
         if re.fullmatch(r'/api/testing/application-contexts/target/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', request.path):
@@ -411,6 +428,7 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
         max_body = (
             5 * 1024 * 1024
             if (request.path.startswith("/api/testing/datasets") or request.path.startswith("/api/testing/generic-runs"))
+            else 256 * 1024 if request.path.startswith("/api/testing/generator")
             else 65536 if large_onboarding else 8192
         )
         if request.content_length and request.content_length > max_body:
@@ -547,6 +565,59 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
     register_execution_routes(app, ctx)
     register_agent_onboarding_routes(app, ctx)
     register_generic_runner_routes(app, ctx)
+
+    from hashlib import sha256 as _sha256
+
+    gen_policy_store = getattr(generic_run_service, "policy_store", None)
+    gen_dataset_repo = dataset_repo if dataset_repo is not None else getattr(generic_run_service, "dataset_repo", None)
+    if generator_service is not None:
+        resolved_gen_service = generator_service
+    else:
+        resolved_provider = (
+            generator_provider if generator_provider is not None else create_server_generator_provider()
+        )
+        resolved_gen_service = GeneratorService(
+            provider=resolved_provider,
+            catalog=catalog,
+            application_contexts=application_contexts,
+            policy_store=gen_policy_store,
+        )
+    gen_preview_store = GeneratorPreviewStore()
+    gen_orchestrator = (
+        GenerateAndRunOrchestrator(
+            generator_service=resolved_gen_service,
+            dataset_repo=gen_dataset_repo,
+            catalog=catalog,
+            application_contexts=application_contexts,
+            generic_run_service=generic_run_service,
+            policy_store=gen_policy_store,
+        )
+        if gen_dataset_repo is not None
+        else None
+    )
+
+    def generator_operator_identity() -> str:
+        if not operator_authorized():
+            return ""
+        if local_single_user:
+            sess = request.headers.get("X-SecAgent-Session", "").strip()
+            return _sha256(f"secagent-local:{sess or 'default'}".encode("utf-8")).hexdigest()
+        supplied = request.headers.get("X-SecAgent-Operator", "")
+        return _sha256(f"secagent-op:{supplied}".encode("utf-8")).hexdigest()
+
+    gen_ctx = GeneratorApiContext(
+        generator_service=resolved_gen_service,
+        preview_store=gen_preview_store,
+        dataset_repo=gen_dataset_repo,
+        catalog=catalog,
+        application_contexts=application_contexts,
+        policy_store=gen_policy_store,
+        orchestrator=gen_orchestrator,
+        nonce=nonce,
+        operator_authorized=operator_authorized,
+        operator_identity=generator_operator_identity,
+    )
+    register_generator_routes(app, gen_ctx)
 
     return app
 

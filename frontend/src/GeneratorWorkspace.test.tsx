@@ -776,3 +776,609 @@ describe('G11.4 GeneratorModeWorkspace — Three Operating Modes', () => {
     expect(saveCallCount).toBe(1);
   });
 });
+
+import App from './App';
+import type { GenerateAndRunSnapshot } from './generatorApi';
+
+function mockLiveWorkflow(
+  overrides: Partial<GenerateAndRunSnapshot> = {},
+): GenerateAndRunSnapshot {
+  const dsId = 'd'.repeat(32);
+  const runId = 'e'.repeat(32);
+  return {
+    workflow_id: 'gnr-' + '1'.repeat(32),
+    mode: 'generate_and_run',
+    submission_id: '2'.repeat(32),
+    idempotent_replay: false,
+    status: 'completed',
+    current_stage: 'reporting',
+    created_at: '2026-11-26T14:00:00Z',
+    updated_at: '2026-11-26T14:00:05Z',
+    completed_at: '2026-11-26T14:00:05Z',
+    target_id: preset.id,
+    target_revision_sha256: preset.profile_revision ?? '3'.repeat(64),
+    application_context_revision_sha256: '4'.repeat(64),
+    context_snapshot_sha256: '5'.repeat(64),
+    selected_asi: ['ASI01'],
+    requested_scopes: {},
+    policy_ids_by_asi: {},
+    language: 'en',
+    evaluation_mode: 'rule_only',
+    execution_mode: 'live',
+    allow_partial_execution: false,
+    stages: [
+      { stage: 'generating', status: 'completed', started_at: '2026-11-26T14:00:00Z', finished_at: '2026-11-26T14:00:01Z', detail: 'Generated 2 candidate(s).', error_code: null, error_message: null },
+      { stage: 'validating', status: 'completed', started_at: '2026-11-26T14:00:01Z', finished_at: '2026-11-26T14:00:01Z', detail: 'Accepted 2/2 testcase(s).', error_code: null, error_message: null },
+      { stage: 'saving_dataset', status: 'completed', started_at: '2026-11-26T14:00:01Z', finished_at: '2026-11-26T14:00:02Z', detail: `Persisted immutable dataset ${dsId}.`, error_code: null, error_message: null },
+      { stage: 'preflight', status: 'completed', started_at: '2026-11-26T14:00:02Z', finished_at: '2026-11-26T14:00:02Z', detail: 'Preflight passed.', error_code: null, error_message: null },
+      { stage: 'executing', status: 'completed', started_at: '2026-11-26T14:00:02Z', finished_at: '2026-11-26T14:00:04Z', detail: 'Executed 2/2 testcase(s).', error_code: null, error_message: null },
+      { stage: 'evaluating', status: 'completed', started_at: '2026-11-26T14:00:04Z', finished_at: '2026-11-26T14:00:05Z', detail: 'Evaluated 2 testcase(s).', error_code: null, error_message: null },
+      { stage: 'reporting', status: 'completed', started_at: '2026-11-26T14:00:05Z', finished_at: '2026-11-26T14:00:05Z', detail: `Report persisted as ${runId}.`, error_code: null, error_message: null },
+    ],
+    generation_id: 'gen-live0001',
+    provider_id: 'deepseek_http',
+    model: 'deepseek-flash',
+    generation_overall_status: 'completed',
+    requested_count: 2,
+    generated_count: 2,
+    accepted_count: 2,
+    rejected_count: 0,
+    meets_requested_counts: true,
+    partial_generation: false,
+    rejection_reason_counts: {},
+    asi_generation_summaries: {},
+    generation_token_usage: { prompt_tokens: 100, completion_tokens: 150, total_tokens: 250 },
+    quality_summary: null,
+    auto_persisted: true,
+    dataset_id: dsId,
+    dataset_name: 'g11-auto-saved.json',
+    dataset_file_sha256: '6'.repeat(64),
+    testcase_ids: ['G11-ASI01-001', 'G11-ASI01-002'],
+    run_id: runId,
+    run_status: 'completed',
+    executed_cases: 2,
+    total_cases: 2,
+    progress_percent: 100,
+    verdict_counts: { PASS: 2 },
+    evidence_summary: {},
+    judge_metadata: null,
+    evaluation_error_code: null,
+    cases_summary: [],
+    dataset_url: '#datasets',
+    report_url: `#scan/${runId}`,
+    report_export_url: `/api/testing/generic-runs/${runId}/report.json`,
+    rerun_supported: true,
+    rerun_history: [],
+    resume_supported: false,
+    resume_endpoint: `/api/testing/generic-runs/${runId}/resume/preview`,
+    resume_note: 'Rerun executes the persisted dataset under a new run_id with zero Generator calls. Resume continues an interrupted run from Generic Runner checkpoints without regenerating prompts.',
+    error_stage: null,
+    error_code: null,
+    error_message: null,
+    provenance: {},
+    ...overrides,
+  };
+}
+
+describe('G11.6 — Live Generate & Run UI & App.tsx Integration', () => {
+  it('unlocks Generate & Run, prevents double-click duplicate submit, renders all 7 stages, links dataset/report, and supports Rerun without Generator', async () => {
+    let startCalls = 0;
+    let rerunCalls = 0;
+    let resolveStart!: (res: Response) => void;
+    const completedWf = mockLiveWorkflow();
+    const rerunRunId = 'f'.repeat(32);
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith('/api/testing/generator/status')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ ...mockStatusResponse(true), generate_and_run_available: true }),
+          ),
+        );
+      }
+      if (url.endsWith('/api/testing/generator/generate-and-run') && init?.method === 'POST') {
+        startCalls += 1;
+        return new Promise<Response>((resolve) => {
+          resolveStart = resolve;
+        });
+      }
+      if (url.endsWith('/rerun') && init?.method === 'POST') {
+        rerunCalls += 1;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              workflow_schema_version: '1.0.0',
+              operation: 'rerun',
+              generator_called: false,
+              regenerated: false,
+              dataset_id: completedWf.dataset_id,
+              previous_run_id: completedWf.run_id,
+              new_run_id: rerunRunId,
+              workflow: { ...completedWf, run_id: rerunRunId },
+            }),
+            { status: 201 },
+          ),
+        );
+      }
+      return Promise.resolve(new Response('{}', { status: 404 }));
+    });
+
+    const onOpenDataset = vi.fn();
+    const onOpenReport = vi.fn();
+    render(
+      <GeneratorModeWorkspace
+        targets={[preset]}
+        nonce={NONCE}
+        onOpenDatasetLibrary={onOpenDataset}
+        onOpenRunReport={onOpenReport}
+      />,
+    );
+
+    await screen.findByTestId('g11-6-active-banner');
+    const runBtn = screen.getByTestId('generate-and-run-submit-btn');
+    // Disabled until operator checks authorization consent
+    expect(runBtn).toBeDisabled();
+    fireEvent.click(screen.getByLabelText(/Confirm authorized Generate and Run scope/i));
+    expect(runBtn).not.toBeDisabled();
+
+    // Double-click guard: rapid double submit fires ONLY ONE POST
+    fireEvent.click(runBtn);
+    fireEvent.click(runBtn);
+    expect(startCalls).toBe(1);
+    expect(runBtn).toBeDisabled();
+
+    resolveStart(
+      new Response(JSON.stringify({ workflow_schema_version: '1.0.0', workflow: completedWf }), {
+        status: 201,
+      }),
+    );
+
+    await screen.findByTestId('generate-and-run-result');
+    expect(screen.getByTestId('workflow-overall-status')).toHaveTextContent('completed');
+    expect(screen.getByTestId('workflow-dataset-id')).toHaveTextContent(completedWf.dataset_id!);
+    expect(screen.getByTestId('workflow-run-id')).toHaveTextContent(completedWf.run_id!);
+    for (const stage of [
+      'generating',
+      'validating',
+      'saving_dataset',
+      'preflight',
+      'executing',
+      'evaluating',
+      'reporting',
+    ]) {
+      expect(screen.getByTestId(`workflow-stage-${stage}`)).toHaveTextContent('Status: completed');
+    }
+
+    // Links to Dataset Library & Run Report work
+    fireEvent.click(screen.getByTestId('workflow-open-dataset-link'));
+    expect(onOpenDataset).toHaveBeenCalledWith(completedWf.dataset_id);
+    fireEvent.click(screen.getByTestId('workflow-open-report-link'));
+    expect(onOpenReport).toHaveBeenCalledWith(completedWf.run_id);
+
+    // Rerun Saved Dataset calls /rerun without calling /generate or /generate-and-run
+    fireEvent.click(screen.getByTestId('workflow-rerun-btn'));
+    await screen.findByTestId('workflow-rerun-status');
+    expect(rerunCalls).toBe(1);
+    expect(startCalls).toBe(1);
+    expect(screen.getByTestId('workflow-run-id')).toHaveTextContent(rerunRunId);
+  });
+
+  it('displays partial-stopped and stage-specific errors cleanly without claiming execution success', async () => {
+    const partialWf = mockLiveWorkflow({
+      status: 'partial_stopped',
+      current_stage: 'validating',
+      requested_count: 5,
+      generated_count: 2,
+      accepted_count: 2,
+      rejected_count: 0,
+      meets_requested_counts: false,
+      partial_generation: true,
+      auto_persisted: false,
+      dataset_id: null,
+      run_id: null,
+      run_status: null,
+      executed_cases: 0,
+      total_cases: 0,
+      rerun_supported: false,
+      error_stage: 'validating',
+      error_code: 'partial_generation_not_executed',
+      error_message: 'Partial generation stopped before execution: accepted 2 of 5 requested.',
+    });
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/api/testing/generator/status')) {
+        return new Response(
+          JSON.stringify({ ...mockStatusResponse(true), generate_and_run_available: true }),
+        );
+      }
+      if (url.endsWith('/api/testing/generator/generate-and-run') && init?.method === 'POST') {
+        return new Response(
+          JSON.stringify({ workflow_schema_version: '1.0.0', workflow: partialWf }),
+          { status: 201 },
+        );
+      }
+      return new Response('{}', { status: 404 });
+    });
+
+    render(<GeneratorModeWorkspace targets={[preset]} nonce={NONCE} />);
+    await screen.findByTestId('g11-6-active-banner');
+    fireEvent.click(screen.getByLabelText(/Confirm authorized Generate and Run scope/i));
+    fireEvent.click(screen.getByTestId('generate-and-run-submit-btn'));
+
+    await screen.findByTestId('workflow-stage-error');
+    expect(screen.getByTestId('workflow-overall-status')).toHaveTextContent('partial_stopped');
+    expect(screen.getByTestId('workflow-stage-error')).toHaveTextContent('partial_generation_not_executed');
+    expect(screen.getByTestId('workflow-dataset-id')).toHaveTextContent('Not saved');
+    expect(screen.getByTestId('workflow-run-id')).toHaveTextContent('Not started');
+  });
+
+  it('integrates GeneratorModeWorkspace into real App.tsx at #generator and never triggers execution on mode switch', async () => {
+    location.hash = '#generator';
+    const postUrls: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (init?.method === 'POST') postUrls.push(url);
+      if (url.endsWith('/api/testing/health')) {
+        return new Response(
+          JSON.stringify({
+            workflow_schema_version: '1.0.0',
+            status: 'ok',
+            mode: 'controlled_execution_enabled',
+            target_network_access: true,
+            evaluation_modes: ['rule_only'],
+            operator_mode: 'local_single_user',
+            validation_nonce: NONCE,
+            generic_runner_enabled: true,
+          }),
+        );
+      }
+      if (url.endsWith('/api/testing/targets')) {
+        return new Response(
+          JSON.stringify({
+            workflow_schema_version: '1.0.0',
+            targets: [preset],
+            protocols: [{ id: 'openai-chat', state: 'offline_configuration_supported' }],
+          }),
+        );
+      }
+      if (url.endsWith('/api/testing/datasets')) {
+        return new Response(JSON.stringify({ workflow_schema_version: '1.0.0', datasets: [] }));
+      }
+      if (url.endsWith('/api/testing/generator/status')) {
+        return new Response(
+          JSON.stringify({ ...mockStatusResponse(true), generate_and_run_available: true }),
+        );
+      }
+      return new Response('{}', { status: 404 });
+    });
+
+    render(<App />);
+    // AI Generator nav link is active and workspace renders inside real App
+    expect(screen.getByRole('link', { name: /AI Generator/i })).toHaveAttribute('aria-current', 'page');
+    await screen.findByTestId('generator-mode-workspace');
+    await screen.findByTestId('g11-6-active-banner');
+
+    // Switching across all 3 operating modes NEVER triggers generation or execution POSTs
+    fireEvent.click(screen.getByTestId('mode-tab-generate_only'));
+    await screen.findByTestId('generate-only-submit-btn');
+    fireEvent.click(screen.getByTestId('mode-tab-run_existing_dataset'));
+    await screen.findByTestId('run-existing-dataset-panel');
+    fireEvent.click(screen.getByTestId('mode-tab-generate_and_run'));
+    await screen.findByTestId('generate-and-run-panel');
+
+    expect(postUrls).toEqual([]);
+    location.hash = '';
+  });
+
+  it('R02: recovers existing workflow after lost network response without duplicate POST and stores zero sensitive payloads', async () => {
+    sessionStorage.clear();
+    const recoveredWf = mockLiveWorkflow();
+    const postSubmissionIds: string[] = [];
+    const lookupSubmissionIds: string[] = [];
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/api/testing/generator/status')) {
+        return new Response(
+          JSON.stringify({ ...mockStatusResponse(true), generate_and_run_available: true }),
+        );
+      }
+      if (url.endsWith('/api/testing/generator/generate-and-run') && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body));
+        postSubmissionIds.push(body.submission_id);
+        throw new TypeError('Failed to fetch');
+      }
+      const match = url.match(/\/api\/testing\/generator\/generate-and-run\/submission\/([a-f0-9]{32})$/);
+      if (match) {
+        lookupSubmissionIds.push(match[1]);
+        // Inspect sessionStorage while pending recovery is active: must NOT contain focus notes or secrets
+        const stored = sessionStorage.getItem('secagent_pending_gnr_submission') ?? '';
+        expect(stored).not.toContain('secret-focus-note-sentinel');
+        expect(stored).toContain(match[1]);
+        return new Response(
+          JSON.stringify({ workflow_schema_version: '1.0.0', workflow: { ...recoveredWf, submission_id: match[1] } }),
+        );
+      }
+      return new Response('{}', { status: 404 });
+    });
+
+    render(<GeneratorModeWorkspace targets={[preset]} nonce={NONCE} />);
+    await screen.findByTestId('g11-6-active-banner');
+    fireEvent.change(screen.getByLabelText('Focus note'), {
+      target: { value: 'secret-focus-note-sentinel' },
+    });
+    fireEvent.click(screen.getByLabelText(/Confirm authorized Generate and Run scope/i));
+    fireEvent.click(screen.getByTestId('generate-and-run-submit-btn'));
+
+    // Automatically recovers existing workflow via GET /submission/<same_id> with ZERO second POST
+    await screen.findByTestId('workflow-recovery-notice');
+    await screen.findByTestId('generate-and-run-result');
+    expect(postSubmissionIds).toHaveLength(1);
+    expect(lookupSubmissionIds).toEqual(postSubmissionIds);
+    expect(sessionStorage.getItem('secagent_pending_gnr_submission')).toBeNull();
+  });
+
+  it('R02: keeps exact same submission_id when retrying after confirmed 404 on network timeout', async () => {
+    sessionStorage.clear();
+    const completedWf = mockLiveWorkflow();
+    const postSubmissionIds: string[] = [];
+    let attempt = 0;
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/api/testing/generator/status')) {
+        return new Response(
+          JSON.stringify({ ...mockStatusResponse(true), generate_and_run_available: true }),
+        );
+      }
+      if (url.endsWith('/api/testing/generator/generate-and-run') && init?.method === 'POST') {
+        attempt += 1;
+        const body = JSON.parse(String(init.body));
+        postSubmissionIds.push(body.submission_id);
+        if (attempt === 1) {
+          throw new DOMException('The operation was aborted', 'AbortError');
+        }
+        return new Response(
+          JSON.stringify({ workflow_schema_version: '1.0.0', workflow: { ...completedWf, submission_id: body.submission_id } }),
+          { status: 201 },
+        );
+      }
+      if (url.includes('/api/testing/generator/generate-and-run/submission/')) {
+        return new Response(
+          JSON.stringify({
+            workflow_schema_version: '1.0.0',
+            error: { code: 'workflow_submission_not_found', message: 'Not found' },
+          }),
+          { status: 404 },
+        );
+      }
+      return new Response('{}', { status: 404 });
+    });
+
+    render(<GeneratorModeWorkspace targets={[preset]} nonce={NONCE} />);
+    await screen.findByTestId('g11-6-active-banner');
+    fireEvent.click(screen.getByLabelText(/Confirm authorized Generate and Run scope/i));
+    fireEvent.click(screen.getByTestId('generate-and-run-submit-btn'));
+
+    // After 404 lookup confirms server never received it, UI allows retry with EXACT SAME submission_id
+    await screen.findByTestId('pending-submission-recovery');
+    const retryBtn = screen.getByTestId('generate-and-run-submit-btn');
+    expect(retryBtn).toHaveTextContent('Retry Generate & Run (Same Submission ID)');
+    expect(retryBtn).not.toBeDisabled();
+
+    fireEvent.click(retryBtn);
+    await screen.findByTestId('generate-and-run-result');
+    expect(postSubmissionIds).toHaveLength(2);
+    expect(postSubmissionIds[0]).toBe(postSubmissionIds[1]);
+  });
+
+  it('Judge-centric default: defaults to hybrid when Judge is ready, and never silently downgrades hybrid when Judge is unavailable', async () => {
+    sessionStorage.clear();
+    const submittedModes: string[] = [];
+    const completedWf = mockLiveWorkflow({ evaluation_mode: 'hybrid' });
+
+    // Case 1: Judge ready -> defaults to hybrid!
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/api/testing/generator/status')) {
+        return new Response(
+          JSON.stringify({
+            ...mockStatusResponse(true),
+            generate_and_run_available: true,
+            judge: {
+              judge_configured: true,
+              credential_available: true,
+              judge_ready: true,
+              provider: 'deepseek',
+              model: 'deepseek-v4-flash',
+              reason: 'ready',
+            },
+          }),
+        );
+      }
+      if (url.endsWith('/api/testing/generator/generate-and-run') && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body));
+        submittedModes.push(body.evaluation_mode);
+        return new Response(
+          JSON.stringify({ workflow_schema_version: '1.0.0', workflow: completedWf }),
+          { status: 201 },
+        );
+      }
+      return new Response('{}', { status: 404 });
+    });
+
+    const { unmount } = render(<GeneratorModeWorkspace targets={[preset]} nonce={NONCE} />);
+    await screen.findByTestId('judge-readiness-status');
+    const evalSelect = screen.getByLabelText('Planned evaluation mode') as HTMLSelectElement;
+    await waitFor(() => expect(evalSelect.value).toBe('hybrid'));
+    fireEvent.click(screen.getByLabelText(/Confirm authorized Generate and Run scope/i));
+    fireEvent.click(screen.getByTestId('generate-and-run-submit-btn'));
+    await screen.findByTestId('generate-and-run-result');
+    expect(submittedModes).toEqual(['hybrid']);
+    unmount();
+
+    // Case 2: Judge unavailable -> stays hybrid (NO silent downgrade to rule_only), blocks submit until operator explicitly chooses rule_only
+    vi.restoreAllMocks();
+    const submittedCase2: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/api/testing/generator/status')) {
+        return new Response(
+          JSON.stringify({
+            ...mockStatusResponse(true),
+            generate_and_run_available: true,
+            judge: {
+              judge_configured: true,
+              credential_available: false,
+              judge_ready: false,
+              provider: 'deepseek',
+              model: 'deepseek-v4-flash',
+              reason: 'credential_missing',
+            },
+          }),
+        );
+      }
+      if (url.endsWith('/api/testing/generator/generate-and-run') && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body));
+        submittedCase2.push(body.evaluation_mode);
+        return new Response(
+          JSON.stringify({
+            workflow_schema_version: '1.0.0',
+            workflow: { ...completedWf, evaluation_mode: 'rule_only' },
+          }),
+          { status: 201 },
+        );
+      }
+      return new Response('{}', { status: 404 });
+    });
+
+    render(<GeneratorModeWorkspace targets={[preset]} nonce={NONCE} />);
+    await screen.findByTestId('hybrid-judge-unavailable-alert');
+    const select2 = screen.getByLabelText('Planned evaluation mode') as HTMLSelectElement;
+    expect(select2.value).toBe('hybrid');
+    fireEvent.click(screen.getByLabelText(/Confirm authorized Generate and Run scope/i));
+    expect(screen.getByTestId('generate-and-run-submit-btn')).toBeDisabled();
+
+    // Operator explicitly opts into rule_only -> unlocks and submits rule_only
+    fireEvent.change(select2, { target: { value: 'rule_only' } });
+    expect(screen.queryByTestId('hybrid-judge-unavailable-alert')).not.toBeInTheDocument();
+    expect(screen.getByTestId('generate-and-run-submit-btn')).not.toBeDisabled();
+    fireEvent.click(screen.getByTestId('generate-and-run-submit-btn'));
+    await screen.findByTestId('generate-and-run-result');
+    expect(submittedCase2).toEqual(['rule_only']);
+  });
+
+  it('Issue A: disables Rerun button while workflow is running and prevents active rerun requests', async () => {
+    sessionStorage.clear();
+    let rerunCalls = 0;
+    const runningWf = mockLiveWorkflow({
+      status: 'running',
+      current_stage: 'executing',
+      run_status: 'running',
+      executed_cases: 0,
+      progress_percent: 0,
+      rerun_supported: false,
+    });
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/api/testing/generator/status')) {
+        return new Response(
+          JSON.stringify({ ...mockStatusResponse(true), generate_and_run_available: true }),
+        );
+      }
+      if (url.endsWith('/api/testing/generator/generate-and-run') && init?.method === 'POST') {
+        return new Response(
+          JSON.stringify({ workflow_schema_version: '1.0.0', workflow: runningWf }),
+          { status: 202 },
+        );
+      }
+      if (url.endsWith('/rerun')) {
+        rerunCalls += 1;
+        return new Response('{}', { status: 409 });
+      }
+      if (url.includes(`/api/testing/generator/generate-and-run/${runningWf.workflow_id}`)) {
+        return new Response(
+          JSON.stringify({ workflow_schema_version: '1.0.0', workflow: runningWf }),
+        );
+      }
+      return new Response('{}', { status: 404 });
+    });
+
+    render(<GeneratorModeWorkspace targets={[preset]} nonce={NONCE} />);
+    await screen.findByTestId('g11-6-active-banner');
+    fireEvent.click(screen.getByLabelText(/Confirm authorized Generate and Run scope/i));
+    fireEvent.click(screen.getByTestId('generate-and-run-submit-btn'));
+
+    await screen.findByTestId('generate-and-run-result');
+    const rerunBtn = screen.getByTestId('workflow-rerun-btn');
+    expect(rerunBtn).toBeDisabled();
+    expect(rerunBtn).toHaveTextContent('Rerun Unavailable While Active');
+    fireEvent.click(rerunBtn);
+    expect(rerunCalls).toBe(0);
+  });
+
+  it('Issue B: distinguishes 410 expired submission from 404 unknown and never auto-retries expired submission_id', async () => {
+    sessionStorage.clear();
+    const postSubmissionIds: string[] = [];
+    const completedWf = mockLiveWorkflow();
+    let postCount = 0;
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/api/testing/generator/status')) {
+        return new Response(
+          JSON.stringify({ ...mockStatusResponse(true), generate_and_run_available: true }),
+        );
+      }
+      if (url.endsWith('/api/testing/generator/generate-and-run') && init?.method === 'POST') {
+        postCount += 1;
+        const body = JSON.parse(String(init.body));
+        postSubmissionIds.push(body.submission_id);
+        if (postCount === 1) {
+          throw new TypeError('Failed to fetch');
+        }
+        return new Response(
+          JSON.stringify({ workflow_schema_version: '1.0.0', workflow: completedWf }),
+          { status: 201 },
+        );
+      }
+      if (url.includes('/api/testing/generator/generate-and-run/submission/')) {
+        return new Response(
+          JSON.stringify({
+            workflow_schema_version: '1.0.0',
+            error: { code: 'workflow_submission_expired', message: 'Submission snapshot expired.' },
+          }),
+          { status: 410 },
+        );
+      }
+      return new Response('{}', { status: 404 });
+    });
+
+    render(<GeneratorModeWorkspace targets={[preset]} nonce={NONCE} />);
+    await screen.findByTestId('g11-6-active-banner');
+    fireEvent.click(screen.getByLabelText(/Confirm authorized Generate and Run scope/i));
+    fireEvent.click(screen.getByTestId('generate-and-run-submit-btn'));
+
+    // 410 expired MUST lock Submit and NOT show "Retry with Same Submission ID"
+    await screen.findByTestId('pending-submission-recovery');
+    expect(screen.getByTestId('pending-submission-recovery')).toHaveTextContent('status: expired');
+    expect(screen.getByTestId('generate-and-run-submit-btn')).toBeDisabled();
+    expect(screen.getByTestId('generate-and-run-submit-btn')).not.toHaveTextContent(
+      'Same Submission ID',
+    );
+    expect(screen.getByTestId('discard-recovery-btn')).toHaveTextContent(
+      'Acknowledge Expired Submission & Start Fresh',
+    );
+
+    // After explicit operator acknowledgement, starting a fresh run MUST use a brand-new submission_id
+    fireEvent.click(screen.getByTestId('discard-recovery-btn'));
+    expect(screen.getByTestId('generate-and-run-submit-btn')).not.toBeDisabled();
+    fireEvent.click(screen.getByTestId('generate-and-run-submit-btn'));
+    await screen.findByTestId('generate-and-run-result');
+    expect(postSubmissionIds).toHaveLength(2);
+    expect(postSubmissionIds[1]).not.toBe(postSubmissionIds[0]);
+  });
+});

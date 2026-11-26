@@ -483,10 +483,12 @@ def _compute_save_request_digest(
 
 def serialize_preview_candidates_to_dataset_json(
     *,
-    preview_id: str,
+    preview_id: str | None,
     result: GenerationResult,
     selected_views: Sequence[PreviewCandidateView],
     partial_save_confirmed: bool,
+    workflow_id: str | None = None,
+    auto_persisted: bool = False,
 ) -> bytes:
     """Build backend-controlled canonical dataset JSON compatible with normalize_dataset()."""
     selected_asi_codes = {v.asi_code for v in selected_views}
@@ -519,7 +521,6 @@ def serialize_preview_candidates_to_dataset_json(
             "origin": view.origin,
             "operator_edited": view.operator_edited,
             "generation_id": result.generation_id,
-            "preview_id": preview_id,
             "source_candidate_id": view.candidate_id,
             "target_id": result.target_id,
             "original_prompt_sha256": view.original_prompt_sha256,
@@ -529,6 +530,10 @@ def serialize_preview_candidates_to_dataset_json(
             "effective_scope_metadata": view.effective_scope,
             "scope_note": view.scope_note,
         }
+        if preview_id is not None:
+            meta["preview_id"] = preview_id
+        if workflow_id is not None:
+            meta["workflow_id"] = workflow_id
         if view.reviewed_policy_id and view.reviewed_policy_revision_sha256:
             meta["reviewed_policy_id"] = view.reviewed_policy_id
             meta["reviewed_policy_revision_sha256"] = view.reviewed_policy_revision_sha256
@@ -545,43 +550,93 @@ def serialize_preview_candidates_to_dataset_json(
             }
         )
 
+    generation_provenance: dict[str, Any] = {
+        "source": "SecAgent AI Generator",
+        "generation_id": result.generation_id,
+        "preview_id": preview_id,
+        "target_id": result.target_id,
+        "target_revision_sha256": result.target_revision_sha256,
+        "application_context_revision_sha256": result.application_context_revision_sha256,
+        "context_snapshot_sha256": result.context_snapshot_sha256,
+        "provider_id": result.provider_id,
+        "model": result.model,
+        "language": result.language,
+        "deduplicate_across_asi": result.deduplicate_across_asi,
+        "overall_status": result.overall_status,
+        "meets_requested_counts": result.meets_requested_counts,
+        "partial_generation": not result.meets_requested_counts,
+        "partial_save_confirmed": partial_save_confirmed,
+        "auto_persisted": auto_persisted,
+        "workflow_mode": "generate_and_run" if auto_persisted else "generate_only",
+        "counts": {
+            "requested": result.total_requested,
+            "generated": result.total_generated,
+            "accepted": result.total_accepted,
+            "rejected": result.total_rejected,
+            "selected_for_save": len(selected_views),
+        },
+        "asi_skills": asi_skills,
+        "reviewed_policies": reviewed_policies,
+    }
+    if workflow_id is not None:
+        generation_provenance["workflow_id"] = workflow_id
+
     payload: dict[str, Any] = {
         "schema_version": "1.0",
         "source_tool": GENERATOR_SOURCE_TOOL,
         "platform": "secagent_ai_generator",
         "bot": result.target_id[:64],
         "run_id": result.generation_id[:64],
-        "generation_provenance": {
-            "source": "SecAgent AI Generator",
-            "generation_id": result.generation_id,
-            "preview_id": preview_id,
-            "target_id": result.target_id,
-            "target_revision_sha256": result.target_revision_sha256,
-            "application_context_revision_sha256": result.application_context_revision_sha256,
-            "context_snapshot_sha256": result.context_snapshot_sha256,
-            "provider_id": result.provider_id,
-            "model": result.model,
-            "language": result.language,
-            "deduplicate_across_asi": result.deduplicate_across_asi,
-            "overall_status": result.overall_status,
-            "meets_requested_counts": result.meets_requested_counts,
-            "partial_generation": not result.meets_requested_counts,
-            "partial_save_confirmed": partial_save_confirmed,
-            "counts": {
-                "requested": result.total_requested,
-                "generated": result.total_generated,
-                "accepted": result.total_accepted,
-                "rejected": result.total_rejected,
-                "selected_for_save": len(selected_views),
-            },
-            "asi_skills": asi_skills,
-            "reviewed_policies": reviewed_policies,
-        },
+        "generation_provenance": generation_provenance,
         "testcases": testcases,
     }
     return json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
     ).encode("utf-8")
+
+
+def serialize_generation_result_to_dataset_json(
+    *,
+    result: GenerationResult,
+    workflow_id: str,
+    partial_execution_confirmed: bool = False,
+) -> bytes:
+    """Serialize all accepted candidates of a GenerationResult for Mode 1 auto-persistence."""
+    views: list[PreviewCandidateView] = []
+    for code in result.asi_order:
+        asi_res = result.asi_results[code]
+        for cand in asi_res.accepted_candidates:
+            views.append(
+                PreviewCandidateView(
+                    candidate_id=cand.candidate_id,
+                    asi_code=cand.asi_code,
+                    asi_category=cand.asi_category,
+                    effective_scope=cand.effective_scope,
+                    source_index=cand.source_index,
+                    origin="ai_generated_original",
+                    operator_edited=False,
+                    selected=True,
+                    original_prompt=cand.prompt,
+                    original_description=cand.description,
+                    original_prompt_sha256=cand.prompt_sha256,
+                    effective_prompt=cand.prompt,
+                    effective_description=cand.description,
+                    effective_prompt_sha256=cand.prompt_sha256,
+                    strategy_tag=cand.strategy_tag,
+                    context_basis=cand.context_basis,
+                    scope_note=cand.scope_note,
+                    reviewed_policy_id=asi_res.reviewed_policy_id,
+                    reviewed_policy_revision_sha256=asi_res.reviewed_policy_revision_sha256,
+                )
+            )
+    return serialize_preview_candidates_to_dataset_json(
+        preview_id=None,
+        result=result,
+        selected_views=views,
+        partial_save_confirmed=partial_execution_confirmed,
+        workflow_id=workflow_id,
+        auto_persisted=True,
+    )
 
 
 class GeneratorPreviewStore:

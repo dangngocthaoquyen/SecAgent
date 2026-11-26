@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { DatasetSummary, TargetPreset } from './testingApi';
+import {
+  getEphemeralOperatorSecret,
+  testingApi,
+  type DatasetSummary,
+  type TargetPreset,
+} from './testingApi';
 import GenerateAndRunPrepPanel from './GenerateAndRunPrepPanel';
 import GeneratorOnlyPanel from './GeneratorOnlyPanel';
 import {
@@ -9,6 +14,7 @@ import {
   extractActiveCounts,
   generatorApi,
   type GeneratorConfigState,
+  type GeneratorJudgeStatus,
   type GeneratorOperatingMode,
   type GeneratorProviderStatus,
   type PreviewSaveRecord,
@@ -34,15 +40,17 @@ function buildReadinessFingerprint(cfg: GeneratorConfigState): string {
 }
 
 export type GeneratorModeWorkspaceProps = {
-  targets: TargetPreset[];
-  nonce: string;
+  targets?: TargetPreset[];
+  nonce?: string;
   secret?: string;
   initialMode?: GeneratorOperatingMode;
   initialTargetId?: string;
   existingDatasets?: DatasetSummary[];
+  onSelectTarget?: (targetId: string) => void;
   onDatasetSaved?: (record: PreviewSaveRecord) => void;
   onOpenDatasetLibrary?: (datasetId?: string) => void;
   onOpenExistingScan?: (datasetId?: string) => void;
+  onOpenRunReport?: (runId: string) => void;
 };
 
 const MODE_DESCRIPTIONS: Record<
@@ -53,7 +61,7 @@ const MODE_DESCRIPTIONS: Record<
     title: 'Generate & Run',
     badge: 'Primary Workflow · G11.6',
     summary:
-      'Configure → Generate → Validate → Auto-Save Dataset → Preflight → Execute → Judge → Report (no mandatory preview/manual save step).',
+      'Configure → Generate → Validate → Auto-Save Dataset → Preflight → Execute → Evaluate → Report (no mandatory preview/manual save step).',
   },
   generate_only: {
     title: 'Generate Only',
@@ -70,31 +78,41 @@ const MODE_DESCRIPTIONS: Record<
 };
 
 /**
- * Unified three-mode Generator & Scan entry workspace for SecAgent G11.4.
+ * Unified three-mode Generator & Scan entry workspace for SecAgent (G11.4 + G11.6).
  *
- * - Mode 1 (`generate_and_run`): Primary product experience (UI contract prepared for G11.6;
- *   cannot accidentally invoke execution until G11.6 orchestration is integrated).
- * - Mode 2 (`generate_only`): Full interactive Generate -> Preview -> Edit/Select -> Explicit Save
- *   workflow connected to G11.3C Generator API.
- * - Mode 3 (`run_existing_dataset`): Links directly to existing Dataset Library & New Scan flows
- *   with zero calls to Generator API.
+ * Works both integrated inside App.tsx (auto-bootstrapping health/targets/datasets via testingApi)
+ * and with injected props in unit tests.
  */
 export default function GeneratorModeWorkspace({
-  targets,
-  nonce,
-  secret = '',
+  targets: propTargets,
+  nonce: propNonce,
+  secret: propSecret,
   initialMode = 'generate_and_run',
   initialTargetId = '',
-  existingDatasets = [],
+  existingDatasets: propExistingDatasets,
+  onSelectTarget,
   onDatasetSaved,
   onOpenDatasetLibrary,
   onOpenExistingScan,
-}: GeneratorModeWorkspaceProps) {
+  onOpenRunReport,
+}: GeneratorModeWorkspaceProps = {}) {
+  const [loadedTargets, setLoadedTargets] = useState<TargetPreset[]>([]);
+  const [loadedNonce, setLoadedNonce] = useState('');
+  const [loadedDatasets, setLoadedDatasets] = useState<DatasetSummary[]>([]);
+  const [bootstrapError, setBootstrapError] = useState('');
+
+  const targets = propTargets ?? loadedTargets;
+  const nonce = propNonce ?? loadedNonce;
+  const secret = propSecret ?? getEphemeralOperatorSecret();
+  const existingDatasets = propExistingDatasets ?? loadedDatasets;
+
   const [mode, setMode] = useState<GeneratorOperatingMode>(initialMode);
   const [config, setConfig] = useState<GeneratorConfigState>(() =>
     createDefaultGeneratorConfig(initialTargetId || targets[0]?.id || ''),
   );
   const [providerStatus, setProviderStatus] = useState<GeneratorProviderStatus | null>(null);
+  const [judgeStatus, setJudgeStatus] = useState<GeneratorJudgeStatus | null>(null);
+  const [generateAndRunAvailable, setGenerateAndRunAvailable] = useState(false);
   const [providerStatusError, setProviderStatusError] = useState('');
   const [readiness, setReadiness] = useState<TargetReadinessReport | null>(null);
   const [readinessLoading, setReadinessLoading] = useState(false);
@@ -104,12 +122,66 @@ export default function GeneratorModeWorkspace({
   const readinessAbortRef = useRef<AbortController | null>(null);
   const readinessKey = useMemo(() => buildReadinessFingerprint(config), [config]);
 
+  // Self-bootstrap workflow API context when mounted inside App.tsx without injected props.
+  useEffect(() => {
+    if (propTargets !== undefined && propNonce !== undefined) return;
+    const controller = new AbortController();
+    setBootstrapError('');
+    Promise.all([
+      testingApi.health(controller.signal),
+      testingApi.targets(controller.signal),
+    ])
+      .then(([healthRes, targetsRes]) => {
+        if (controller.signal.aborted) return;
+        setLoadedNonce(healthRes.nonce);
+        setLoadedTargets(targetsRes.targets);
+        if (propExistingDatasets === undefined) {
+          testingApi
+            .listDatasets(secret, healthRes.nonce)
+            .then((ds) => {
+              if (!controller.signal.aborted) setLoadedDatasets(ds);
+            })
+            .catch(() => {
+              // Dataset list may require operator auth in non-local mode.
+            });
+        }
+      })
+      .catch((err) => {
+        if (controller.signal.aborted) return;
+        setBootstrapError(
+          err instanceof Error ? err.message : 'Unable to connect to Workflow API.',
+        );
+      });
+    return () => controller.abort();
+  }, [propTargets, propNonce, propExistingDatasets, secret]);
+
+  const handleConfigChange = useCallback(
+    (next: GeneratorConfigState) => {
+      setConfig(next);
+      if (next.targetId && next.targetId !== config.targetId) {
+        onSelectTarget?.(next.targetId);
+      }
+    },
+    [config.targetId, onSelectTarget],
+  );
+
+  const refreshDatasetsIfManaged = useCallback(() => {
+    if (propExistingDatasets !== undefined || !nonce) return;
+    testingApi
+      .listDatasets(secret, nonce)
+      .then((ds) => setLoadedDatasets(ds))
+      .catch(() => {});
+  }, [propExistingDatasets, nonce, secret]);
+
   // Keep targetId aligned when targets list populates asynchronously.
   useEffect(() => {
     if (!config.targetId && targets.length > 0) {
-      setConfig((prev) => ({ ...prev, targetId: targets[0].id }));
+      const nextId = initialTargetId && targets.some((t) => t.id === initialTargetId)
+        ? initialTargetId
+        : targets[0].id;
+      setConfig((prev) => ({ ...prev, targetId: nextId }));
     }
-  }, [config.targetId, targets]);
+  }, [config.targetId, targets, initialTargetId]);
 
   // R02: Immediately invalidate stale readiness and abort in-flight requests whenever
   // target, selected ASIs, requested scopes, or reviewed policy bindings change.
@@ -135,10 +207,14 @@ export default function GeneratorModeWorkspace({
       .then((res) => {
         if (!controller.signal.aborted) {
           setProviderStatus(res.provider);
+          setJudgeStatus(res.judge ?? null);
+          setGenerateAndRunAvailable(res.generate_and_run_available === true);
         }
       })
       .catch((err) => {
         if (controller.signal.aborted) return;
+        setGenerateAndRunAvailable(false);
+        setJudgeStatus(null);
         setProviderStatusError(
           err instanceof GeneratorApiError
             ? `${err.code}: ${err.message}`
@@ -207,6 +283,21 @@ export default function GeneratorModeWorkspace({
         </p>
       </header>
 
+      {bootstrapError && (
+        <div
+          role="alert"
+          style={{
+            marginBottom: 14,
+            padding: 10,
+            borderRadius: 8,
+            border: '1px solid var(--fail)',
+            color: 'var(--fail)',
+          }}
+        >
+          {bootstrapError}
+        </div>
+      )}
+
       {/* Three Operating Modes Selector */}
       <div
         role="tablist"
@@ -253,13 +344,17 @@ export default function GeneratorModeWorkspace({
         })}
       </div>
 
-      {/* Mode 1 — Generate & Run (Primary Workflow — Prepared for G11.6) */}
+      {/* Mode 1 — Generate & Run (Primary Workflow — Active in G11.6) */}
       {mode === 'generate_and_run' && (
         <GenerateAndRunPrepPanel
           targets={targets}
           config={config}
-          onChangeConfig={setConfig}
+          onChangeConfig={handleConfigChange}
+          nonce={nonce}
+          secret={secret}
+          generateAndRunAvailable={generateAndRunAvailable}
           providerStatus={providerStatus}
+          judgeStatus={judgeStatus}
           providerStatusError={providerStatusError}
           readiness={readiness}
           readinessLoading={readinessLoading}
@@ -267,6 +362,9 @@ export default function GeneratorModeWorkspace({
           onCheckReadiness={handleCheckReadiness}
           onSwitchToGenerateOnly={() => setMode('generate_only')}
           onSwitchToRunExisting={() => setMode('run_existing_dataset')}
+          onOpenDatasetLibrary={onOpenDatasetLibrary}
+          onOpenRunReport={onOpenRunReport}
+          onDatasetPersisted={refreshDatasetsIfManaged}
         />
       )}
 
@@ -275,7 +373,7 @@ export default function GeneratorModeWorkspace({
         <GeneratorOnlyPanel
           targets={targets}
           config={config}
-          onChangeConfig={setConfig}
+          onChangeConfig={handleConfigChange}
           nonce={nonce}
           secret={secret}
           providerStatus={providerStatus}
@@ -284,7 +382,10 @@ export default function GeneratorModeWorkspace({
           readinessLoading={readinessLoading}
           readinessError={readinessError}
           onCheckReadiness={handleCheckReadiness}
-          onDatasetSaved={onDatasetSaved}
+          onDatasetSaved={(rec) => {
+            refreshDatasetsIfManaged();
+            onDatasetSaved?.(rec);
+          }}
           onOpenDatasetLibrary={(datasetId) => onOpenDatasetLibrary?.(datasetId)}
         />
       )}
