@@ -340,7 +340,7 @@ def main(argv=None) -> int:
                      lambda response: (lambda h: h.get("status") == "ok"
                          and h.get("operator_mode") == "local_single_user"
                          and h.get("mode") == "controlled_execution_enabled"
-                         and h.get("asi01_batch_enabled") is (args.enable_asi01_batch or unified)
+                         and h.get("asi01_batch_enabled") is args.enable_asi01_batch
                          and h.get("web_lab_batch_enabled") is args.enable_web_lab_batch
                          and h.get("toolbot_lab_batch_enabled") is args.enable_toolbot_lab_batch
                          and h.get("custom_imported_batch_enabled") is (args.enable_custom_imported_batch or unified)

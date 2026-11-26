@@ -48,6 +48,34 @@ from workflow.routes_targets import (DiscoveryProbeRequest, LocalProbeRequest,
     register_target_routes)
 
 
+class _LazyTestcaseCatalog:
+    """Defer legacy native testcase YAML scanning until a legacy planning endpoint is called."""
+
+    def __init__(self, root: Path = ROOT) -> None:
+        self._root = root
+        self._loaded: TestcaseCatalog | None = None
+
+    def _ensure(self) -> TestcaseCatalog:
+        if self._loaded is None:
+            self._loaded = TestcaseCatalog(self._root)
+        return self._loaded
+
+    @property
+    def items(self):
+        return self._ensure().items
+
+    @property
+    def paths(self):
+        return self._ensure().paths
+
+    @property
+    def invalid_records(self):
+        return self._ensure().invalid_records
+
+    def preview(self, selection, catalog, *, plan: bool = False):
+        return self._ensure().preview(selection, catalog, plan=plan)
+
+
 @dataclass(frozen=True)
 class WorkflowApiContext:
     """Application-scoped dependencies shared across Workflow API route groups."""
@@ -122,7 +150,7 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
     app.config.update(MAX_CONTENT_LENGTH=5 * 1024 * 1024, DEBUG=False, PROPAGATE_EXCEPTIONS=False)
     nonce = secrets.token_urlsafe(32)
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
-    inventory = testcase_catalog if testcase_catalog is not None else TestcaseCatalog()
+    inventory = testcase_catalog if testcase_catalog is not None else _LazyTestcaseCatalog()
     if imported_service is not None:
         # Discovery and connection checks in this offline session also stay in-process.
         discovery_transport = imported_service.dispatcher.transport or imported_service.mock_live_transport
@@ -455,7 +483,7 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
         generic_run_service = GenericRunService(
             catalog=catalog,
             dataset_repo=dataset_repo,
-            inventory=inventory,
+            inventory=None,
             policy_store=ResponsePolicyStore(default_policy_dir),
             runs_root=default_runs_dir,
             controlled_runs_root=controlled_root,
@@ -659,8 +687,9 @@ def main(argv=None):
                     or not isinstance(catalog, ManagedTargetCatalog)):
                 raise ValueError('Unified runtime requires local managed controlled-run startup.')
             dataset_repo = DatasetRepository(catalog.data_dir)
+            # G12 Phase 1: unified production runtime registers dataset/imported workflows
+            # without eagerly loading legacy native ASI01 YAML testcases or payloads.
             batch_services = {
-                'asi01': Asi01BatchWorkflow(dispatcher),
                 'imported': GenericImportedBatchWorkflow(dispatcher, dataset_repo,
                     execution_mode='both')}
         if args.enable_custom_imported_batch:

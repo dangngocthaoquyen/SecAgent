@@ -1,6 +1,5 @@
 import { useCallback,useEffect,useRef,useState } from 'react';
-import { testingApi,draftFor,type TargetPreset,type ValidationResult,type EvaluationMode,type Asi01TextTarget } from './testingApi';
-import PlanWizard from './PlanWizard';
+import { testingApi,draftFor,type TargetPreset,type ValidationResult } from './testingApi';
 import TargetManager,{targetKey,type ConnectionState} from './TargetManager';
 import AgentOnboardingPanel from './AgentOnboardingPanel';
 import { Facts,value } from './EvidenceViews';
@@ -8,26 +7,18 @@ const LEGACY_PLATFORM = '__legacy_platform__';
 function platformOf(target:TargetPreset){return target.platform_id??LEGACY_PLATFORM;}
 export default function TargetConfiguration({initialTargetId='',onSelectDataset}:{initialTargetId?:string;onSelectDataset?:(id:string)=>void}={}){
  const [catalog,setCatalog]=useState<TargetPreset[]|null>(null),[protocols,setProtocols]=useState<{id:string;state:string}[]>([]),[credentialAliases,setCredentialAliases]=useState<string[]>([]),[credentialAliasAvailability,setCredentialAliasAvailability]=useState<Record<string,string>>({}),[nonce,setNonce]=useState(''),[platform,setPlatform]=useState(''),[selected,setSelected]=useState(''),[model,setModel]=useState(''),[timeout,setTimeout]=useState(30),[error,setError]=useState(''),[result,setResult]=useState<ValidationResult|null>(null),[busy,setBusy]=useState(false),[revision,setRevision]=useState(0);
- const [planning,setPlanning]=useState(false);
  const [discoveryFlowActive,setDiscoveryFlowActive]=useState(!initialTargetId);
- const [customImported,setCustomImported]=useState(false);
  const [connection,setConnection]=useState<{key:string;state:ConnectionState}|null>(null);
  const updateConnection=useCallback((key:string,state:ConnectionState)=>setConnection({key,state}),[]);
  const [evidenceEnabled,setEvidenceEnabled]=useState(false);
  const [managementEnabled,setManagementEnabled]=useState(false);
  const [localSingleUser,setLocalSingleUser]=useState(false);
- const [controlledRunsEnabled,setControlledRunsEnabled]=useState(false);
- const [offlineBatchEnabled,setOfflineBatchEnabled]=useState(false);
- const [asi01BatchEnabled,setAsi01BatchEnabled]=useState(false);
- const [asi01TextTargets,setAsi01TextTargets]=useState<Asi01TextTarget[]>([]);
- const [webLabBatchEnabled,setWebLabBatchEnabled]=useState(false);
  const [toolbotLabBatchEnabled,setToolbotLabBatchEnabled]=useState(false);
- const [evaluationModes,setEvaluationModes]=useState<EvaluationMode[]>(['rule_only']);
  const pending=useRef<AbortController|null>(null),desiredTarget=useRef(initialTargetId);const target=catalog?.find(t=>t.id===selected);
  const platforms=Array.from(new Map(catalog?.map(t=>[platformOf(t),t.platform_name??'Configured targets'])??[]).entries());
  const available=catalog?.filter(t=>platformOf(t)===platform)??[];
- function invalidate(){setPlanning(false);pending.current?.abort();setBusy(false);setResult(null);setError('');}
- useEffect(()=>{const c=new AbortController();setEvaluationModes(['rule_only']);setError('');setResult(null);Promise.all([testingApi.health(c.signal),testingApi.targets(c.signal)]).then(([h,r])=>{if(c.signal.aborted)return;const first=r.targets.find(t=>t.id===desiredTarget.current)??r.targets[0];desiredTarget.current='';setNonce(h.nonce);setEvidenceEnabled(h.evidenceSourcesEnabled===true);setEvaluationModes(h.evaluationModes);setManagementEnabled(h.managementEnabled);if(!h.managementEnabled)setDiscoveryFlowActive(false);setCustomImported(h.customImportedBatchEnabled);setLocalSingleUser(h.localSingleUser);setControlledRunsEnabled(h.controlledRunsEnabled);setOfflineBatchEnabled(h.offlineBatchEnabled);setAsi01BatchEnabled(h.asi01BatchEnabled);setAsi01TextTargets(h.asi01TextTargets);setWebLabBatchEnabled(h.webLabBatchEnabled);setToolbotLabBatchEnabled(h.toolbotLabBatchEnabled);setCatalog(r.targets);setProtocols(r.protocols);setCredentialAliases(r.credential_aliases??[]);setCredentialAliasAvailability(r.credential_alias_availability??{});setPlatform(first?platformOf(first):'');setSelected(first?.id??'');setModel(first?.default_model??'');setTimeout(first?.timeout_default??30);}).catch(e=>{if(!c.signal.aborted)setError(e.message);});return()=>{c.abort();pending.current?.abort();};},[revision]);
+ function invalidate(){pending.current?.abort();setBusy(false);setResult(null);setError('');}
+ useEffect(()=>{const c=new AbortController();setError('');setResult(null);Promise.all([testingApi.health(c.signal),testingApi.targets(c.signal)]).then(([h,r])=>{if(c.signal.aborted)return;const first=r.targets.find(t=>t.id===desiredTarget.current)??r.targets[0];desiredTarget.current='';setNonce(h.nonce);setEvidenceEnabled(h.evidenceSourcesEnabled===true);setManagementEnabled(h.managementEnabled);if(!h.managementEnabled)setDiscoveryFlowActive(false);setLocalSingleUser(h.localSingleUser);setToolbotLabBatchEnabled(h.toolbotLabBatchEnabled);setCatalog(r.targets);setProtocols(r.protocols);setCredentialAliases(r.credential_aliases??[]);setCredentialAliasAvailability(r.credential_alias_availability??{});setPlatform(first?platformOf(first):'');setSelected(first?.id??'');setModel(first?.default_model??'');setTimeout(first?.timeout_default??30);}).catch(e=>{if(!c.signal.aborted)setError(e.message);});return()=>{c.abort();pending.current?.abort();};},[revision]);
  function selectPlatform(id:string){invalidate();const first=catalog?.find(t=>platformOf(t)===id);desiredTarget.current=first?.id??'';setPlatform(id);setSelected(first?.id??'');setModel(first?.default_model??'');setTimeout(first?.timeout_default??30);}
  function select(id:string){desiredTarget.current=id;invalidate();const t=catalog?.find(t=>t.id===id);setSelected(id);setModel(t?.default_model??'');setTimeout(t?.timeout_default??30);}
  async function validate(){if(!target||!nonce)return;invalidate();const c=new AbortController();pending.current=c;setBusy(true);try{const r=await testingApi.validate(draftFor(target,model,timeout),nonce,c.signal);if(!c.signal.aborted){if(r.target_id!==target.id||r.profile_revision!==target.profile_revision)throw Error('Workflow API returned a different profile. Reload the catalog.');setResult(r);}}catch(e){if(!c.signal.aborted)setError((e as Error).message);}finally{if(!c.signal.aborted)setBusy(false);}}
@@ -39,7 +30,8 @@ export default function TargetConfiguration({initialTargetId='',onSelectDataset}
  const connectionState=settingsMatch&&connection?.key===targetKey(target)?connection.state:'Not checked';
  const ready=result?.configuration_status==='valid'&&connectionState==='Connected';
  const responseScope=target?.protocol==='openai-chat'||target?.protocol==='http-json';
- return <><div className="detail-page target-configuration" hidden={planning}>
+ const configValid=result?.configuration_status==='valid';
+ return <div className="detail-page target-configuration">
   <div className="page-title"><div><span className="eyebrow">TARGET SETUP</span><h1>Connect AI Agent</h1><p>Discover a local agent, confirm its connection, then authorize the saved profile for testing.</p></div><button className="text-button" onClick={()=>{invalidate();desiredTarget.current=selected;setRevision(n=>n+1);}}>Reload targets</button></div>
   {error&&<div className="notice error" role="alert"><strong>Configuration unavailable</strong><p>{error}</p></div>}
   {!catalog&&!error&&<p role="status">Loading target catalog...</p>}
@@ -79,8 +71,11 @@ export default function TargetConfiguration({initialTargetId='',onSelectDataset}
      <p className="caption">{ready?'Dataset, scope and execution authorization are checked before each run.':'You can prepare a dataset now. Live execution remains separately gated.'}</p>
      <div className="target-readiness-facts"><span>{feedback}</span><span>Evidence: {responseScope?'Response only':'Run-specific provenance required'}</span><span>{responseScope?'Action verification not ready':'Autonomous action verification not ready'}</span></div>
     </div>
-    <div className="target-next">{customImported&&<a className="target-primary-link" href="#datasets" onClick={()=>onSelectDataset?.(target.id)}>Select Dataset</a>}{(!customImported||asi01BatchEnabled)&&<button className={customImported?'':'primary'} disabled={result?.configuration_status!=='valid'} onClick={()=>setPlanning(true)}>{customImported?'Native ASI01 cases':'Continue'}</button>}</div>
+    <div className="target-next">
+     <a className="target-primary-link" href="#datasets" onClick={()=>onSelectDataset?.(target.id)}>Select Dataset</a>
+     <button className="primary" disabled={!configValid} onClick={()=>{onSelectDataset?.(target.id);location.hash='scan';}}>New Scan</button>
+    </div>
    </section>
   </>}
- </div>{target&&result?.configuration_status==='valid'&&<div hidden={!planning}><PlanWizard key={JSON.stringify(draftFor(target,model,timeout))} target={draftFor(target,model,timeout)} nonce={nonce} evaluationModes={evaluationModes} controlledRunsEnabled={controlledRunsEnabled} localSingleUser={localSingleUser} offlineBatchEnabled={offlineBatchEnabled} asi01BatchEnabled={asi01BatchEnabled} asi01TextTargets={asi01TextTargets} webLabBatchEnabled={webLabBatchEnabled} toolbotLabBatchEnabled={toolbotLabBatchEnabled} onBack={()=>setPlanning(false)}/></div>}</>;
+ </div>;
 }

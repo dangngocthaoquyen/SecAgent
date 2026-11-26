@@ -43,10 +43,8 @@ from testing.offline_stored_import import (
     BlindEvaluationRecord,
     build_offline_stored_datasets,
 )
-from testing.report_builder import build_summary, build_test_input
+from testing.report_builder import build_summary
 from testing.runner import Runner
-from testing.testcase_binding import bind_testcase_variables
-from testing.testcase_loader import TestCaseLoader
 from workflow.response_policies import (
     DEFAULT_EVALUATION_SCOPES,
     POLICY_REVISION_KEYS,
@@ -72,6 +70,46 @@ _SEMANTIC_LABELS_BY_CATEGORY: dict[str, list[str]] = {
         "UNCLEAR",
     ],
 }
+
+
+_RULE_PLACEHOLDER_PATTERN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+
+
+def _render_rule_parameter_value(value: Any, variables: dict[str, Any]) -> Any:
+    """Bind {{var}} placeholders in reviewed rule parameters in-memory without native payload assets."""
+    if isinstance(value, str):
+        def _replace(match: re.Match[str]) -> str:
+            var_name = match.group(1).strip()
+            if var_name not in variables:
+                raise ValueError(
+                    f"Missing template variable in evaluation rule parameters: {var_name!r}."
+                )
+            return str(variables[var_name])
+
+        rendered = _RULE_PLACEHOLDER_PATTERN.sub(_replace, value)
+        if "{{" in rendered or "}}" in rendered:
+            raise ValueError("Unbound template placeholder remains in evaluation rule parameters.")
+        return rendered
+    if isinstance(value, list):
+        return [_render_rule_parameter_value(item, variables) for item in value]
+    if isinstance(value, dict):
+        return {k: _render_rule_parameter_value(v, variables) for k, v in value.items()}
+    return value
+
+
+def _bind_reviewed_rule_parameters(testcase: TestCase) -> TestCase:
+    """Resolve {{var}} placeholders in reviewed evaluation rules against in-memory testcase.variables."""
+    if not testcase.evaluation.rules:
+        return testcase
+    bound_rules = [
+        rule.model_copy(
+            update={"parameters": _render_rule_parameter_value(rule.parameters, testcase.variables)}
+        )
+        for rule in testcase.evaluation.rules
+    ]
+    return testcase.model_copy(
+        update={"evaluation": testcase.evaluation.model_copy(update={"rules": bound_rules})}
+    )
 
 
 def build_blind_record_testcase(
@@ -764,19 +802,19 @@ def prepare_generic_case_pair(
             variables=variables,
             evaluation=eval_cfg,
         )
-        bound_tc, ti = build_live_case_and_input(
+        base_tc = _bind_reviewed_rule_parameters(base_tc)
+        ti = build_dataset_live_input(
             base_tc,
             target,
-            prompt_override=prompt,
+            prompt=prompt,
             environment=environment,
-            repository_root=repository_root,
         )
         params = {**ti.parameters, "request_id": response_id or case_id}
         if isinstance(required_capability, str) and required_capability.strip():
             params["required_capability"] = required_capability.strip()
         meta = {**ti.metadata, "evaluation_rule_provenance": rule_prov_meta}
         ti = ti.model_copy(update={"parameters": params, "metadata": meta})
-        return bound_tc, ti
+        return base_tc, ti
 
     if not isinstance(stored_response, str):
         raise ValueError("generic_stored_response_required_for_offline")
@@ -838,6 +876,44 @@ def prepare_generic_case_pair(
     return tc, ti
 
 
+def build_dataset_live_input(
+    testcase: TestCase,
+    target: TargetProfile,
+    *,
+    prompt: str,
+    environment: dict[str, Any] | None = None,
+) -> TestInput:
+    """Build a live TestInput directly from a dataset prompt without native YAML/payload assets."""
+    parameters: dict[str, Any] = {}
+    if target.interface.adapter == "generic_mcp_jsonrpc":
+        tool_name = testcase.variables.get("tool_name")
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            raise ValueError("MCP testcase requires a tool_name variable.")
+        parameters = {
+            "tool_call": {
+                "name": tool_name,
+                "arguments": {"command": prompt},
+            }
+        }
+    test_input = TestInput(
+        id=f"live-{uuid4().hex[:12]}",
+        prompt=prompt,
+        parameters=parameters,
+        environment=dict(environment or {}),
+    )
+    if target.interface.adapter == "generic_mcp_jsonrpc":
+        tool_call = test_input.parameters.get("tool_call")
+        if not isinstance(tool_call, dict) or not tool_call.get("name"):
+            raise ValueError("Direct MCP target requires structured TestInput.parameters['tool_call'].")
+    serialized_input = json.dumps(
+        {"prompt": test_input.prompt, "parameters": test_input.parameters},
+        default=str,
+    )
+    if "{{" in serialized_input:
+        raise ValueError("Unbound template placeholder remains in live TestInput.")
+    return test_input
+
+
 def build_live_case_and_input(
     testcase: TestCase,
     target: TargetProfile,
@@ -850,6 +926,9 @@ def build_live_case_and_input(
     repository_root: Path = ROOT,
 ) -> tuple[TestCase, TestInput]:
     """Bind payloads, parameters, environment prerequisites, and optional reviewed policy for live CLI."""
+    from testing.report_builder import build_test_input
+    from testing.testcase_binding import bind_testcase_variables
+
     bound_tc = bind_testcase_variables(testcase, None)
     if prompt_override is not None:
         parameters: dict[str, Any] = {}
@@ -1257,6 +1336,8 @@ def main(argv: list[str] | None = None) -> int:
                 allowed_collector_endpoints=collector_endpoints,
             )
         else:
+            from testing.testcase_loader import TestCaseLoader
+
             tc = TestCaseLoader().load(args.testcase)
             bound_tc, ti = build_live_case_and_input(
                 tc,

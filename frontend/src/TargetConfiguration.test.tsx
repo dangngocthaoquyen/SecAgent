@@ -33,7 +33,9 @@ it('shows a session-compatible probe separately from review and configuration va
  await screen.findByRole('heading',{name:'Reviewed lab'});
  expect(screen.getByText('Connected')).toBeInTheDocument();
  await screen.findByText('Configuration valid');
- expect(screen.getByRole('button',{name:'Continue'})).toBeEnabled();
+ expect(screen.getByRole('button',{name:'New Scan'})).toBeEnabled();
+ expect(screen.getByRole('link',{name:'Select Dataset'})).toHaveAttribute('href','#datasets');
+ expect(screen.queryByRole('button',{name:'Native ASI01 cases'})).not.toBeInTheDocument();
 });
 it('switches platform and uses that agent’s own model and timeout without carrying validation',async()=>{
  const other={...catalog.targets[0],id:'lab-three',name:'Other platform agent',
@@ -49,7 +51,7 @@ it('switches platform and uses that agent’s own model and timeout without carr
  expect(screen.getByLabelText('Model')).toHaveValue('other-model');
  expect(screen.getByLabelText('Timeout (seconds)')).toHaveValue(12);
  expect(screen.queryByText('Configuration valid')).not.toBeInTheDocument();
- expect(screen.getByRole('button',{name:'Continue'})).toBeDisabled();
+ expect(screen.getByRole('button',{name:'New Scan'})).toBeDisabled();
 });
 it('keeps a one-profile legacy catalog usable without platform metadata',async()=>{
  const legacy={...catalog.targets[0]};delete legacy.platform_id;delete legacy.platform_name;
@@ -88,7 +90,7 @@ it('invalidates a validated configuration immediately when changing target',asyn
  mock();render(<TargetConfiguration/>);await screen.findByText('Configuration valid');
  fireEvent.change(screen.getByLabelText('Target'),{target:{value:'lab-two'}});
  expect(screen.queryByText('Configuration valid')).not.toBeInTheDocument();
- expect(screen.getByRole('button',{name:'Continue'})).toBeDisabled();
+ expect(screen.getByRole('button',{name:'New Scan'})).toBeDisabled();
 });
 it.each(['http://user:secret@127.0.0.1/path','http://127.0.0.1/path?token=secret','http://127.0.0.1/path#secret'])('rejects sensitive endpoint %s',endpoint=>expect(()=>parseTargets({...catalog,targets:[{...catalog.targets[0],endpoint}]})).toThrow());
 it('rejects unsupported selectable protocols and fabricated execution',()=>{expect(()=>parseTargets({...catalog,targets:[{...catalog.targets[0],protocol:'a2a'}]})).toThrow();expect(()=>parseValidation({...valid,target_execution_performed:true})).toThrow();});
@@ -98,7 +100,7 @@ it('keeps advanced metadata collapsed and refuses to invent a probe',async()=>{
  expect(details.open).toBe(false);
  expect(screen.queryByText(/Approved endpoint/)).not.toBeInTheDocument();
  await screen.findByText('Configuration valid');
- expect(screen.getByRole('button',{name:'Continue'})).toBeEnabled();
+ expect(screen.getByRole('button',{name:'New Scan'})).toBeEnabled();
  expect(screen.getByRole('button',{name:'Test Connection'})).toBeDisabled();
  expect(screen.getByText('A safe connection probe is not supported for this profile.')).toBeInTheDocument();
  expect(fetcher.mock.calls.every(([url])=>!String(url).includes('connection-checks'))).toBe(true);

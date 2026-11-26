@@ -230,7 +230,7 @@ class GenericRunService:
         *,
         catalog: Any,
         dataset_repo: Any,
-        inventory: Any,
+        inventory: Any = None,
         policy_store: ResponsePolicyStore,
         runs_root: Path,
         controlled_runs_root: Path | None = None,
