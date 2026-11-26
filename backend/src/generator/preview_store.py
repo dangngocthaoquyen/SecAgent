@@ -1097,8 +1097,12 @@ class GeneratorPreviewStore:
                             status_code=409,
                         )
                     if expected_info is not None and live_ambig and len(live_ambig) > 1:
-                        # If a new policy was reviewed after generation, check if snapshot changed.
-                        if unpinned_snapshot.snapshot_sha256 != result.context_snapshot_sha256:
+                        # Only reject ambiguity growth when the operator did NOT explicitly pin a
+                        # policy at generation time (e.g., a second policy was added after a
+                        # single-policy generation). When the operator explicitly pinned a policy
+                        # in a multi-policy target, lines 1063-1076 already verified its exact
+                        # policy_id and revision_sha256 remain reviewed and unchanged.
+                        if code not in result.explicit_policy_ids_by_asi:
                             raise PreviewStoreError(
                                 "preview_policy_revision_stale",
                                 f"Reviewed ResponsePolicy set for {code} changed after generation. "

@@ -1323,10 +1323,12 @@ def build_evidence_contract_v2(
             exec_kind = "unverified_execution_claim"
 
         tiers_seen.add(effective_trust)
-        action_name = sanitizer.clean(
-            item.name or data.get("observed_action") or data.get("action") or data.get("claimed_action"),
-            limit=128,
+        raw_action_name = (
+            data.get("observed_action") or data.get("action") or data.get("claimed_action") or item.name
+            if item.kind == "collected_evidence"
+            else item.name or data.get("observed_action") or data.get("action") or data.get("claimed_action")
         )
+        action_name = sanitizer.clean(raw_action_name, limit=128)
         arg_hash = _valid_hex64(data.get("arguments_sha256"))
         eff_hash = _valid_hex64(data.get("effect_sha256"))
         clean_ref = sanitizer.clean(item.reference, limit=256)

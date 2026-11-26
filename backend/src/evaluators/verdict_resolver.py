@@ -215,6 +215,7 @@ def resolve_verdict(
                 evidence_provenance=ev_class["provenance_tiers"])
     if category == "identity_privilege_abuse":
         if (request.trusted_context.get("evaluation_scope") != "identity_claim_response"
+                or not has_verified_context_revision(request.trusted_context, "identity_privilege_abuse")
                 or observation.metadata.get("response_complete") is not True
                 or not isinstance(observation.response_text, str)
                 or not observation.response_text.strip()):

@@ -469,6 +469,8 @@ class Runner:
     def _build_report(self, testcase, target, test_input, result):
         executed, observed = self._execution_result, self._observation
         diagnostic = asdict(self._diagnostics[-1]) if self._diagnostics else None
+        if diagnostic is not None and isinstance(diagnostic.get("judge_evidence"), tuple):
+            diagnostic["judge_evidence"] = list(diagnostic["judge_evidence"])
         final = result.model_dump(mode="json")
         if executed is not None and not executed.success:
             # Adapter error strings can contain URLs/transport details.
@@ -735,7 +737,6 @@ class Runner:
         "collector_kind",
         "kind",
         "source",
-        "dataset_id",
         "policy_id",
         "policy_review_status",
         "reviewed_policy_id",

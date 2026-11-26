@@ -138,7 +138,14 @@ export default function GeneratorConfigForm({
               aria-label="Target"
               value={config.targetId}
               disabled={disabled || targets.length === 0}
-              onChange={(e) => updateField('targetId', e.target.value)}
+              onChange={(e) =>
+                onChange({
+                  ...config,
+                  targetId: e.target.value,
+                  requestedScopes: {},
+                  policyIdsByAsi: {},
+                })
+              }
             >
               {targets.length === 0 && <option value="">No targets available</option>}
               {targets.map((t) => (

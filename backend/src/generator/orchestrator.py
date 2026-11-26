@@ -508,6 +508,24 @@ def _make_initial_stages() -> dict[WorkflowStageName, dict[str, Any]]:
     }
 
 
+def _map_judge_fault_to_code(raw_fault: Any) -> str:
+    """Map GenericRunService / HybridEvaluator fault tokens onto allowlisted evaluation error codes."""
+    token = str(raw_fault or "").strip().lower()
+    if not token:
+        return "judge_evaluation_error"
+    if "timeout" in token:
+        return "judge_timeout"
+    if token in {"credential_missing", "judge_credential_missing"}:
+        return "judge_credential_missing"
+    if token in {"executable_missing", "judge_executable_missing"}:
+        return "judge_executable_missing"
+    if token in {"judge_configuration_missing", "configuration_missing"}:
+        return "judge_configuration_missing"
+    if token in {"judge_provider_unavailable", "provider_unavailable", "unavailable"}:
+        return "judge_provider_unavailable"
+    return token if token in _EVALUATION_ERROR_CODES else "judge_evaluation_error"
+
+
 def _detect_judge_evaluation_issue(
     *,
     evaluation_mode: EvaluationMode,
@@ -515,6 +533,10 @@ def _detect_judge_evaluation_issue(
 ) -> tuple[str | None, str | None]:
     """Inspect a completed/failed Generic Runner record for Judge/evaluation errors.
 
+    Inspects BOTH G12 `GenericRunService._build_judge_metadata()` fields
+    (`invocation_status`, `failure_count`, `error_categories`) and per-case
+    Judge fault fields (`provider_fault_code`, `json_validation_status`), as well
+    as legacy/synthetic `status`/`reason` fields.
     Uses the active run's effective `evaluation_mode` (R04) and sanitizes any
     external reason through the strict allowlist (R03).
     """
@@ -523,34 +545,66 @@ def _detect_judge_evaluation_issue(
     judge_meta = run_record.get("judge_metadata")
     if isinstance(judge_meta, dict):
         j_status = str(judge_meta.get("status") or "").lower()
+        inv_status = str(judge_meta.get("invocation_status") or "").lower()
+        failure_count = int(judge_meta.get("failure_count") or 0)
+        raw_err_cats = judge_meta.get("error_categories")
+        err_cats = [str(c).strip() for c in raw_err_cats if isinstance(c, str) and c.strip()] if isinstance(raw_err_cats, list) else []
         raw_reason = judge_meta.get("reason") or judge_meta.get("error_code")
-        if j_status in {"failed", "error", "unavailable"}:
+        if (
+            j_status in {"failed", "error", "unavailable"}
+            or inv_status in {"failed", "partial_failure", "unknown_unverified"}
+            or failure_count > 0
+            or bool(err_cats)
+        ):
+            mapped_raw = (
+                _map_judge_fault_to_code(err_cats[0])
+                if err_cats
+                else _map_judge_fault_to_code(raw_reason)
+            )
             safe_code, _, _, safe_msg = _sanitize_runner_error_code(
-                raw_reason,
+                mapped_raw,
                 default_code="judge_evaluation_error",
                 default_stage="evaluating",
             )
+            if failure_count > 0:
+                safe_msg = (
+                    f"{safe_msg} ({failure_count} testcase(s) failed semantic evaluation; "
+                    f"invocation_status={inv_status or 'failed'})."
+                )
             return safe_code, safe_msg
     cases = run_record.get("cases")
     if isinstance(cases, list):
         judge_error_cases = 0
+        first_fault: str | None = None
         for item in cases:
             if not isinstance(item, dict):
                 continue
             reason = str(item.get("reason") or item.get("evaluation_reason") or "").lower()
             j_err = item.get("judge_error") or item.get("evaluator_error")
             judge_status = str(item.get("judge_status") or "").lower()
+            provider_fault = item.get("provider_fault_code")
+            val_status = str(item.get("json_validation_status") or "").lower()
             verdict = str(item.get("verdict") or item.get("final_verdict") or "").upper()
             if (
                 j_err
+                or bool(provider_fault)
+                or val_status == "provider_fault"
                 or judge_status in {"error", "failed", "unavailable"}
                 or ("judge" in reason and ("error" in reason or "fail" in reason or "unavailable" in reason))
                 or (verdict == "ERROR" and "judge" in reason)
             ):
                 judge_error_cases += 1
+                if first_fault is None and provider_fault:
+                    first_fault = str(provider_fault)
         if judge_error_cases > 0:
+            mapped_code = _map_judge_fault_to_code(first_fault)
+            safe_code, _, _, _ = _sanitize_runner_error_code(
+                mapped_code,
+                default_code="judge_evaluation_error",
+                default_stage="evaluating",
+            )
             return (
-                "judge_evaluation_error",
+                safe_code,
                 f"Hybrid Judge reported an evaluation error on {judge_error_cases} testcase(s); inspect run report.",
             )
     return None, None
@@ -570,6 +624,18 @@ def _summarize_cases(run_record: dict[str, Any]) -> tuple[dict[str, Any], ...]:
             if isinstance(raw_reason, str) and len(raw_reason) <= 128 and _SAFE_ERROR_CODE_RE.fullmatch(raw_reason)
             else None
         )
+        raw_fault = item.get("provider_fault_code")
+        safe_fault = (
+            raw_fault.strip()
+            if isinstance(raw_fault, str) and _SAFE_ERROR_CODE_RE.fullmatch(raw_fault.strip())
+            else None
+        )
+        raw_val_status = item.get("json_validation_status")
+        safe_val_status = (
+            raw_val_status.strip()
+            if isinstance(raw_val_status, str) and _SAFE_ERROR_CODE_RE.fullmatch(raw_val_status.strip())
+            else None
+        )
         out.append(
             {
                 "case_id": item.get("case_id") or item.get("testcase_id"),
@@ -579,6 +645,9 @@ def _summarize_cases(run_record: dict[str, Any]) -> tuple[dict[str, Any], ...]:
                 "status": item.get("status"),
                 "evidence_level": item.get("evidence_level"),
                 "evaluation_mode": item.get("evaluation_mode"),
+                "semantic_invoked": bool(item["semantic_invoked"]) if "semantic_invoked" in item else None,
+                "provider_fault_code": safe_fault,
+                "json_validation_status": safe_val_status,
                 "reason": safe_reason,
             }
         )
@@ -590,10 +659,19 @@ def _sanitize_judge_metadata_for_snapshot(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
     allowed_keys = (
+        "mode",
         "enabled",
+        "judge_configured",
+        "credential_available",
+        "judge_ready",
         "status",
+        "invocation_status",
         "provider",
         "model",
+        "request_count",
+        "success_count",
+        "failure_count",
+        "error_categories",
         "invoked_cases",
         "evaluated_cases",
         "failed_cases",
@@ -611,6 +689,15 @@ def _sanitize_judge_metadata_for_snapshot(raw: Any) -> dict[str, Any] | None:
                 out[k] = val.strip()
             elif val is not None:
                 out[k] = "judge_evaluation_error"
+        elif k == "error_categories":
+            if isinstance(val, list):
+                cleaned_cats: list[str] = []
+                for entry in val[:16]:
+                    if isinstance(entry, str) and _SAFE_ERROR_CODE_RE.fullmatch(entry.strip()):
+                        cleaned_cats.append(entry.strip())
+                    elif entry is not None:
+                        cleaned_cats.append("judge_evaluation_error")
+                out[k] = cleaned_cats
         elif isinstance(val, (str, int, float, bool)) or val is None:
             out[k] = val[:128] if isinstance(val, str) else val
     return out
@@ -690,6 +777,7 @@ class _WorkflowEntry:
         self.cases_summary: tuple[dict[str, Any], ...] = ()
         self.runner_asi_category: str = "auto"
         self.runner_policy_id: str | None = None
+        self.runner_policy_ids_by_asi: dict[str, str] = {}
         self.rerun_history: list[RerunHistoryEntry] = []
         self.rerun_starting: bool = False
 
@@ -1041,7 +1129,7 @@ class GenerateAndRunOrchestrator:
         return None
 
     def _is_target_authorized(self, target_id: str, preset: Any) -> bool:
-        """Check whether a managed target has been explicitly reviewed/authorized."""
+        """Check whether a managed target has been explicitly reviewed/authorized (fail closed)."""
         if self._catalog is not None and hasattr(self._catalog, "public_targets"):
             try:
                 for entry in self._catalog.public_targets():
@@ -1051,10 +1139,13 @@ class GenerateAndRunOrchestrator:
                             return str(status) in _REVIEWED_AUTH_STATUSES
             except Exception:
                 return False
+        reviewed_flag = getattr(preset, "reviewed", None)
+        if isinstance(reviewed_flag, bool):
+            return reviewed_flag
         auth_status = getattr(preset, "authorization_status", None)
         if auth_status is not None:
             return str(auth_status) in _REVIEWED_AUTH_STATUSES
-        return True
+        return False
 
     def _evict_if_full_locked(self) -> None:
         if len(self._workflows) < self._max_workflows:
@@ -1120,14 +1211,18 @@ class GenerateAndRunOrchestrator:
         selected_asi: tuple[AsiCode, ...],
         policy_ids_by_asi: dict[str, str],
         result: GenerationResult | None = None,
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, str | None, dict[str, str]]:
+        resolved_map: dict[str, str] = {}
+        for code in selected_asi:
+            pol = policy_ids_by_asi.get(code)
+            if not pol and result is not None and code in result.asi_results:
+                pol = result.asi_results[code].reviewed_policy_id
+            if isinstance(pol, str) and pol.strip():
+                resolved_map[code] = pol.strip()
         if len(selected_asi) == 1:
             only_asi = selected_asi[0]
-            pol = policy_ids_by_asi.get(only_asi)
-            if not pol and result is not None and only_asi in result.asi_results:
-                pol = result.asi_results[only_asi].reviewed_policy_id
-            return only_asi, pol
-        return "auto", None
+            return only_asi, resolved_map.get(only_asi), resolved_map
+        return "auto", None, resolved_map
 
     def _evaluate_preflight_coverage(
         self,
@@ -1289,7 +1384,16 @@ class GenerateAndRunOrchestrator:
             target_id=req.target_id,
             catalog=self._catalog,
             application_contexts=self._application_contexts,
+            policy_store=self._policy_store,
+            policy_ids_by_asi=service_req.policy_ids_by_asi or None,
         )
+        if snapshot is None:
+            raise OrchestrationError(
+                "target_not_found",
+                "Selected target was not found in the active catalog.",
+                status_code=404,
+                stage="preflight",
+            )
         if (
             req.expected_target_revision is not None
             and snapshot.target_revision_sha256 is not None
@@ -1669,7 +1773,7 @@ class GenerateAndRunOrchestrator:
             )
 
         # ---------------- STAGE 4: PREFLIGHT ----------------
-        runner_asi, runner_policy = self._build_runner_asi_and_policy(
+        runner_asi, runner_policy, runner_policies_by_asi = self._build_runner_asi_and_policy(
             selected_asi=selected_asi,
             policy_ids_by_asi=service_req.policy_ids_by_asi,
             result=gen_result,
@@ -1677,6 +1781,7 @@ class GenerateAndRunOrchestrator:
         with self._lock:
             entry.runner_asi_category = runner_asi
             entry.runner_policy_id = runner_policy
+            entry.runner_policy_ids_by_asi = dict(runner_policies_by_asi)
 
         preview_payload: dict[str, Any] = {
             "mode": req.execution_mode,
@@ -1687,6 +1792,8 @@ class GenerateAndRunOrchestrator:
         }
         if runner_policy is not None:
             preview_payload["policy_id"] = runner_policy
+        if runner_policies_by_asi:
+            preview_payload["policy_ids_by_asi"] = dict(runner_policies_by_asi)
 
         try:
             preview_res = self._generic_run_service.preview_run(preview_payload)
@@ -1951,11 +2058,14 @@ class GenerateAndRunOrchestrator:
 
         entry = self._get_owned_workflow(workflow_id, owner_id)
         # Refresh live run status first so a completed async run is not falsely treated as active.
-        if entry.run_id:
-            latest_run = self._generic_run_service.get_run(entry.run_id)
+        with self._lock:
+            fetched_run_id = entry.run_id
+        if fetched_run_id:
+            latest_run = self._generic_run_service.get_run(fetched_run_id)
             if isinstance(latest_run, dict):
                 with self._lock:
-                    entry.sync_from_run_record(latest_run, self._now_iso())
+                    if entry.run_id == fetched_run_id and not entry.rerun_starting:
+                        entry.sync_from_run_record(latest_run, self._now_iso())
 
         # Issue A: Atomically verify no original execution or concurrent rerun is active and reserve rerun lock.
         with self._lock:
@@ -1989,8 +2099,25 @@ class GenerateAndRunOrchestrator:
             target_id = entry.req.target_id
             runner_asi = entry.runner_asi_category
             runner_policy = entry.runner_policy_id
+            runner_policies_by_asi = dict(entry.runner_policy_ids_by_asi)
 
         try:
+            preset = self._lookup_target(target_id)
+            if preset is None:
+                raise OrchestrationError(
+                    "target_not_found",
+                    "Selected target was not found in the active catalog.",
+                    status_code=404,
+                    stage="preflight",
+                )
+            if not self._is_target_authorized(target_id, preset):
+                raise OrchestrationError(
+                    "target_not_authorized",
+                    "Selected target has not been reviewed and authorized for live execution.",
+                    status_code=403,
+                    stage="preflight",
+                )
+
             ds = self._dataset_repo.get_dataset(dataset_id)
             if ds is None:
                 raise OrchestrationError(
@@ -2019,6 +2146,8 @@ class GenerateAndRunOrchestrator:
             }
             if runner_policy is not None:
                 preview_payload["policy_id"] = runner_policy
+            if runner_policies_by_asi:
+                preview_payload["policy_ids_by_asi"] = dict(runner_policies_by_asi)
 
             try:
                 preview_res = self._generic_run_service.preview_run(preview_payload)

@@ -766,6 +766,10 @@ class FileArtifactCollector:
             "integrity_reference": f"sha256:{digest}",
         }
         if parsed_obj is not None:
+            for corr_key in ("run_id", "case_id", "execution_id", "request_id", "session_id"):
+                raw_corr_val = parsed_obj.get(corr_key)
+                if isinstance(raw_corr_val, str) and raw_corr_val.strip():
+                    fa_data[corr_key] = raw_corr_val.strip()
             fa_sem, _, _ = _extract_execution_semantics(parsed_obj)
             if fa_sem is not None:
                 fa_data["execution_semantics"] = fa_sem
@@ -1155,6 +1159,10 @@ class HttpCallbackCollector:
             }
             if mapped_ev_id is not None:
                 cb_data["event_id"] = mapped_ev_id
+            for corr_key in ("run_id", "case_id", "execution_id", "request_id", "session_id"):
+                raw_corr_val = row.get(corr_key)
+                if isinstance(raw_corr_val, str) and raw_corr_val.strip():
+                    cb_data[corr_key] = raw_corr_val.strip()
             if row_target_corr is not None:
                 cb_data["target_correlation_id"] = row_target_corr
             if fp is not None:

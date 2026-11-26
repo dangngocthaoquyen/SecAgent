@@ -6,6 +6,7 @@ from collections import Counter
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from hashlib import sha256
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import secrets
 import shutil
 from threading import Event, RLock, Thread
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from flask import Response, jsonify, request
@@ -207,6 +209,87 @@ def _sanitize_for_api(
             for item in value
         ]
     return value
+
+
+_FORBIDDEN_CALLER_EVIDENCE_PROVENANCE = frozenset({
+    "independently_verified",
+    "independent_observer",
+    "local_collector",
+})
+
+
+def _contains_credential_placeholder(value: Any) -> bool:
+    """Detect any {{credential:...}} template reference anywhere in a caller-supplied payload."""
+    if isinstance(value, str):
+        return "{{credential:" in value.lower()
+    if isinstance(value, dict):
+        return any(
+            _contains_credential_placeholder(k) or _contains_credential_placeholder(v)
+            for k, v in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_credential_placeholder(item) for item in value)
+    return False
+
+
+def _validate_caller_evidence_sources(specs: Any, *, mode: str) -> None:
+    """Reject caller-supplied HTTP callbacks, env credential references, and forged independent provenance."""
+    if not isinstance(specs, list):
+        raise ValueError("generic_unapproved_evidence_source_forbidden")
+    for spec in specs:
+        if not isinstance(spec, dict):
+            raise ValueError("generic_unapproved_evidence_source_forbidden")
+        if _contains_credential_placeholder(spec):
+            raise ValueError("generic_inline_credential_ref_forbidden")
+        raw_prov = str(spec.get("provenance") or "").strip().lower()
+        if spec.get("independent_verifier") is True or raw_prov in _FORBIDDEN_CALLER_EVIDENCE_PROVENANCE:
+            raise ValueError("generic_forged_evidence_provenance_rejected")
+        kind = str(spec.get("kind") or "").strip().lower()
+        if mode == "live" and (kind == "http_callback" or bool(spec.get("url"))):
+            raise ValueError("generic_unapproved_evidence_source_forbidden")
+
+
+def _validate_inline_live_target_profile(profile: TargetProfile) -> TargetProfile:
+    """Restrict unmanaged inline live target_profile payloads to literal loopback URLs with zero env credentials."""
+    if profile.credential_refs or _contains_credential_placeholder(profile.interface.config):
+        raise ValueError("generic_inline_credential_ref_forbidden")
+    raw_url = profile.interface.config.get("url")
+    if not isinstance(raw_url, str) or not raw_url.strip():
+        raise ValueError("generic_unsafe_target_endpoint")
+    parsed = urlsplit(raw_url.strip())
+    if parsed.scheme not in {"http", "https"} or parsed.username is not None or parsed.password is not None:
+        raise ValueError("generic_unsafe_target_endpoint")
+    host = parsed.hostname or ""
+    try:
+        is_loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = False
+    if not is_loopback:
+        raise ValueError("generic_unsafe_target_endpoint")
+    safe_cfg = dict(profile.interface.config)
+    safe_cfg["trust_env"] = False
+    safe_iface = profile.interface.model_copy(update={"config": safe_cfg})
+    return profile.model_copy(update={"interface": safe_iface})
+
+
+def _normalize_policy_ids_by_category(raw: Any) -> dict[str, str]:
+    """Validate and normalize optional per-ASI/category policy_ids_by_asi mapping."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("generic_invalid_policy_binding")
+    out: dict[str, str] = {}
+    for raw_key, raw_val in raw.items():
+        if not isinstance(raw_key, str) or not isinstance(raw_val, str) or not raw_val.strip():
+            raise ValueError("generic_invalid_policy_binding")
+        try:
+            norm_cat = normalize_policy_category(raw_key.strip())
+        except ValueError as exc:
+            raise ValueError("generic_invalid_policy_binding") from exc
+        if norm_cat in out and out[norm_cat] != raw_val.strip():
+            raise ValueError("generic_invalid_policy_binding")
+        out[norm_cat] = raw_val.strip()
+    return out
 
 
 class _StaticDiagnosticCollector:
@@ -452,20 +535,28 @@ class GenericRunService:
         evidence_sources: list[dict[str, Any]] | None = None,
         for_execution: bool = False,
     ) -> TargetProfile:
-        resolved_evidence = (
-            evidence_sources
-            if evidence_sources is not None
-            else self._resolve_saved_evidence_sources(target_id, for_execution=for_execution, mode=mode)
-        )
         saved_preset = (
             self.catalog.get(target_id)
             if hasattr(self.catalog, "get")
             else getattr(self.catalog, "_targets", {}).get(target_id)
         )
+        if evidence_sources is not None:
+            if saved_preset is not None and mode == "live":
+                raise ValueError("generic_unapproved_evidence_source_forbidden")
+            _validate_caller_evidence_sources(evidence_sources, mode=mode)
+        resolved_evidence = (
+            evidence_sources
+            if evidence_sources is not None
+            else self._resolve_saved_evidence_sources(target_id, for_execution=for_execution, mode=mode)
+        )
         if target_profile_dict is not None:
             if saved_preset is not None and mode == "live":
                 raise ValueError("generic_managed_target_override_forbidden")
             profile = TargetProfile.model_validate(target_profile_dict)
+            if profile.evidence_sources:
+                _validate_caller_evidence_sources(profile.evidence_sources, mode=mode)
+            if mode == "live":
+                profile = _validate_inline_live_target_profile(profile)
             if capability_states:
                 profile = profile.model_copy(update={"capability_states": {**profile.capability_states, **capability_states}})
             if evidence_sources is not None:
@@ -782,19 +873,21 @@ class GenericRunService:
         raw_cases: list[dict[str, Any]],
         use_judge: bool,
         policy_id: str | None,
+        policy_ids_by_category: dict[str, str] | None = None,
     ) -> tuple[list[tuple[CoreTestCase, CoreTestInput]], dict[str, Any]]:
         if len(raw_cases) > _MAX_WEB_CASES:
             raise ValueError("generic_too_many_cases")
         fallback_norm_cat: str | None = None
         if asi_category and asi_category.strip().lower() not in {"", "auto", "unmapped"}:
             fallback_norm_cat = normalize_policy_category(asi_category)
+        per_cat_policies = policy_ids_by_category or {}
 
         context_cache: dict[str, tuple[dict[str, Any] | None, Any | None, str | None]] = {}
         if use_judge and fallback_norm_cat is not None:
             context_cache[fallback_norm_cat] = self._resolve_category_trusted_context(
                 target_id=target.id,
                 norm_category=fallback_norm_cat,
-                policy_id=policy_id,
+                policy_id=per_cat_policies.get(fallback_norm_cat, policy_id),
                 mode=mode,
             )
 
@@ -881,11 +974,12 @@ class GenericRunService:
                 elif row_cat is None:
                     row_blocker = "unmapped_asi_category"
                 elif use_judge:
+                    effective_policy_id = per_cat_policies.get(row_cat, policy_id)
                     if row_cat not in context_cache:
                         context_cache[row_cat] = self._resolve_category_trusted_context(
                             target_id=target.id,
                             norm_category=row_cat,
-                            policy_id=policy_id,
+                            policy_id=effective_policy_id,
                             mode=mode,
                         )
                     trusted_context, rev_pol, row_blocker = context_cache[row_cat]
@@ -916,10 +1010,11 @@ class GenericRunService:
                     if row_blocker is None and not self.pi_judge_ready():
                         row_blocker = "judge_provider_unavailable"
                 else:
+                    effective_policy_id = per_cat_policies.get(row_cat, policy_id)
                     rev_pol, rule_blocker = self._resolve_reviewed_policy_for_rule_only(
                         target_id=target.id,
                         norm_category=row_cat,
-                        policy_id=policy_id,
+                        policy_id=effective_policy_id,
                         mode=mode,
                     )
                     if rule_blocker is not None:
@@ -1199,6 +1294,7 @@ class GenericRunService:
             raise ValueError("generic_asi_category_required")
         use_judge = bool(payload.get("use_judge", False))
         policy_id = payload.get("policy_id")
+        policy_ids_by_cat = _normalize_policy_ids_by_category(payload.get("policy_ids_by_asi"))
         target = self._resolve_target(
             mode=mode,
             target_id=target_id,
@@ -1228,6 +1324,7 @@ class GenericRunService:
             raw_cases=raw_cases,
             use_judge=use_judge,
             policy_id=policy_id,
+            policy_ids_by_category=policy_ids_by_cat,
         )
         dataset_id = payload.get("dataset_id")
         dataset_name = None
@@ -1347,6 +1444,7 @@ class GenericRunService:
             "asi_category": asi_category,
             "use_judge": use_judge,
             "policy_id": payload.get("policy_id"),
+            "policy_ids_by_asi": payload.get("policy_ids_by_asi"),
             "dataset_id": payload.get("dataset_id"),
             "testcase_ids": list(payload.get("testcase_ids") or []),
             "cases": payload.get("cases"),
@@ -1560,6 +1658,7 @@ class GenericRunService:
         asi_category = str(payload.get("asi_category") or ("auto" if payload.get("dataset_id") else "")).strip()
         use_judge = bool(payload.get("use_judge", False))
         policy_id = payload.get("policy_id")
+        policy_ids_by_cat = _normalize_policy_ids_by_category(payload.get("policy_ids_by_asi"))
         async_execution = bool(payload.get("async_execution", False))
         submission_id_raw = payload.get("submission_id")
         submission_id: str | None = None
@@ -1726,6 +1825,7 @@ class GenericRunService:
                 raw_cases=raw_cases,
                 use_judge=use_judge,
                 policy_id=policy_id,
+                policy_ids_by_category=policy_ids_by_cat,
             )
             if preview_meta["blocker"]:
                 raise ValueError(preview_meta["blocker"])
@@ -1761,9 +1861,10 @@ class GenericRunService:
             allowed_endpoints: list[str] = []
             if target.interface.config.get("url"):
                 allowed_endpoints.append(str(target.interface.config["url"]))
-            for spec in target.evidence_sources:
-                if isinstance(spec, dict) and spec.get("url"):
-                    allowed_endpoints.append(str(spec["url"]))
+            if payload.get("evidence_sources") is None and payload.get("target_profile") is None:
+                for spec in target.evidence_sources:
+                    if isinstance(spec, dict) and spec.get("url"):
+                        allowed_endpoints.append(str(spec["url"]))
 
             extra_roots: list[Path] = list(self.allowed_collector_roots)
             requested_roots = payload.get("allowed_collector_roots")

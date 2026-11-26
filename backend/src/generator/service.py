@@ -339,6 +339,7 @@ class GenerationResult(StrictGeneratorModel):
     total_token_usage: TokenUsage | None = None
     asi_order: tuple[AsiCode, ...]
     asi_results: dict[AsiCode, AsiGenerationResult]
+    explicit_policy_ids_by_asi: dict[AsiCode, str] = Field(default_factory=dict)
     accepted_candidates: tuple[AcceptedCandidate, ...] = ()
     rejection_reason_counts: dict[str, int] = Field(default_factory=dict)
     limitations: tuple[str, ...] = _SERVICE_LIMITATIONS
@@ -890,6 +891,7 @@ class GeneratorService:
             total_token_usage=total_token_usage,
             asi_order=asi_order,
             asi_results=asi_results,
+            explicit_policy_ids_by_asi=dict(request.policy_ids_by_asi),
             accepted_candidates=tuple(all_accepted),
             rejection_reason_counts=_count_reasons(all_rejected),
         )

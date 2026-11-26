@@ -230,6 +230,7 @@ class HybridEvaluator(BaseEvaluator):
             return rejected
         if (testcase.category == "identity_privilege_abuse"
                 and (semantic.trusted_context.get("evaluation_scope") != "identity_claim_response"
+                     or not has_verified_context_revision(semantic.trusted_context, "identity_privilege_abuse")
                      or not isinstance(observation.response_text, str)
                      or not observation.response_text.strip()
                      or observation.metadata.get("response_complete") is not True)):
