@@ -24,6 +24,7 @@ class RunnerEvaluationConfig(BaseModel):
     pi: PiEvaluatorConfig | None = None
     require_complete_response_for_semantic: bool = Field(default=False, strict=True)
     prefer_deterministic_v2: bool = Field(default=False, strict=True)
+    max_technical_retries: int = Field(default=0, ge=0, le=3, strict=True)
 
     @model_validator(mode="after")
     def explicit_activation(self):
@@ -118,4 +119,5 @@ def configured_evaluator(config, provider, diagnostic_sink, *, bundle_loader=Non
         diagnostic_sink=diagnostic_sink,
         require_complete_response_for_semantic=config.require_complete_response_for_semantic,
         prefer_deterministic_v2=config.prefer_deterministic_v2,
+        max_technical_retries=config.max_technical_retries,
     ), budget

@@ -2,11 +2,14 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import TestcaseDetailDrawer from './TestcaseDetailDrawer';
 import {
   classifyJudgeFault,
+  computeEvaluationMetrics,
   copyTextToClipboard,
   deriveRunAsiSummary,
   formatCaseAsiCategory,
   formatDateTime,
   formatDurationBetween,
+  formatEvaluationReasonCode,
+  formatEvaluationStatus,
   formatEvidenceLevel,
   formatInvocationStatus,
   formatProviderModel,
@@ -77,6 +80,19 @@ export default function ScanResultsView({
     INCONCLUSIVE: Number(unified.verdictCounts.INCONCLUSIVE ?? 0),
     ERROR: Number(unified.verdictCounts.ERROR ?? 0),
   };
+  const evalMetrics = useMemo(
+    () =>
+      computeEvaluationMetrics({
+        summary: runRecord.unified_lineage?.evaluation_summary ?? runRecord.evaluation_summary ?? null,
+        verdictCounts: unified.verdictCounts,
+        cases,
+        totalCases: runRecord.total_cases,
+        schemaVersion: runRecord.unified_lineage?.verdict_schema_version ?? runRecord.verdict_schema_version ?? null,
+        policyVersion: runRecord.unified_lineage?.verdict_policy_version ?? runRecord.verdict_policy_version ?? null,
+      }),
+    [runRecord, unified.verdictCounts, cases],
+  );
+  const notEvaluatedReasonEntries = Object.entries(evalMetrics.notEvaluatedReasons);
   const status = unified.logicalStatus.toLowerCase();
   const isCompleted = status === 'completed';
   const isCompletedWithErrors = status === 'completed_with_errors';
@@ -90,7 +106,9 @@ export default function ScanResultsView({
 
   const barTotal = Math.max(
     1,
-    verdictCounts.PASS + verdictCounts.FAIL + verdictCounts.INCONCLUSIVE + verdictCounts.ERROR,
+    evalMetrics.isBinarySchema
+      ? evalMetrics.passCount + evalMetrics.failCount + evalMetrics.notEvaluatedCount
+      : verdictCounts.PASS + verdictCounts.FAIL + verdictCounts.INCONCLUSIVE + verdictCounts.ERROR,
   );
 
   const judgeMeta = unified.judgeMetadata;
@@ -127,7 +145,7 @@ export default function ScanResultsView({
       ) {
         return false;
       }
-      if (verdictFilter !== 'ALL' && normalizeVerdict(c.verdict) !== verdictFilter) {
+      if (verdictFilter !== 'ALL' && normalizeVerdict(c.verdict, c.evaluation_status) !== verdictFilter) {
         return false;
       }
       if (asiFilter !== 'ALL' && normAsi !== asiFilter) {
@@ -417,29 +435,64 @@ export default function ScanResultsView({
         </div>
       )}
 
-      {/* 4 Distinct Verdict KPI Cards */}
-      <div className="cards verdict-kpis" role="region" aria-label="Verdict summary metrics">
-        <article className="metric ok">
-          <div className="k">PASS</div>
-          <div className="v">{verdictCounts.PASS}</div>
-          <div className="s">{safePercent(verdictCounts.PASS, executedCount)}% of executed cases</div>
-        </article>
-        <article className="metric fail">
-          <div className="k">FAIL</div>
-          <div className="v">{verdictCounts.FAIL}</div>
-          <div className="s">{safePercent(verdictCounts.FAIL, executedCount)}% · Finding requires review</div>
-        </article>
-        <article className="metric warn">
-          <div className="k">INCONCLUSIVE</div>
-          <div className="v">{verdictCounts.INCONCLUSIVE}</div>
-          <div className="s">{safePercent(verdictCounts.INCONCLUSIVE, executedCount)}% · Insufficient evidence</div>
-        </article>
-        <article className="metric err">
-          <div className="k">ERROR</div>
-          <div className="v">{verdictCounts.ERROR}</div>
-          <div className="s">{safePercent(verdictCounts.ERROR, executedCount)}% · Operational / tool failure</div>
-        </article>
-      </div>
+      {/* Distinct Binary PASS/FAIL & Technical Failure KPI Cards */}
+      {evalMetrics.isBinarySchema && evalMetrics.legacyInconclusiveCount === 0 ? (
+        <div className="cards verdict-kpis" role="region" aria-label="Verdict summary metrics">
+          <article className="metric ok">
+            <div className="k">PASS</div>
+            <div className="v">{evalMetrics.passCount}</div>
+            <div className="s">{evalMetrics.passRatePercent.toFixed(1)}% PASS rate · No observed violation</div>
+          </article>
+          <article className="metric fail">
+            <div className="k">FAIL</div>
+            <div className="v">{evalMetrics.failCount}</div>
+            <div className="s">{evalMetrics.failRatePercent.toFixed(1)}% FAIL rate · Finding requires review</div>
+          </article>
+          <article className={`metric ${evalMetrics.technicalFailureCount > 0 ? 'err' : ''}`}>
+            <div className="k">TECHNICAL FAILURES</div>
+            <div className="v">{evalMetrics.technicalFailureCount}</div>
+            <div className="s">
+              {Object.entries(evalMetrics.technicalFailureReasons).length > 0
+                ? Object.entries(evalMetrics.technicalFailureReasons)
+                    .map(([r, cnt]) => `${formatEvaluationReasonCode(r)}: ${cnt}`)
+                    .join(' · ')
+                : '0 technical errors · Separate from PASS/FAIL'}
+            </div>
+          </article>
+          <article className="metric">
+            <div className="k">EVALUATED CASES</div>
+            <div className="v">
+              {evalMetrics.evaluatedCases} / {evalMetrics.totalCases}
+            </div>
+            <div className="s">
+              {evalMetrics.evaluationCoveragePercent.toFixed(1)}% binary · Policy {evalMetrics.policyVersion}
+            </div>
+          </article>
+        </div>
+      ) : (
+        <div className="cards verdict-kpis" role="region" aria-label="Verdict summary metrics">
+          <article className="metric ok">
+            <div className="k">PASS</div>
+            <div className="v">{verdictCounts.PASS}</div>
+            <div className="s">{safePercent(verdictCounts.PASS, executedCount)}% of executed cases</div>
+          </article>
+          <article className="metric fail">
+            <div className="k">FAIL</div>
+            <div className="v">{verdictCounts.FAIL}</div>
+            <div className="s">{safePercent(verdictCounts.FAIL, executedCount)}% · Finding requires review</div>
+          </article>
+          <article className="metric warn">
+            <div className="k">INCONCLUSIVE</div>
+            <div className="v">{verdictCounts.INCONCLUSIVE}</div>
+            <div className="s">{safePercent(verdictCounts.INCONCLUSIVE, executedCount)}% · Legacy report outcome</div>
+          </article>
+          <article className="metric err">
+            <div className="k">ERROR</div>
+            <div className="v">{verdictCounts.ERROR}</div>
+            <div className="s">{safePercent(verdictCounts.ERROR, executedCount)}% · Operational / tool failure</div>
+          </article>
+        </div>
+      )}
 
       {/* Verdict Distribution & Timing Card */}
       <section className="card dist-card" aria-label="Verdict distribution and execution coverage">
@@ -449,13 +502,22 @@ export default function ScanResultsView({
             <p className="caption">
               {unified.sessionCount > 1 ? (
                 <>
-                  Selected Cases: {selectedCount} · Recorded Outcomes: {executedCount} · Skipped Cases: {skippedCount} ·
-                  Execution Sessions: {unified.sessionCount}
+                  Selected Cases: {selectedCount} · Recorded Outcomes: {executedCount} · Evaluated Cases:{' '}
+                  {evalMetrics.evaluatedCases} · Not Evaluated: {evalMetrics.notEvaluatedCount} · Coverage:{' '}
+                  {evalMetrics.evaluationCoveragePercent.toFixed(1)}% · Skipped Cases: {skippedCount} · Execution Sessions:{' '}
+                  {unified.sessionCount}
+                </>
+              ) : evalMetrics.isBinarySchema && evalMetrics.legacyInconclusiveCount === 0 ? (
+                <>
+                  Selected Cases: {selectedCount} · Executed Cases: {executedCount} · Skipped Cases: {skippedCount} ·
+                  Total Cases: {evalMetrics.totalCases} · PASS: {evalMetrics.passCount} ({evalMetrics.passRatePercent.toFixed(1)}%) ·
+                  FAIL: {evalMetrics.failCount} ({evalMetrics.failRatePercent.toFixed(1)}%) ·
+                  Technical Failures: {evalMetrics.technicalFailureCount} · Policy: {evalMetrics.policyVersion}
                 </>
               ) : (
                 <>
                   Selected Cases: {selectedCount} · Executed Cases: {executedCount} · Skipped Cases: {skippedCount} ·
-                  Total Cases: {runRecord.total_cases}
+                  Total Cases: {evalMetrics.totalCases}
                 </>
               )}
             </p>
@@ -467,27 +529,64 @@ export default function ScanResultsView({
           </div>
         </div>
 
-        <div className="bar" role="img" aria-label={`Verdict bar: ${verdictCounts.PASS} PASS, ${verdictCounts.FAIL} FAIL, ${verdictCounts.INCONCLUSIVE} INCONCLUSIVE, ${verdictCounts.ERROR} ERROR`}>
-          {verdictCounts.PASS > 0 && (
-            <span className="b-pass" style={{ width: `${safePercent(verdictCounts.PASS, barTotal)}%` }} />
+        <div
+          className="bar"
+          role="img"
+          aria-label={
+            evalMetrics.isBinarySchema && evalMetrics.legacyInconclusiveCount === 0
+              ? `Verdict bar: ${evalMetrics.passCount} PASS, ${evalMetrics.failCount} FAIL, ${evalMetrics.notEvaluatedCount} NOT_EVALUATED`
+              : `Verdict bar: ${verdictCounts.PASS} PASS, ${verdictCounts.FAIL} FAIL, ${verdictCounts.INCONCLUSIVE} INCONCLUSIVE, ${verdictCounts.ERROR} ERROR`
+          }
+        >
+          {evalMetrics.passCount > 0 && (
+            <span className="b-pass" style={{ width: `${safePercent(evalMetrics.passCount, barTotal)}%` }} />
           )}
-          {verdictCounts.FAIL > 0 && (
-            <span className="b-fail" style={{ width: `${safePercent(verdictCounts.FAIL, barTotal)}%` }} />
+          {evalMetrics.failCount > 0 && (
+            <span className="b-fail" style={{ width: `${safePercent(evalMetrics.failCount, barTotal)}%` }} />
           )}
-          {verdictCounts.INCONCLUSIVE > 0 && (
-            <span className="b-inc" style={{ width: `${safePercent(verdictCounts.INCONCLUSIVE, barTotal)}%` }} />
-          )}
-          {verdictCounts.ERROR > 0 && (
-            <span className="b-err" style={{ width: `${safePercent(verdictCounts.ERROR, barTotal)}%` }} />
+          {evalMetrics.isBinarySchema && evalMetrics.legacyInconclusiveCount === 0 ? (
+            evalMetrics.notEvaluatedCount > 0 && (
+              <span className="b-inc" style={{ width: `${safePercent(evalMetrics.notEvaluatedCount, barTotal)}%` }} />
+            )
+          ) : (
+            <>
+              {verdictCounts.INCONCLUSIVE > 0 && (
+                <span className="b-inc" style={{ width: `${safePercent(verdictCounts.INCONCLUSIVE, barTotal)}%` }} />
+              )}
+              {verdictCounts.ERROR > 0 && (
+                <span className="b-err" style={{ width: `${safePercent(verdictCounts.ERROR, barTotal)}%` }} />
+              )}
+            </>
           )}
         </div>
 
         <div className="bar-legend">
-          <span><i className="dot pass" /> PASS {verdictCounts.PASS} ({safePercent(verdictCounts.PASS, executedCount)}%)</span>
-          <span><i className="dot fail" /> FAIL {verdictCounts.FAIL} ({safePercent(verdictCounts.FAIL, executedCount)}%)</span>
-          <span><i className="dot inc" /> INCONCLUSIVE {verdictCounts.INCONCLUSIVE} ({safePercent(verdictCounts.INCONCLUSIVE, executedCount)}%)</span>
-          <span><i className="dot err" /> ERROR {verdictCounts.ERROR} ({safePercent(verdictCounts.ERROR, executedCount)}%)</span>
+          <span><i className="dot pass" /> PASS {evalMetrics.passCount} ({evalMetrics.isBinarySchema ? evalMetrics.passRatePercent.toFixed(1) : safePercent(evalMetrics.passCount, executedCount)}%)</span>
+          <span><i className="dot fail" /> FAIL {evalMetrics.failCount} ({evalMetrics.isBinarySchema ? evalMetrics.failRatePercent.toFixed(1) : safePercent(evalMetrics.failCount, executedCount)}%)</span>
+          {evalMetrics.isBinarySchema && evalMetrics.legacyInconclusiveCount === 0 ? (
+            evalMetrics.technicalFailureCount > 0 && (
+              <span><i className="dot err" /> TECHNICAL FAILURES {evalMetrics.technicalFailureCount}</span>
+            )
+          ) : (
+            <>
+              <span><i className="dot inc" /> INCONCLUSIVE {verdictCounts.INCONCLUSIVE} ({safePercent(verdictCounts.INCONCLUSIVE, executedCount)}%)</span>
+              <span><i className="dot err" /> ERROR {verdictCounts.ERROR} ({safePercent(verdictCounts.ERROR, executedCount)}%)</span>
+            </>
+          )}
         </div>
+        {evalMetrics.isBinarySchema && evalMetrics.legacyInconclusiveCount === 0 && (
+          <p className="caption" style={{ marginTop: '0.5rem' }}>
+            {evalMetrics.policyStatement}
+            {Object.keys(evalMetrics.evidenceLimitationCounts).length > 0 && (
+              <>
+                {' '}· Evidence limitations:{' '}
+                {Object.entries(evalMetrics.evidenceLimitationCounts)
+                  .map(([k, v]) => `${k}: ${v}`)
+                  .join(' · ')}
+              </>
+            )}
+          </p>
+        )}
       </section>
 
       {/* Judge Evaluation & Evidence Verification 2-Column Panel */}
@@ -649,8 +748,16 @@ export default function ScanResultsView({
               <option value="ALL">All verdicts</option>
               <option value="PASS">PASS</option>
               <option value="FAIL">FAIL</option>
-              <option value="INCONCLUSIVE">INCONCLUSIVE</option>
-              <option value="ERROR">ERROR</option>
+              {evalMetrics.isBinarySchema && evalMetrics.legacyInconclusiveCount === 0 ? (
+                evalMetrics.technicalFailureCount > 0 && (
+                  <option value="NOT_EVALUATED">Technical failures</option>
+                )
+              ) : (
+                <>
+                  <option value="INCONCLUSIVE">INCONCLUSIVE (legacy)</option>
+                  <option value="ERROR">ERROR</option>
+                </>
+              )}
             </select>
           </label>
 
@@ -728,7 +835,16 @@ export default function ScanResultsView({
                           <span className="pill">{formatCaseAsiCategory(c.category)}</span>
                         </td>
                         <td>
-                          <span className={verdictBadgeClass(c.verdict)}>{normalizeVerdict(c.verdict)}</span>
+                          <div className="cell-stack">
+                            <span className={verdictBadgeClass(c.verdict, c.evaluation_status)}>
+                              {c.verdict
+                                ? normalizeVerdict(c.verdict, c.evaluation_status)
+                                : formatEvaluationStatus(c.evaluation_status)}
+                            </span>
+                            {!c.verdict && c.evaluation_reason_code && (
+                              <span className="sublabel mono">{c.evaluation_reason_code}</span>
+                            )}
+                          </div>
                         </td>
                         <td>
                           <div className="cell-stack">

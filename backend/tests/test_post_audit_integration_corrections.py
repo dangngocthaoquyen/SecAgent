@@ -360,7 +360,13 @@ def test_b01_real_hybrid_judge_success_and_fault_propagation(tmp_path: Path, mon
     assert wf_err["status"] == "failed"
     assert wf_err["error_stage"] == "evaluating"
     assert wf_err["evaluation_error_code"] == "judge_evaluation_error"
-    assert wf_err["verdict_counts"] == {"INCONCLUSIVE": 1}
+    assert wf_err["verdict_counts"] == {}
+    assert wf_err["verdict_schema_version"] == "2.0"
+    assert wf_err["evaluation_summary"]["not_evaluated_count"] == 1
+    assert wf_err["evaluation_summary"]["not_evaluated_reasons"] == {"JUDGE_ERROR": 1}
+    assert wf_err["cases_summary"][0]["verdict"] is None
+    assert wf_err["cases_summary"][0]["evaluation_status"] == "JUDGE_ERROR"
+    assert wf_err["cases_summary"][0]["evaluation_reason_code"] == "JUDGE_ERROR"
     stages = {s["stage"]: s["status"] for s in wf_err["stages"]}
     assert stages["executing"] == "completed"
     assert stages["evaluating"] == "failed"

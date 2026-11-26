@@ -4,6 +4,8 @@ import {
   copyTextToClipboard,
   downloadJsonFile,
   formatCaseAsiCategory,
+  formatEvaluationReasonCode,
+  formatEvaluationStatus,
   formatEvidenceLevel,
   formatInvocationStatus,
   formatProviderModel,
@@ -169,7 +171,8 @@ export default function TestcaseDetailDrawer({
     judgeMode: runRecord.judge_metadata?.mode ?? null,
   };
   const faultInfo = classifyJudgeFault(testcase, judgeOptions);
-  const verdict = normalizeVerdict(testcase.verdict);
+  const verdict = normalizeVerdict(testcase.verdict, testcase.evaluation_status);
+  const verdictDisplay = testcase.verdict ? verdict : formatEvaluationStatus(testcase.evaluation_status);
   const caseEvidence = summarizeCaseEvidenceVerification(testcase);
   const responseText = testcase.response_text ?? '';
   const hasResponse = testcase.response_text !== null && testcase.response_text !== '';
@@ -204,7 +207,10 @@ export default function TestcaseDetailDrawer({
           <div className="drawer-title-group">
             <div className="drawer-badges">
               <span className="pill">{formatCaseAsiCategory(testcase.category)}</span>
-              <span className={verdictBadgeClass(verdict)}>{verdict}</span>
+              <span className={verdictBadgeClass(testcase.verdict, testcase.evaluation_status)}>{verdictDisplay}</span>
+              {!testcase.verdict && testcase.evaluation_reason_code && (
+                <span className="pill">{formatEvaluationReasonCode(testcase.evaluation_reason_code)}</span>
+              )}
               {faultInfo.isProviderFault && (
                 <span className="pill warn">{faultInfo.primary}</span>
               )}

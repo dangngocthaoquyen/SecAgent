@@ -428,6 +428,9 @@ class GenerateAndRunSnapshot(StrictGeneratorModel):
     total_cases: int = 0
     progress_percent: int = 0
     verdict_counts: dict[str, int] = Field(default_factory=dict)
+    verdict_schema_version: str | None = None
+    verdict_policy_version: str | None = None
+    evaluation_summary: dict[str, Any] | None = None
     evidence_summary: dict[str, Any] = Field(default_factory=dict)
     judge_metadata: dict[str, Any] | None = None
     evaluation_error_code: str | None = None
@@ -641,7 +644,9 @@ def _summarize_cases(run_record: dict[str, Any]) -> tuple[dict[str, Any], ...]:
                 "case_id": item.get("case_id") or item.get("testcase_id"),
                 "asi_code": item.get("asi_code"),
                 "category": item.get("category"),
-                "verdict": item.get("verdict") or item.get("final_verdict"),
+                "verdict": item["verdict"] if "verdict" in item else item.get("final_verdict"),
+                "evaluation_status": item.get("evaluation_status"),
+                "evaluation_reason_code": item.get("evaluation_reason_code"),
                 "status": item.get("status"),
                 "evidence_level": item.get("evidence_level"),
                 "evaluation_mode": item.get("evaluation_mode"),
@@ -771,6 +776,9 @@ class _WorkflowEntry:
         self.total_cases: int = 0
         self.progress_percent: int = 0
         self.verdict_counts: dict[str, int] = {}
+        self.verdict_schema_version: str | None = None
+        self.verdict_policy_version: str | None = None
+        self.evaluation_summary: dict[str, Any] | None = None
         self.evidence_summary: dict[str, Any] = {}
         self.judge_metadata: dict[str, Any] | None = None
         self.evaluation_error_code: str | None = None
@@ -840,6 +848,12 @@ class _WorkflowEntry:
         self.progress_percent = int(run_record.get("progress_percent") or 0)
         vc = run_record.get("verdict_counts")
         self.verdict_counts = {str(k): int(v) for k, v in vc.items()} if isinstance(vc, dict) else {}
+        ev_sum = run_record.get("evaluation_summary")
+        self.evaluation_summary = dict(ev_sum) if isinstance(ev_sum, dict) else None
+        raw_vsv = run_record.get("verdict_schema_version") or (ev_sum.get("schema_version") if isinstance(ev_sum, dict) else None)
+        raw_vpv = run_record.get("verdict_policy_version") or (ev_sum.get("policy_version") if isinstance(ev_sum, dict) else None)
+        self.verdict_schema_version = str(raw_vsv) if isinstance(raw_vsv, str) and raw_vsv else None
+        self.verdict_policy_version = str(raw_vpv) if isinstance(raw_vpv, str) and raw_vpv else None
         ev = run_record.get("evidence_summary")
         self.evidence_summary = dict(ev) if isinstance(ev, dict) else {}
         self.judge_metadata = _sanitize_judge_metadata_for_snapshot(run_record.get("judge_metadata"))
@@ -977,6 +991,9 @@ class _WorkflowEntry:
             "judge_metadata": self.judge_metadata,
             "evidence_summary": self.evidence_summary,
             "verdict_counts": self.verdict_counts,
+            "verdict_schema_version": self.verdict_schema_version,
+            "verdict_policy_version": self.verdict_policy_version,
+            "evaluation_summary": self.evaluation_summary,
             "rerun_count": len(self.rerun_history),
         }
         return GenerateAndRunSnapshot(
@@ -1032,6 +1049,9 @@ class _WorkflowEntry:
             total_cases=self.total_cases,
             progress_percent=self.progress_percent,
             verdict_counts=dict(self.verdict_counts),
+            verdict_schema_version=self.verdict_schema_version,
+            verdict_policy_version=self.verdict_policy_version,
+            evaluation_summary=dict(self.evaluation_summary) if isinstance(self.evaluation_summary, dict) else None,
             evidence_summary=dict(self.evidence_summary),
             judge_metadata=self.judge_metadata,
             evaluation_error_code=self.evaluation_error_code,

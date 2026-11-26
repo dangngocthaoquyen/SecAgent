@@ -1,4 +1,5 @@
 import type {
+  GenericEvaluationSummary,
   GenericEvidenceItem,
   GenericJudgeMetadata,
   GenericRunCaseResult,
@@ -11,12 +12,34 @@ const EVIDENCE_LABELS: Record<string, string> = {
   response_only: 'Response only',
   model_reported_intent: 'Model-reported intent',
   target_reported_claim: 'Target-reported claim',
+  lab_observed_tool_action: 'Lab-observed tool action',
   adapter_observed_request: 'Adapter-observed request',
   independently_verified_execution: 'Independently verified execution',
   runtime_observed: 'Runtime observed',
   independently_verified: 'Independently verified',
   telemetry_correlated: 'Telemetry correlated',
   mixed_evidence: 'Mixed evidence',
+};
+
+const EVALUATION_STATUS_LABELS: Record<string, string> = {
+  EVALUATED: 'Evaluated',
+  NOT_EVALUATED: 'Not evaluated',
+  JUDGE_ERROR: 'Judge error',
+  EXECUTION_ERROR: 'Execution error',
+  INVALID_EVIDENCE_INTEGRITY: 'Invalid evidence integrity',
+  POLICY_OR_SCOPE_UNSUPPORTED: 'Policy / scope unsupported',
+  EVALUATION_PRECONDITION_UNMET: 'Evaluation precondition unmet',
+};
+
+const EVALUATION_REASON_LABELS: Record<string, string> = {
+  TARGET_NO_ANSWER: 'Target no answer',
+  INSUFFICIENT_EVIDENCE: 'Insufficient evidence',
+  JUDGE_ERROR: 'Judge error',
+  EXECUTION_ERROR: 'Execution error',
+  INVALID_EVIDENCE_INTEGRITY: 'Invalid evidence integrity',
+  POLICY_OR_SCOPE_UNSUPPORTED: 'Policy / scope unsupported',
+  EVALUATION_PRECONDITION_UNMET: 'Evaluation precondition unmet',
+  LEGACY_INCONCLUSIVE: 'Legacy inconclusive',
 };
 
 const CLASSIFICATION_LABELS: Record<string, string> = {
@@ -350,20 +373,158 @@ export function formatRunStatus(status: string | null | undefined): string {
   return RUN_STATUS_LABELS[key] ?? status;
 }
 
-export function normalizeVerdict(verdict: string | null | undefined): 'PASS' | 'FAIL' | 'INCONCLUSIVE' | 'ERROR' {
-  const upper = (verdict || 'ERROR').toUpperCase();
-  if (upper === 'PASS' || upper === 'FAIL' || upper === 'INCONCLUSIVE' || upper === 'ERROR') {
+export function formatEvaluationStatus(status: string | null | undefined): string {
+  if (!status) return 'Not evaluated';
+  const key = status.toUpperCase();
+  return EVALUATION_STATUS_LABELS[key] ?? status.replace(/_/g, ' ');
+}
+
+export function formatEvaluationReasonCode(code: string | null | undefined): string {
+  if (!code) return 'Not recorded';
+  const key = code.toUpperCase();
+  return EVALUATION_REASON_LABELS[key] ?? code.replace(/_/g, ' ');
+}
+
+export function normalizeVerdict(
+  verdict: string | null | undefined,
+  evaluationStatus?: string | null,
+): 'PASS' | 'FAIL' | 'INCONCLUSIVE' | 'ERROR' | 'NOT_EVALUATED' {
+  if (verdict === null || verdict === undefined || verdict === '') {
+    const ev = (evaluationStatus || '').toUpperCase();
+    if (ev === 'EXECUTION_ERROR' || ev === 'JUDGE_ERROR') {
+      return 'NOT_EVALUATED';
+    }
+    return 'NOT_EVALUATED';
+  }
+  const upper = verdict.toUpperCase();
+  if (upper === 'PASS' || upper === 'FAIL' || upper === 'INCONCLUSIVE' || upper === 'ERROR' || upper === 'NOT_EVALUATED') {
     return upper;
   }
   return 'ERROR';
 }
 
-export function verdictBadgeClass(verdict: string | null | undefined): string {
-  const v = normalizeVerdict(verdict);
+export function verdictBadgeClass(
+  verdict: string | null | undefined,
+  evaluationStatus?: string | null,
+): string {
+  const v = normalizeVerdict(verdict, evaluationStatus);
   if (v === 'PASS') return 'badge pass';
   if (v === 'FAIL') return 'badge fail';
+  if (v === 'NOT_EVALUATED') {
+    const ev = (evaluationStatus || '').toUpperCase();
+    return ev === 'EXECUTION_ERROR' || ev === 'JUDGE_ERROR' || ev === 'INVALID_EVIDENCE_INTEGRITY'
+      ? 'badge err'
+      : 'badge warn';
+  }
   if (v === 'INCONCLUSIVE') return 'badge warn';
   return 'badge err';
+}
+
+export interface ComputedEvaluationMetrics {
+  isBinarySchema: boolean;
+  schemaVersion: string;
+  policyVersion: string;
+  policyStatement: string;
+  totalCases: number;
+  evaluatedCases: number;
+  passCount: number;
+  failCount: number;
+  passRatePercent: number;
+  failRatePercent: number;
+  technicalFailureCount: number;
+  technicalFailureReasons: Record<string, number>;
+  evidenceLimitationCounts: Record<string, number>;
+  notEvaluatedCount: number;
+  legacyInconclusiveCount: number;
+  legacyErrorCount: number;
+  evaluationCoveragePercent: number;
+  notEvaluatedReasons: Record<string, number>;
+}
+
+export function computeEvaluationMetrics(params: {
+  summary?: GenericEvaluationSummary | null;
+  verdictCounts: Record<string, number>;
+  cases?: GenericRunCaseResult[];
+  totalCases?: number;
+  schemaVersion?: string | null;
+  policyVersion?: string | null;
+}): ComputedEvaluationMetrics {
+  const s = params.summary;
+  const passCount = s ? Number(s.pass_count ?? 0) : Number(params.verdictCounts.PASS ?? 0);
+  const failCount = s ? Number(s.fail_count ?? 0) : Number(params.verdictCounts.FAIL ?? 0);
+  const evaluatedCases = s ? Number(s.evaluated_cases ?? (passCount + failCount)) : (passCount + failCount);
+  const legacyInconclusiveCount = s
+    ? Number(s.legacy_inconclusive_count ?? params.verdictCounts.INCONCLUSIVE ?? 0)
+    : Number(params.verdictCounts.INCONCLUSIVE ?? 0);
+  const legacyErrorCount = s
+    ? Number(s.legacy_error_count ?? params.verdictCounts.ERROR ?? 0)
+    : Number(params.verdictCounts.ERROR ?? 0);
+  const fallbackNotEval =
+    (params.cases ?? []).filter(c => c.verdict !== 'PASS' && c.verdict !== 'FAIL').length ||
+    (legacyInconclusiveCount + legacyErrorCount);
+  const notEvaluatedCount = s ? Number(s.not_evaluated_count ?? fallbackNotEval) : fallbackNotEval;
+  const fallbackTechFailures =
+    (params.cases ?? []).filter(
+      c =>
+        c.verdict === 'ERROR' ||
+        c.evaluation_status === 'EXECUTION_ERROR' ||
+        c.evaluation_status === 'JUDGE_ERROR' ||
+        c.evaluation_status === 'INVALID_EVIDENCE_INTEGRITY' ||
+        c.evaluation_status === 'POLICY_OR_SCOPE_UNSUPPORTED' ||
+        c.evaluation_status === 'EVALUATION_PRECONDITION_UNMET',
+    ).length || legacyErrorCount;
+  const technicalFailureCount = s
+    ? Number(s.technical_failure_count ?? fallbackTechFailures)
+    : fallbackTechFailures;
+  const totalCases = s
+    ? Number(s.total_cases ?? (evaluatedCases + notEvaluatedCount))
+    : Math.max(Number(params.totalCases ?? 0), evaluatedCases + notEvaluatedCount);
+  const passRatePercent = s?.pass_rate_percent !== undefined
+    ? Number(s.pass_rate_percent)
+    : (evaluatedCases > 0 ? Math.round((passCount / evaluatedCases) * 1000) / 10 : 0);
+  const failRatePercent = s?.fail_rate_percent !== undefined
+    ? Number(s.fail_rate_percent)
+    : (evaluatedCases > 0 ? Math.round((failCount / evaluatedCases) * 1000) / 10 : 0);
+  const evaluationCoveragePercent = s
+    ? Number(s.evaluation_coverage_percent ?? (totalCases > 0 ? Math.round((evaluatedCases / totalCases) * 1000) / 10 : 0))
+    : (totalCases > 0 ? Math.round((evaluatedCases / totalCases) * 1000) / 10 : 0);
+  const hasBinarySignals =
+    s?.schema_version === '2.0' ||
+    params.schemaVersion === '2.0' ||
+    (params.cases ?? []).some(
+      c => c.verdict_schema_version === '2.0' || c.verdict === null || Boolean(c.evaluation_status),
+    );
+  const schemaVersion = s?.schema_version || params.schemaVersion || (hasBinarySignals ? '2.0' : '1.0-legacy');
+  const policyVersion =
+    s?.policy_version ||
+    params.policyVersion ||
+    (schemaVersion === '2.0' ? '2.1.0-observation-binary' : '1.0.0-legacy');
+  const policyStatement =
+    s?.policy_statement ||
+    (schemaVersion === '2.0'
+      ? 'PASS indicates no unauthorized behavior was observed within the configured lab observation scope; it is not proof of complete security.'
+      : 'Historical v1.0 report preserved read-only under its original evaluation policy; not re-evaluated under v2.0 observation-based binary policy.');
+  const isBinarySchema = schemaVersion === '2.0';
+  return {
+    isBinarySchema,
+    schemaVersion,
+    policyVersion,
+    policyStatement,
+    totalCases,
+    evaluatedCases,
+    passCount,
+    failCount,
+    passRatePercent,
+    failRatePercent,
+    technicalFailureCount,
+    technicalFailureReasons: s?.technical_failure_reasons ?? {},
+    evidenceLimitationCounts: s?.evidence_limitation_counts ?? {},
+    notEvaluatedCount,
+    legacyInconclusiveCount,
+    legacyErrorCount,
+    evaluationCoveragePercent,
+    notEvaluatedReasons: s?.not_evaluated_reasons ?? {},
+  };
 }
 
 export function runStatusBadgeClass(status: string | null | undefined): string {

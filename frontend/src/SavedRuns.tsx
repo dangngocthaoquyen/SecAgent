@@ -8,6 +8,8 @@ import {
   deriveRunAsiSummary,
   formatCaseAsiCategory,
   formatDateTime,
+  formatEvaluationReasonCode,
+  formatEvaluationStatus,
   formatEvidenceLevel,
   formatRunStatus,
   normalizeVerdict,
@@ -145,7 +147,16 @@ export default function SavedRuns({
           return false;
         }
       }
-      if (filters.verdict && !(Number(lg.verdict_counts?.[filters.verdict] ?? 0) > 0)) return false;
+      if (filters.verdict) {
+        if (filters.verdict === 'TECHNICAL_FAILURE') {
+          const tfCount =
+            Number(lg.evaluation_summary?.technical_failure_count ?? 0) +
+            Number(lg.verdict_counts?.ERROR ?? 0);
+          if (tfCount <= 0) return false;
+        } else if (!(Number(lg.verdict_counts?.[filters.verdict] ?? 0) > 0)) {
+          return false;
+        }
+      }
       const runDate = (lg.started_at || lg.completed_at || '').slice(0, 10);
       if (filters.date_from && (!runDate || runDate < filters.date_from)) return false;
       if (filters.date_to && (!runDate || runDate > filters.date_to)) return false;
@@ -359,9 +370,15 @@ export default function SavedRuns({
             Verdict / Outcome
             <select value={draft.verdict} onChange={e => edit('verdict', e.target.value)}>
               <option value="">All</option>
-              {['PASS', 'FAIL', 'INCONCLUSIVE', 'ERROR'].map(v => (
+              {['PASS', 'FAIL', 'TECHNICAL_FAILURE', 'INCONCLUSIVE', 'ERROR'].map(v => (
                 <option key={v} value={v}>
-                  {v === 'ERROR' ? 'ERROR (execution error)' : v}
+                  {v === 'ERROR'
+                    ? 'ERROR (legacy execution error)'
+                    : v === 'TECHNICAL_FAILURE'
+                      ? 'Technical failures'
+                      : v === 'INCONCLUSIVE'
+                        ? 'INCONCLUSIVE (legacy)'
+                        : v}
                 </option>
               ))}
             </select>
@@ -459,7 +476,17 @@ export default function SavedRuns({
                   <tbody>
                     {filteredLogicalScans.map(lg => {
                       const vc = computeVerdictCounts({ verdict_counts: lg.verdict_counts } as GenericRunSummary);
-                      const barTotal = Math.max(1, vc.PASS + vc.FAIL + vc.INCONCLUSIVE + vc.ERROR);
+                      const isBinaryV2 =
+                        lg.verdict_schema_version === '2.0' &&
+                        vc.INCONCLUSIVE === 0 &&
+                        vc.ERROR === 0;
+                      const techFailCount = Number(lg.evaluation_summary?.technical_failure_count ?? 0);
+                      const barTotal = Math.max(
+                        1,
+                        isBinaryV2
+                          ? vc.PASS + vc.FAIL + techFailCount
+                          : vc.PASS + vc.FAIL + vc.INCONCLUSIVE + vc.ERROR,
+                      );
                       const isExpanded = expandedRunId === lg.logicalScanId;
                       const asiSummary = deriveRunAsiSummary(lg);
                       const canExportUnified = lg.has_continuations && lg.integrity_status !== 'invalid_checkpoint';
@@ -511,14 +538,26 @@ export default function SavedRuns({
                               <div className="bar mini" aria-hidden="true">
                                 {vc.PASS > 0 && <span className="b-pass" style={{ width: `${safePercent(vc.PASS, barTotal)}%` }} />}
                                 {vc.FAIL > 0 && <span className="b-fail" style={{ width: `${safePercent(vc.FAIL, barTotal)}%` }} />}
-                                {vc.INCONCLUSIVE > 0 && <span className="b-inc" style={{ width: `${safePercent(vc.INCONCLUSIVE, barTotal)}%` }} />}
-                                {vc.ERROR > 0 && <span className="b-err" style={{ width: `${safePercent(vc.ERROR, barTotal)}%` }} />}
+                                {isBinaryV2 ? (
+                                  techFailCount > 0 && <span className="b-err" style={{ width: `${safePercent(techFailCount, barTotal)}%` }} />
+                                ) : (
+                                  <>
+                                    {vc.INCONCLUSIVE > 0 && <span className="b-inc" style={{ width: `${safePercent(vc.INCONCLUSIVE, barTotal)}%` }} />}
+                                    {vc.ERROR > 0 && <span className="b-err" style={{ width: `${safePercent(vc.ERROR, barTotal)}%` }} />}
+                                  </>
+                                )}
                               </div>
                               <div className="mini-counts">
                                 <span className="ok-text">{vc.PASS}P</span> ·{' '}
-                                <span className="fail-text">{vc.FAIL}F</span> ·{' '}
-                                <span className="warn-text">{vc.INCONCLUSIVE}I</span>
-                                {vc.ERROR > 0 && <> · <span className="err-text">{vc.ERROR}E</span></>}
+                                <span className="fail-text">{vc.FAIL}F</span>
+                                {isBinaryV2 ? (
+                                  techFailCount > 0 && <> · <span className="err-text">{techFailCount}E</span></>
+                                ) : (
+                                  <>
+                                    {' '}· <span className="warn-text">{vc.INCONCLUSIVE}I</span>
+                                    {vc.ERROR > 0 && <> · <span className="err-text">{vc.ERROR}E</span></>}
+                                  </>
+                                )}
                               </div>
                             </div>
                           </td>
@@ -716,7 +755,16 @@ export default function SavedRuns({
                                     <span className="pill">{safeLabel(formatCaseAsiCategory(c.category))}</span>
                                   </td>
                                   <td>
-                                    <span className={verdictBadgeClass(c.verdict)}>{normalizeVerdict(c.verdict)}</span>
+                                    <div className="cell-stack">
+                                      <span className={verdictBadgeClass(c.verdict)}>
+                                        {c.verdict ? normalizeVerdict(c.verdict) : formatEvaluationStatus(c.evaluation_status)}
+                                      </span>
+                                      {!c.verdict && c.evaluation_reason_code && (
+                                        <span className="sublabel mono">
+                                          {formatEvaluationReasonCode(c.evaluation_reason_code)}
+                                        </span>
+                                      )}
+                                    </div>
                                   </td>
                                   <td>
                                     <div className="cell-stack">

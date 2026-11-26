@@ -1697,7 +1697,12 @@ def test_unified_scan_lineage_completed_with_errors_and_report_export(tmp_path, 
         assert ul["logical_status"] == "completed_with_errors"
         assert ul["execution_completed"] is True
         assert ul["has_evaluation_errors"] is True
-        assert ul["verdict_counts"] == {"ERROR": 29, "FAIL": 1, "INCONCLUSIVE": 5}
+        # Legacy parent cases preserve historical FAIL/INCONCLUSIVE verdicts;
+        # new v2.0 continuation cases record execution errors in evaluation_summary (never polluting verdict_counts).
+        assert ul["verdict_counts"] == {"FAIL": 1, "INCONCLUSIVE": 5}
+        assert ul["evaluation_summary"]["evaluated_cases"] == 1
+        assert ul["evaluation_summary"]["not_evaluated_count"] == 34
+        assert ul["evaluation_summary"]["not_evaluated_reasons"]["EXECUTION_ERROR"] == 29
         assert len(ul["cases"]) == 35
         assert len({c["case_id"] for c in ul["cases"]}) == 35  # Zero double-counting!
         assert [c["case_id"] for c in ul["cases"]] == selected_35
@@ -1707,7 +1712,12 @@ def test_unified_scan_lineage_completed_with_errors_and_report_export(tmp_path, 
         tc11 = ul["cases"][0]
         tc17 = ul["cases"][6]
         assert tc11["case_id"] == "TC0011" and tc11["verdict"] == "FAIL" and tc11["source_generic_run_id"] == root_id
-        assert tc17["case_id"] == "TC0017" and tc17["verdict"] == "ERROR" and tc17["source_generic_run_id"] == child_id
+        assert (
+            tc17["case_id"] == "TC0017"
+            and tc17["verdict"] is None
+            and tc17["evaluation_status"] == "EXECUTION_ERROR"
+            and tc17["source_generic_run_id"] == child_id
+        )
 
     # Unified report endpoint works identically from root_id or child_id and leaves disk artifacts immutable!
     uni_a = client.get(f"/api/testing/generic-runs/{root_id}/unified-report.json", base_url=BASE, headers=headers)
@@ -1718,7 +1728,8 @@ def test_unified_scan_lineage_completed_with_errors_and_report_export(tmp_path, 
     assert rep_a["logical_scan_id"] == root_id == rep_b["logical_scan_id"]
     assert rep_a["selected_cases"] == 35
     assert rep_a["recorded_outcomes"] == 35
-    assert rep_a["verdict_counts"] == {"ERROR": 29, "FAIL": 1, "INCONCLUSIVE": 5}
+    assert rep_a["verdict_counts"] == {"FAIL": 1, "INCONCLUSIVE": 5}
+    assert rep_a["evaluation_summary"]["not_evaluated_reasons"]["EXECUTION_ERROR"] == 29
     assert rep_a["logical_status"] == "completed_with_errors"
     assert rep_a["session_count"] == 2
     assert len(rep_a["cases"]) == 35

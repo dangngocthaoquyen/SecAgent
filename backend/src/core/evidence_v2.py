@@ -561,6 +561,17 @@ def _check_correlation_against_context(
             elif expected and actual == expected:
                 matched_fields.append(key)
 
+    # Target-reported correlation IDs never establish independent verification,
+    # but a direct conflict with the observation's target_correlation_id must fail closed.
+    raw_tcorr = data.get("target_correlation_id")
+    if (
+        isinstance(raw_tcorr, str)
+        and raw_tcorr.strip()
+        and corr_ctx.target_correlation_id
+        and raw_tcorr.strip() != corr_ctx.target_correlation_id
+    ):
+        mismatches.append("mismatched_target_correlation_id")
+
     if mismatches:
         return False, "none", "mismatch", mismatches
 

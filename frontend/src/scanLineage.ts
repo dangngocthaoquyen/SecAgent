@@ -1,4 +1,5 @@
 import type {
+  GenericEvaluationSummary,
   GenericRunRecord,
   GenericRunSummary,
   LogicalScanStatus,
@@ -24,6 +25,9 @@ export interface LogicalScanGroup {
   executed_cases: number;
   skipped_count: number;
   verdict_counts: Record<string, number>;
+  verdict_schema_version?: string | null;
+  verdict_policy_version?: string | null;
+  evaluation_summary?: GenericEvaluationSummary | null;
   logical_status: LogicalScanStatus;
   integrity_status: 'valid' | 'invalid_checkpoint';
   integrity_warning: string | null;
@@ -156,7 +160,11 @@ export function groupLogicalScans(runs: GenericRunSummary[]): LogicalScanGroup[]
         : sessions.reduce((acc, s) => acc + s.executed_cases, 0);
     }
 
-    const errorCount = Number(verdictCounts.ERROR ?? 0);
+    const evaluationSummary =
+      latestSession.evaluation_summary ?? rootSession.evaluation_summary ?? null;
+    const errorCount =
+      Number(verdictCounts.ERROR ?? 0) +
+      Number(evaluationSummary?.not_evaluated_reasons?.EXECUTION_ERROR ?? 0);
     const logicalStatus = deriveLogicalScanStatus({
       explicitLogicalStatus: summaryWithLineage?.logical_status ?? null,
       activeSessionPresent,
@@ -190,6 +198,9 @@ export function groupLogicalScans(runs: GenericRunSummary[]): LogicalScanGroup[]
       executed_cases: executedCases,
       skipped_count: skippedCount,
       verdict_counts: verdictCounts,
+      verdict_schema_version: latestSession.verdict_schema_version ?? rootSession.verdict_schema_version ?? null,
+      verdict_policy_version: latestSession.verdict_policy_version ?? rootSession.verdict_policy_version ?? null,
+      evaluation_summary: evaluationSummary,
       logical_status: logicalStatus,
       integrity_status: summaryWithLineage?.integrity_status ?? 'valid',
       integrity_warning: summaryWithLineage?.integrity_warning ?? null,
@@ -296,7 +307,9 @@ export function resolveUnifiedDisplay(record: GenericRunRecord): {
   const executedCount = record.executed_cases ?? (rawStatus === 'completed' ? record.total_cases : cases.length);
   const skippedCount = record.skipped_count ?? skippedCases.length;
   const verdictCounts = record.verdict_counts ?? {};
-  const errorCount = Number(verdictCounts.ERROR ?? 0);
+  const errorCount =
+    Number(verdictCounts.ERROR ?? 0) +
+    Number(record.evaluation_summary?.not_evaluated_reasons?.EXECUTION_ERROR ?? 0);
   const integrityStatus = record.lineage_summary?.integrity_status ?? 'valid';
   const logicalStatus: LogicalScanStatus =
     record.lineage_summary?.logical_status ??
@@ -307,7 +320,7 @@ export function resolveUnifiedDisplay(record: GenericRunRecord): {
     cases.map(c => ({
       case_id: c.case_id,
       category: c.category,
-      status: (c.verdict === 'ERROR' ? 'error' : 'completed') as 'error' | 'completed',
+      status: (c.verdict === 'ERROR' || c.evaluation_status === 'EXECUTION_ERROR' ? 'error' : 'completed') as 'error' | 'completed',
       stage: 'completed',
       verdict: c.verdict,
       reason: c.reason,

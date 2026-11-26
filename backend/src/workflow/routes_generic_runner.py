@@ -31,6 +31,13 @@ from evaluators.contract import (
     assess_target_scope_compatibility,
     summarize_target_capabilities_and_scopes,
 )
+from evaluators.verdict_outcome import (
+    TECHNICAL_FAILURE_STATUSES,
+    VALID_CASE_EVALUATION_STATUSES,
+    VERDICT_POLICY_VERSION,
+    VERDICT_SCHEMA_VERSION,
+    build_evaluation_summary,
+)
 from integrations.external_evaluator.pi import PiEvaluatorConfig, PiEvaluatorProvider
 from observers.evidence_collectors import (
     CollectedEvidenceOutput,
@@ -1568,13 +1575,21 @@ class GenericRunService:
         if record.get("executed_cases") != expected_cases_count or record.get("total_cases") != expected_cases_count:
             raise RuntimeError("completion_invariant_executed_count_mismatch")
         v_counts = record.get("verdict_counts")
-        if not isinstance(v_counts, dict) or sum(int(v) for v in v_counts.values()) != expected_cases_count:
+        if not isinstance(v_counts, dict):
             raise RuntimeError("completion_invariant_verdict_sum_mismatch")
         actual_verdicts: Counter[str] = Counter()
+        not_evaluated_count = 0
         for c in cases:
-            if not isinstance(c, dict) or not isinstance(c.get("verdict"), str):
+            if not isinstance(c, dict):
                 raise RuntimeError("completion_invariant_invalid_case_entry")
-            actual_verdicts[c["verdict"]] += 1
+            verdict_val = c.get("verdict")
+            ev_status_val = c.get("evaluation_status")
+            if isinstance(verdict_val, str) and verdict_val:
+                actual_verdicts[verdict_val] += 1
+            elif verdict_val is None and isinstance(ev_status_val, str) and ev_status_val in VALID_CASE_EVALUATION_STATUSES:
+                not_evaluated_count += 1
+            else:
+                raise RuntimeError("completion_invariant_invalid_case_entry")
             c_case_id = str(c.get("case_id") or "")
             c_run_id = str(c.get("run_id") or "")
             if not c_case_id or not c_run_id:
@@ -1637,6 +1652,8 @@ class GenericRunService:
                     raise RuntimeError("completion_invariant_controlled_report_missing")
                 if sha256(ctrl_rep_path.read_bytes()).hexdigest() != rep_sha:
                     raise RuntimeError("completion_invariant_controlled_report_sha256_mismatch")
+        if sum(int(v) for v in v_counts.values()) + not_evaluated_count != expected_cases_count:
+            raise RuntimeError("completion_invariant_verdict_sum_mismatch")
         if dict(sorted(actual_verdicts.items())) != dict(sorted((k, int(v)) for k, v in v_counts.items() if int(v) > 0)):
             raise RuntimeError("completion_invariant_verdict_distribution_mismatch")
 
@@ -1973,6 +1990,8 @@ class GenericRunService:
             ]
             record: dict[str, Any] = {
                 "workflow_schema_version": "1.0.0",
+                "verdict_schema_version": VERDICT_SCHEMA_VERSION,
+                "verdict_policy_version": VERDICT_POLICY_VERSION,
                 "generic_run_id": run_id,
                 "submission_id": submission_id,
                 "status": "running",
@@ -2025,6 +2044,12 @@ class GenericRunService:
                 "judge_request_budget": preview_meta["judge_request_budget"],
                 "judge_requests_used": 0,
                 "verdict_counts": {},
+                "evaluation_summary": build_evaluation_summary(
+                    [],
+                    total_cases=len(pairs),
+                    schema_version=VERDICT_SCHEMA_VERSION,
+                    policy_version=VERDICT_POLICY_VERSION,
+                ),
                 "evidence_summary": {},
                 "evidence_source_diagnostics": ev_store_diagnostics,
                 "judge_metadata": self._build_judge_metadata(
@@ -2147,6 +2172,9 @@ class GenericRunService:
                     prov_block = ev_block.get("research_provenance") if isinstance(ev_block.get("research_provenance"), dict) else {}
                     prov_eval = prov_block.get("evaluation") if isinstance(prov_block.get("evaluation"), dict) else {}
                     prov_judge = prov_block.get("judge") if isinstance(prov_block.get("judge"), dict) else {}
+                    case_verdict = item.get("verdict")
+                    case_eval_status = item.get("evaluation_status")
+                    case_eval_reason = item.get("evaluation_reason_code")
                     enriched_case = _sanitize_for_api({
                         "case_id": item["case_id"],
                         "run_id": item["run_id"],
@@ -2154,7 +2182,12 @@ class GenericRunService:
                         "prompt": pair_ti.prompt if pair_ti is not None else "",
                         "response_text": obs_block.get("response_text"),
                         "response_complete": obs_block.get("response_complete"),
-                        "verdict": item["verdict"],
+                        "verdict": case_verdict,
+                        "evaluation_status": case_eval_status,
+                        "evaluation_reason_code": case_eval_reason,
+                        "evidence_limitations": list(item.get("evidence_limitations") or []),
+                        "verdict_schema_version": VERDICT_SCHEMA_VERSION,
+                        "verdict_policy_version": VERDICT_POLICY_VERSION,
                         "reason": item["reason"],
                         "decision_source": prov_eval.get("decision_source"),
                         "deterministic_verdict": prov_eval.get("deterministic_verdict"),
@@ -2187,7 +2220,8 @@ class GenericRunService:
                     }, extra_secrets=session_secrets)
                     with self._lock:
                         enriched_cases.append(enriched_case)
-                        verdict_counter[item["verdict"]] += 1
+                        if case_verdict in {"PASS", "FAIL"}:
+                            verdict_counter[case_verdict] += 1
                         if isinstance(ev_level, str) and ev_level:
                             evidence_counter[ev_level] += 1
                         if mode == "live" and exec_block:
@@ -2199,13 +2233,25 @@ class GenericRunService:
                         # Keep total_cases equal to ready executable count (len(pairs)), never overwrite with partial executed count
                         record["total_cases"] = len(pairs)
                         record["verdict_counts"] = dict(sorted(verdict_counter.items()))
+                        record["evaluation_summary"] = build_evaluation_summary(
+                            enriched_cases,
+                            total_cases=len(pairs),
+                            schema_version=VERDICT_SCHEMA_VERSION,
+                            policy_version=VERDICT_POLICY_VERSION,
+                        )
                         record["evidence_summary"] = dict(sorted(evidence_counter.items()))
                         record["progress_percent"] = int(round((len(enriched_cases) / max(1, len(pairs))) * 100))
                         for row in record["case_statuses"]:
                             if row["case_id"] == cid:
-                                row["status"] = "error" if item["verdict"] == "ERROR" else "completed"
+                                row["status"] = (
+                                    "error"
+                                    if case_eval_status in TECHNICAL_FAILURE_STATUSES
+                                    else "completed"
+                                )
                                 row["stage"] = "completed"
-                                row["verdict"] = item["verdict"]
+                                row["verdict"] = case_verdict
+                                row["evaluation_status"] = case_eval_status
+                                row["evaluation_reason_code"] = case_eval_reason
                                 row["reason"] = item["reason"]
                                 row["evidence_level"] = ev_level
                                 row["run_id"] = item["run_id"]
@@ -2218,7 +2264,13 @@ class GenericRunService:
                         )
                         record["events"] = (
                             record["events"]
-                            + [{"at": now_iso, "stage": "case_completed", "case_id": cid, "verdict": item["verdict"]}]
+                            + [{
+                                "at": now_iso,
+                                "stage": "case_completed",
+                                "case_id": cid,
+                                "verdict": case_verdict,
+                                "evaluation_status": case_eval_status,
+                            }]
                         )[-120:]
                     self._write_run_record(run_dir, record)
 
@@ -2246,6 +2298,12 @@ class GenericRunService:
                         record["executed_cases"] = len(record["cases"])
                         record["total_cases"] = len(pairs)
                         record["verdict_counts"] = summary["verdict_counts"]
+                        record["evaluation_summary"] = build_evaluation_summary(
+                            record["cases"],
+                            total_cases=len(pairs),
+                            schema_version=VERDICT_SCHEMA_VERSION,
+                            policy_version=VERDICT_POLICY_VERSION,
+                        )
                         if isinstance(summary.get("research_provenance"), dict):
                             record["research_provenance"] = summary["research_provenance"]
                         self._verify_completion_invariants(
@@ -2253,7 +2311,10 @@ class GenericRunService:
                             record=record,
                             expected_cases_count=len(pairs),
                         )
+                        tech_failures = int(record["evaluation_summary"].get("technical_failure_count", 0))
                         record["status"] = "completed"
+                        if tech_failures > 0 and not record.get("error_code"):
+                            record["error_code"] = "technical_evaluation_failure"
                         record["completed_at"] = done_iso
                         record["current_case_id"] = None
                         record["current_stage"] = "completed"
@@ -2450,6 +2511,12 @@ class GenericRunService:
             enriched_hist_cases.append(c_copy)
         cases = enriched_hist_cases
         record["cases"] = cases
+        record["evaluation_summary"] = build_evaluation_summary(
+            cases,
+            total_cases=ready_count if ready_count >= len(cases) else len(cases),
+            schema_version=record.get("verdict_schema_version"),
+            policy_version=record.get("verdict_policy_version"),
+        )
 
         if not record.get("started_at") and cases:
             first_path = cases[0].get("report_path") if isinstance(cases[0], dict) else None
@@ -2518,7 +2585,13 @@ class GenericRunService:
         if (
             is_multi_session
             or record.get("status") == "interrupted"
-            or (record.get("status") == "completed" and int((record.get("verdict_counts") or {}).get("ERROR", 0)) > 0)
+            or (
+                record.get("status") == "completed"
+                and (
+                    int((record.get("verdict_counts") or {}).get("ERROR", 0)) > 0
+                    or any(c.get("evaluation_status") in TECHNICAL_FAILURE_STATUSES for c in cases)
+                )
+            )
         ):
             cls = self._classify_resume_cases(raw, lineage_info)
             unified = self._build_unified_lineage_view(run_id, raw, record, lineage_info, cls)
@@ -2645,7 +2718,12 @@ class GenericRunService:
                     continue
                 cid = c.get("case_id")
                 verdict = c.get("verdict")
-                if not isinstance(cid, str) or not cid or not isinstance(verdict, str) or not verdict:
+                ev_status = c.get("evaluation_status")
+                valid_c_outcome = (
+                    (isinstance(verdict, str) and bool(verdict))
+                    or (verdict is None and isinstance(ev_status, str) and ev_status in VALID_CASE_EVALUATION_STATUSES)
+                )
+                if not isinstance(cid, str) or not cid or not valid_c_outcome:
                     continue
                 if cid not in unified_cases_by_id:
                     c_copy = dict(c)
@@ -2680,7 +2758,9 @@ class GenericRunService:
         verdict_counter: Counter[str] = Counter()
         evidence_counter: Counter[str] = Counter()
         for c in unified_cases:
-            verdict_counter[str(c["verdict"])] += 1
+            c_verdict = c.get("verdict")
+            if isinstance(c_verdict, str) and c_verdict:
+                verdict_counter[c_verdict] += 1
             ev_lvl = c.get("evidence_level")
             if isinstance(ev_lvl, str) and ev_lvl:
                 evidence_counter[ev_lvl] += 1
@@ -2717,6 +2797,10 @@ class GenericRunService:
 
         # Authoritative logical status distinguishing execution completion from evaluation errors and invalid checkpoints.
         latest_sess = sessions[-1] if sessions else None
+        has_unified_errors = (
+            int(unified_verdict_counts.get("ERROR", 0)) > 0
+            or any(c.get("evaluation_status") in TECHNICAL_FAILURE_STATUSES for c in unified_cases)
+        )
         if state_incomplete:
             if active_id is not None:
                 logical_status = "running"
@@ -2727,7 +2811,7 @@ class GenericRunService:
         elif active_id is not None:
             logical_status = "running"
         elif root_ready_count > 0 and executed_unique >= root_ready_count:
-            logical_status = "completed_with_errors" if int(unified_verdict_counts.get("ERROR", 0)) > 0 else "completed"
+            logical_status = "completed_with_errors" if has_unified_errors else "completed"
         elif latest_sess and latest_sess["status"] in {"interrupted", "cancelled", "failed"}:
             logical_status = latest_sess["status"]
         elif any(s["status"] == "interrupted" for s in sessions):
@@ -2919,6 +3003,19 @@ class GenericRunService:
             "has_resumable_work": has_resumable_work,
         }
 
+        has_eval_or_exec_errors = (
+            int(unified_verdict_counts.get("ERROR", 0)) > 0
+            or any(
+                c.get("evaluation_status") in {"EXECUTION_ERROR", "JUDGE_ERROR"}
+                for c in unified_cases
+            )
+        )
+        unified_evaluation_summary = build_evaluation_summary(
+            unified_cases,
+            total_cases=root_ready_count if root_ready_count >= executed_unique else executed_unique,
+            schema_version=root_doc.get("verdict_schema_version"),
+            policy_version=root_doc.get("verdict_policy_version"),
+        )
         unified_lineage = {
             "logical_scan_id": root_id,
             "root_run_id": root_id,
@@ -2935,7 +3032,9 @@ class GenericRunService:
                 and executed_unique >= root_ready_count
                 and active_id is None
             ),
-            "has_evaluation_errors": int(unified_verdict_counts.get("ERROR", 0)) > 0,
+            "has_evaluation_errors": has_eval_or_exec_errors,
+            "verdict_schema_version": unified_evaluation_summary["schema_version"],
+            "verdict_policy_version": unified_evaluation_summary["policy_version"],
             "started_at": started_at,
             "completed_at": completed_at,
             "session_count": len(sessions),
@@ -2947,6 +3046,7 @@ class GenericRunService:
             "skipped_cases": root_skipped_cases,
             "progress_percent": progress_pct,
             "verdict_counts": unified_verdict_counts,
+            "evaluation_summary": unified_evaluation_summary,
             "evidence_summary": unified_evidence_summary,
             "judge_metadata": unified_judge_metadata,
             "target_requests_used": cumulative_target_requests_used,
@@ -2982,6 +3082,8 @@ class GenericRunService:
         root_doc = lineage_info.get("root_doc") if isinstance(lineage_info.get("root_doc"), dict) else raw
         return {
             "workflow_schema_version": "1.0.0",
+            "verdict_schema_version": ul.get("verdict_schema_version"),
+            "verdict_policy_version": ul.get("verdict_policy_version"),
             "report_kind": "unified_generic_scan_lineage",
             "logical_scan_id": ul["logical_scan_id"],
             "root_run_id": ul["root_run_id"],
@@ -3007,6 +3109,7 @@ class GenericRunService:
             "skipped_count": ul["skipped_count"],
             "recorded_outcomes": ul["executed_cases"],
             "verdict_counts": ul["verdict_counts"],
+            "evaluation_summary": ul.get("evaluation_summary"),
             "evidence_summary": ul["evidence_summary"],
             "target_requests_used": ul["target_requests_used"],
             "judge_requests_used": ul["judge_requests_used"],
@@ -3100,18 +3203,26 @@ class GenericRunService:
                     continue
                 cid = c.get("case_id")
                 verdict = c.get("verdict")
-                if not isinstance(cid, str) or not cid or not isinstance(verdict, str) or not verdict:
+                ev_status = c.get("evaluation_status")
+                has_valid_outcome = (
+                    (isinstance(verdict, str) and bool(verdict))
+                    or (verdict is None and isinstance(ev_status, str) and ev_status in VALID_CASE_EVALUATION_STATUSES)
+                )
+                if not isinstance(cid, str) or not cid or not has_valid_outcome:
                     continue
                 if cid not in lineage_completed_by_case_id:
                     lineage_completed_by_case_id[cid] = {
                         "case_id": cid,
                         "verdict": verdict,
+                        "evaluation_status": ev_status,
+                        "evaluation_reason_code": c.get("evaluation_reason_code"),
                         "run_id": c.get("run_id"),
                         "generic_run_id": rid,
                         "report_path": c.get("report_path"),
                         "category": c.get("category"),
                     }
-                    verdict_counter[verdict] += 1
+                    if isinstance(verdict, str) and verdict:
+                        verdict_counter[verdict] += 1
 
         root_doc = raw_by_id.get(root_id)
         root_statuses = root_doc.get("case_statuses") if (isinstance(root_doc, dict) and isinstance(root_doc.get("case_statuses"), list)) else []
@@ -3188,14 +3299,18 @@ class GenericRunService:
                 return {"valid": False}
             cid = c.get("case_id")
             verdict = c.get("verdict")
+            ev_status = c.get("evaluation_status")
+            valid_outcome = (
+                (isinstance(verdict, str) and verdict in valid_verdicts)
+                or (verdict is None and isinstance(ev_status, str) and ev_status in VALID_CASE_EVALUATION_STATUSES)
+            )
             if (
                 not isinstance(cid, str)
                 or not cid
                 or cid.strip() != cid
                 or cid in completed_in_doc
                 or cid not in status_by_id
-                or not isinstance(verdict, str)
-                or verdict not in valid_verdicts
+                or not valid_outcome
             ):
                 return {"valid": False}
             completed_in_doc[cid] = c
@@ -3958,7 +4073,10 @@ class GenericRunService:
                 "total_cases": rec.get("total_cases", len(cases)),
                 "skipped_count": rec.get("skipped_count", 0),
                 "progress_percent": rec.get("progress_percent", 100),
+                "verdict_schema_version": (rec.get("evaluation_summary") or {}).get("schema_version") or rec.get("verdict_schema_version"),
+                "verdict_policy_version": (rec.get("evaluation_summary") or {}).get("policy_version") or rec.get("verdict_policy_version"),
                 "verdict_counts": rec.get("verdict_counts") or {},
+                "evaluation_summary": rec.get("evaluation_summary"),
                 "evidence_summary": rec.get("evidence_summary") or {},
                 "judge_metadata": rec.get("judge_metadata"),
                 "case_run_ids": [c.get("run_id") for c in cases if isinstance(c, dict) and isinstance(c.get("run_id"), str)],

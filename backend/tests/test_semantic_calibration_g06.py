@@ -273,7 +273,11 @@ def test_task33_conditional_intent_calibration_rubric_and_eight_classes(tmp_path
     )
     by_id = {c["case_id"]: c for c in out["cases"]}
     for cid, _, _, _, _, expected_v, _, expected_invoked in scenarios:
-        assert by_id[cid]["verdict"] == expected_v.value
+        if expected_v is EvaluationStatus.INCONCLUSIVE:
+            assert by_id[cid]["verdict"] is None
+            assert by_id[cid]["evaluation_status"] in {"EXECUTION_ERROR", "EVALUATION_PRECONDITION_UNMET", "POLICY_OR_SCOPE_UNSUPPORTED"}
+        else:
+            assert by_id[cid]["verdict"] == expected_v.value
         assert by_id[cid]["semantic_invoked"] is expected_invoked
         assert by_id[cid]["evidence_level"] in {"response_only", "model_reported_intent"}
 
@@ -375,7 +379,10 @@ def test_task34_four_asi_unseen_synthetic_calibration_and_execution_scope_separa
     )
     by_id = {c["case_id"]: c for c in out["cases"]}
     for cid, _, _, _, _, expected_v, _ in cases_spec:
-        assert by_id[cid]["verdict"] == expected_v.value
+        if expected_v is EvaluationStatus.INCONCLUSIVE:
+            assert by_id[cid]["verdict"] is None
+        else:
+            assert by_id[cid]["verdict"] == expected_v.value
 
     # Execution-scoped ASI02 (agent_run) & ASI05 (execution_action) MUST NOT infer execution from response text / model intent
     tc_exec_asi02 = CoreTestCase(
@@ -713,7 +720,9 @@ def test_task35_synthetic_offline_calibration_contract_and_isolation(tmp_path: P
     assert out["research_provenance"]["judge"]["skill_versions"] == ["1.3.0"]
     assert out["research_provenance"]["judge"]["skill_sha256s"] == [expected_rf_skill.sha256]
     by_case = {c["case_id"]: c for c in out["cases"]}
-    assert by_case["SYN-CAL-05-TRUNC"]["verdict"] == "INCONCLUSIVE"
+    assert by_case["SYN-CAL-05-TRUNC"]["verdict"] is None
+    assert by_case["SYN-CAL-05-TRUNC"]["evaluation_status"] == "EXECUTION_ERROR"
     assert by_case["SYN-CAL-05-TRUNC"]["semantic_invoked"] is False
-    assert by_case["SYN-CAL-06-UNKNOWN-COMPLETE"]["verdict"] == "INCONCLUSIVE"
+    assert by_case["SYN-CAL-06-UNKNOWN-COMPLETE"]["verdict"] is None
+    assert by_case["SYN-CAL-06-UNKNOWN-COMPLETE"]["evaluation_status"] == "EVALUATION_PRECONDITION_UNMET"
     assert by_case["SYN-CAL-06-UNKNOWN-COMPLETE"]["semantic_invoked"] is False

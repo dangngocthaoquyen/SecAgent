@@ -36,6 +36,12 @@ from targets.adapters import (
     McpJsonRpcTargetAdapter,
     OfflineStoredTargetAdapter,
 )
+from evaluators.verdict_outcome import (
+    VERDICT_POLICY_VERSION,
+    VERDICT_SCHEMA_VERSION,
+    build_evaluation_summary,
+    classify_binary_case_outcome,
+)
 from testing.evaluation_config import RunnerEvaluationConfig
 from testing.executor import Executor
 from testing.offline_stored_import import (
@@ -379,16 +385,51 @@ def run_generic_cases(
         report_bytes = (json.dumps(envelope, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
         report_file.write_bytes(report_bytes)
 
-        verdict_counts[result.status.value] += 1
         ev_class = snapshot.get("evidence_classification") or {}
         judge_info = snapshot.get("judge") if isinstance(snapshot.get("judge"), dict) else {}
         obs_info = snapshot.get("observation") if isinstance(snapshot.get("observation"), dict) else {}
+        exec_info = snapshot.get("execution") if isinstance(snapshot.get("execution"), dict) else {}
         prov_info = snapshot.get("research_provenance") if isinstance(snapshot.get("research_provenance"), dict) else {}
         prov_eval = prov_info.get("evaluation") if isinstance(prov_info.get("evaluation"), dict) else {}
         prov_judge = prov_info.get("judge") if isinstance(prov_info.get("judge"), dict) else {}
         resp_text = obs_info.get("response_text")
         raw_fault = judge_info.get("provider_fault_code")
         fault_str = getattr(raw_fault, "value", raw_fault)
+        eff_resp_complete = (
+            obs_info.get("response_complete")
+            if obs_info.get("response_complete") is not None
+            else exec_info.get("response_complete")
+        )
+        corr_info = snapshot.get("correlation") if isinstance(snapshot.get("correlation"), dict) else {}
+        obs_meta_for_integrity = {
+            **corr_info,
+            **(
+                {"target_correlation_id": obs_info.get("target_correlation_id")}
+                if obs_info.get("target_correlation_id")
+                else {}
+            ),
+        }
+        binary_outcome = classify_binary_case_outcome(
+            internal_status=result.status.value,
+            response_text=resp_text if isinstance(resp_text, str) else None,
+            response_complete=eff_resp_complete,
+            execution_status=(
+                "succeeded"
+                if exec_info.get("success") is True
+                else ("failed" if exec_info.get("success") is False else None)
+            ),
+            provider_fault_code=fault_str,
+            json_validation_status=judge_info.get("json_validation_status"),
+            reason=result.reason,
+            downgrade_reason=prov_eval.get("downgrade_reason"),
+            evidence=obs_info.get("evidence") if isinstance(obs_info.get("evidence"), list) else (),
+            evidence_level=result.evidence_level or ev_class.get("evidence_level"),
+            execution_verified=ev_class.get("verified_execution_present"),
+            evidence_v2=snapshot.get("evidence_v2"),
+            observation_metadata=obs_meta_for_integrity,
+        )
+        if binary_outcome["verdict"] in {"PASS", "FAIL"}:
+            verdict_counts[binary_outcome["verdict"]] += 1
         case_summary = {
             "case_id": testcase.id,
             "run_id": run_id,
@@ -396,7 +437,12 @@ def run_generic_cases(
             "category": testcase.category,
             "payload_ref": test_input.payload_ref,
             "sent_payload_sha256": sent_payload_sha256,
-            "verdict": result.status.value,
+            "verdict": binary_outcome["verdict"],
+            "evaluation_status": binary_outcome["evaluation_status"],
+            "evaluation_reason_code": binary_outcome["evaluation_reason_code"],
+            "evidence_limitations": binary_outcome["evidence_limitations"],
+            "verdict_schema_version": VERDICT_SCHEMA_VERSION,
+            "verdict_policy_version": VERDICT_POLICY_VERSION,
             "reason": runner.redact_report_value(target, result.reason),
             "decision_source": prov_eval.get("decision_source"),
             "deterministic_verdict": prov_eval.get("deterministic_verdict"),
@@ -463,7 +509,9 @@ def run_generic_cases(
         ),
     )
     batch_summary = {
-        "schema_version": "secagent.generic_batch.v1",
+        "schema_version": "secagent.generic_batch.v2",
+        "verdict_schema_version": VERDICT_SCHEMA_VERSION,
+        "verdict_policy_version": VERDICT_POLICY_VERSION,
         "batch_id": batch_id,
         "mode": mode,
         "target_id": target.id,
@@ -471,6 +519,12 @@ def run_generic_cases(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "total_cases": len(case_summaries),
         "verdict_counts": dict(sorted(verdict_counts.items())),
+        "evaluation_summary": build_evaluation_summary(
+            case_summaries,
+            total_cases=len(case_summaries),
+            schema_version=VERDICT_SCHEMA_VERSION,
+            policy_version=VERDICT_POLICY_VERSION,
+        ),
         "research_provenance": run_provenance,
         "cases": case_summaries,
     }

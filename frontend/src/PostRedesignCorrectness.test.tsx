@@ -75,7 +75,9 @@ function makeRunRecord(cases: GenericRunCaseResult[], overrides?: Partial<Generi
   const vc: Record<string, number> = { PASS: 0, FAIL: 0, INCONCLUSIVE: 0, ERROR: 0 };
   const es: Record<string, number> = {};
   for (const c of cases) {
-    vc[c.verdict] = (vc[c.verdict] ?? 0) + 1;
+    if (c.verdict) {
+      vc[c.verdict] = (vc[c.verdict] ?? 0) + 1;
+    }
     if (c.evidence_level) {
       es[c.evidence_level] = (es[c.evidence_level] ?? 0) + 1;
     }

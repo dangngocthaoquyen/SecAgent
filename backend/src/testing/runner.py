@@ -23,6 +23,11 @@ from core.models import (
 from evaluators import BaseEvaluator
 from evaluators.contract import assess_target_scope_compatibility
 from evaluators.evidence_v2_evaluator import build_evaluation_explanation
+from evaluators.verdict_outcome import (
+    VERDICT_POLICY_VERSION,
+    VERDICT_SCHEMA_VERSION,
+    classify_binary_case_outcome,
+)
 from evaluators.hybrid_evaluator import apply_heuristic_sufficiency
 from core.evidence_v2 import build_evidence_contract_v2
 from core.models.evidence import (
@@ -597,7 +602,38 @@ class Runner:
                 **evaluation_explanation,
                 "summary": final["reason"],
             }
+        raw_diag_fault = diagnostic.get("provider_fault_code") if isinstance(diagnostic, dict) else None
+        obs_complete = (
+            observed.metadata.get("response_complete")
+            if observed is not None and observed.metadata.get("response_complete") is not None
+            else (executed.response_complete if executed is not None else None)
+        )
+        binary_outcome = classify_binary_case_outcome(
+            internal_status=result.status.value,
+            response_text=(observed.response_text if observed is not None else None),
+            response_complete=obs_complete,
+            execution_status=("succeeded" if executed is not None and executed.success else "failed" if executed is not None else None),
+            provider_fault_code=getattr(raw_diag_fault, "value", raw_diag_fault),
+            json_validation_status=(diagnostic.get("json_validation_status") if isinstance(diagnostic, dict) else None),
+            reason=result.reason,
+            downgrade_reason=top_downgrade_reason,
+            evidence=(observed.evidence if observed is not None else ()),
+            evidence_level=result.evidence_level,
+            execution_verified=(
+                evidence_v2_payload.get("verified_execution_present")
+                if isinstance(evidence_v2_payload, dict)
+                else None
+            ),
+            evidence_v2=evidence_v2_payload,
+            observation_metadata=(observed.metadata if observed is not None else None),
+        )
         report = {
+            "verdict_schema_version": VERDICT_SCHEMA_VERSION,
+            "verdict_policy_version": VERDICT_POLICY_VERSION,
+            "security_verdict": binary_outcome["verdict"],
+            "evaluation_status": binary_outcome["evaluation_status"],
+            "evaluation_reason_code": binary_outcome["evaluation_reason_code"],
+            "evidence_limitation_codes": binary_outcome["evidence_limitations"],
             "run_id": self._current_run_id or uuid4().hex, "timestamp": datetime.now(timezone.utc).isoformat(),
             "target_id": getattr(target, "id", None), "target_name": getattr(target, "name", None), "testcase_id": testcase.id,
             "input_id": test_input.id,
