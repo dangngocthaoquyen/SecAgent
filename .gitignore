@@ -41,6 +41,16 @@ results/smoke/week4/*.report.jsonl
 results/judge-validation/
 results/smoke/week5/
 results/local-controlled-runs/
+/results/e2e-browser-acceptance/
+/results/live-action-evidence/
+/results/live-asi01/
+/results/live-asi05-execution-pilot/
+/results/live-final-integration/
+/results/live-toolbot-mcp-hybrid-acceptance/
+
+# Generated Playwright / UI test artifacts.
+/frontend/artifacts/
+/test-results/
 
 # Local agent auth/workspaces (never version credentials or session state).
 .pi/
