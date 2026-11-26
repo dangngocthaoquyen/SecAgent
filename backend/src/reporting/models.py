@@ -401,6 +401,7 @@ class ExecutionReport(BaseReport):
     execution_evaluation: ExecutionAssessment | None = None
     submitted_payload_preview: Text | None = None
     evidence_classification: dict[str, Any] | None = None
+    evidence_v2: dict[str, Any] | None = None
     collector_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
     research_provenance: dict[str, Any] | None = None
 

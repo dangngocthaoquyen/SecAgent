@@ -6,6 +6,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from core.evidence_v2 import project_public_evidence_v2, project_v1_report_to_evidence_v2
 from reporting.models import (
     ArchivedAssessmentReport, Citation, Comparison, Completeness, Context, DeterministicResult,
     ExecutionReport, ExecutionState, ExecutionAssessment, HistoricalIntegrityClaims, HistoricalResult, HistoricalSecurity, HumanReference,
@@ -358,6 +359,15 @@ def _native(document, source, r):
             "provenance_tiers": [r.clean(str(t)) for t in e["evidence_classification"].get("provenance_tiers", []) if isinstance(t, str)],
             "verified_execution_present": bool(e["evidence_classification"].get("verified_execution_present", False)),
         } if isinstance(e.get("evidence_classification"), dict) else None),
+        evidence_v2=(
+            project_public_evidence_v2(
+                e["evidence_v2"],
+                sensitive_values=r.values,
+                include_response_preview=False,
+            )
+            if e.get("evidence_v2") is not None
+            else None
+        ),
         collector_diagnostics=([
             {
                 "collector_id": r.clean(str(row.get("collector_id") or "")),

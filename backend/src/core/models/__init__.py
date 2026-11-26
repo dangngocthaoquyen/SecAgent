@@ -19,6 +19,17 @@ from core.models.testcase import (
     TestCaseTaxonomy,
 )
 from core.models.evidence import Evidence
+from core.models.evidence_v2 import (
+    EVIDENCE_CONTRACT_V2_VERSION,
+    CorrelationContextV2,
+    EvidenceContractV2,
+    EvidenceFindingV2,
+    ExecutionObservationRecordV2,
+    ObservationCoverageV2,
+    ResponseObservationV2,
+    ScopeAlignmentV2,
+    ToolIntentRecordV2,
+)
 
 __all__ = [
     "EvaluationConfig",
@@ -36,5 +47,14 @@ __all__ = [
     "TestCase",
     "TestCaseTaxonomy",
     "EvaluationRule",
-    "Evidence"
+    "Evidence",
+    "EVIDENCE_CONTRACT_V2_VERSION",
+    "CorrelationContextV2",
+    "EvidenceContractV2",
+    "EvidenceFindingV2",
+    "ExecutionObservationRecordV2",
+    "ObservationCoverageV2",
+    "ResponseObservationV2",
+    "ScopeAlignmentV2",
+    "ToolIntentRecordV2",
 ]

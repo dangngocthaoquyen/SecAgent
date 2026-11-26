@@ -23,6 +23,7 @@ from core.models import (
 from evaluators import BaseEvaluator
 from evaluators.contract import assess_target_scope_compatibility
 from evaluators.hybrid_evaluator import apply_heuristic_sufficiency
+from core.evidence_v2 import build_evidence_contract_v2
 from core.models.evidence import (
     PROVENANCE_RANK,
     canonical_provenance,
@@ -482,6 +483,54 @@ class Runner:
             if diagnostic and diagnostic.get("downgrade_reason")
             else research_prov["evaluation"]["downgrade_reason"]
         )
+        effective_scope_v2 = context.get("evaluation_scope")
+        if not isinstance(effective_scope_v2, str) or not effective_scope_v2.strip():
+            rp_meta = (
+                test_input.metadata.get("evaluation_rule_provenance")
+                if isinstance(test_input.metadata, dict)
+                else None
+            )
+            if isinstance(rp_meta, dict) and isinstance(rp_meta.get("evaluation_scope"), str):
+                effective_scope_v2 = rp_meta["evaluation_scope"].strip() or None
+            else:
+                effective_scope_v2 = None
+        else:
+            effective_scope_v2 = effective_scope_v2.strip()
+        evidence_v2_payload = None
+        if observed is not None:
+            try:
+                evidence_v2_payload = build_evidence_contract_v2(
+                    observation=observed,
+                    execution_result=executed,
+                    effective_scope=effective_scope_v2,
+                    run_id=self._current_run_id,
+                    execution_id=test_input.id,
+                    testcase_id=testcase.id,
+                    target_id=getattr(target, "id", None),
+                    request_id=(
+                        str(test_input.parameters.get("request_id"))
+                        if isinstance(test_input.parameters, dict) and test_input.parameters.get("request_id")
+                        else None
+                    ),
+                    session_id=(
+                        str(test_input.parameters.get("session_id"))
+                        if isinstance(test_input.parameters, dict) and test_input.parameters.get("session_id")
+                        else None
+                    ),
+                    collector_diagnostics=self._collector_diagnostics,
+                    sensitive_values=self._judge_sensitive_values(target),
+                    include_response_preview=False,
+                ).model_dump(mode="json")
+            except Exception:
+                evidence_v2_payload = {
+                    "contract_version": "2.0",
+                    "availability": "unavailable",
+                    "verified_execution_present": False,
+                    "reason_codes": ["evidence_v2_construction_failed"],
+                    "limitations": [
+                        "Evidence Contract v2 could not be constructed; existing report fields and verdict were preserved."
+                    ],
+                }
         report = {
             "run_id": self._current_run_id or uuid4().hex, "timestamp": datetime.now(timezone.utc).isoformat(),
             "target_id": getattr(target, "id", None), "target_name": getattr(target, "name", None), "testcase_id": testcase.id,
@@ -533,6 +582,7 @@ class Runner:
             "evidence_classification": None if observed is None else classify_observation_evidence(
                 observed.evidence, observed.response_text
             ),
+            "evidence_v2": evidence_v2_payload,
             "research_provenance": research_prov,
             "downgrade_reason": top_downgrade_reason,
             "judge_budget": None if self._budget is None else {
@@ -642,6 +692,22 @@ class Runner:
         "session_auth_type",
         "session_auth_header",
         "session_credential_generation",
+        "contract_version",
+        "projection_origin",
+        "effective_evaluation_scope",
+        "verified_execution_status",
+        "highest_trust_classification",
+        "trust_classification",
+        "action_trace_completeness",
+        "request_trace_completeness",
+        "response_completeness",
+        "action_presence",
+        "refusal_state",
+        "scope_family",
+        "alignment_status",
+        "execution_kind",
+        "intent_origin",
+        "explicit_refusal",
     })
     _PRESERVED_VALUE_SUFFIXES = ("_sha256", "_fingerprint", "_digest")
     _DYNAMIC_KEY_CONTAINERS = frozenset({"data", "stored_provenance", "extra", "response_sample"})
