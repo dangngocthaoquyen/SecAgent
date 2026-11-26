@@ -22,6 +22,7 @@ from core.models import (
 )
 from evaluators import BaseEvaluator
 from evaluators.contract import assess_target_scope_compatibility
+from evaluators.evidence_v2_evaluator import build_evaluation_explanation
 from evaluators.hybrid_evaluator import apply_heuristic_sufficiency
 from core.evidence_v2 import build_evidence_contract_v2
 from core.models.evidence import (
@@ -109,6 +110,7 @@ class Runner:
         self._submitted_prompt: str | None = None
         self._raw_deterministic_result: EvaluationResult | None = None
         self._effective_deterministic_result: EvaluationResult | None = None
+        self._evidence_v2_payload: dict[str, Any] | None = None
         self.last_report = None
         self._attack_module_registry = (
             attack_module_registry
@@ -127,6 +129,7 @@ class Runner:
         self._collector_diagnostics.clear()
         self._execution_result = self._observation = None
         self._raw_deterministic_result = self._effective_deterministic_result = None
+        self._evidence_v2_payload = None
         self._current_run_id = uuid4().hex
         self._started_at = datetime.now(timezone.utc).isoformat()
         self._ended_at = None
@@ -290,6 +293,43 @@ class Runner:
                 reason="Observation stage failed.",
             )
 
+        # Build Evidence Contract v2 after observation and before evaluation so
+        # Judge-centric evaluators can use verified v2 facts while preserving
+        # fail-safe v1 fallback on any construction error.
+        try:
+            self._evidence_v2_payload = build_evidence_contract_v2(
+                observation=observation,
+                execution_result=execution_result,
+                effective_scope=declared_scope,
+                run_id=self._current_run_id,
+                execution_id=test_input.id,
+                testcase_id=testcase.id,
+                target_id=getattr(target, "id", None),
+                request_id=(
+                    str(test_input.parameters.get("request_id"))
+                    if isinstance(test_input.parameters, dict) and test_input.parameters.get("request_id")
+                    else None
+                ),
+                session_id=(
+                    str(test_input.parameters.get("session_id"))
+                    if isinstance(test_input.parameters, dict) and test_input.parameters.get("session_id")
+                    else None
+                ),
+                collector_diagnostics=self._collector_diagnostics,
+                sensitive_values=self._judge_sensitive_values(target),
+                include_response_preview=False,
+            ).model_dump(mode="json")
+        except Exception:
+            self._evidence_v2_payload = {
+                "contract_version": "2.0",
+                "availability": "unavailable",
+                "verified_execution_present": False,
+                "reason_codes": ["evidence_v2_construction_failed"],
+                "limitations": [
+                    "Evidence Contract v2 could not be constructed; existing report fields and verdict were preserved."
+                ],
+            }
+
         try:
             rule_prov = (
                 test_input.metadata.get("evaluation_rule_provenance")
@@ -304,7 +344,8 @@ class Runner:
                 evaluated = self._evaluator.evaluate(testcase, observation,
                     prepared_prompt=(prepared_prompt if self._reviewed_judge_input_sha256 else None),
                     reviewed_input_sha256=self._reviewed_judge_input_sha256,
-                    sensitive_values=self._judge_sensitive_values(target))
+                    sensitive_values=self._judge_sensitive_values(target),
+                    evidence_v2=self._evidence_v2_payload)
                 if is_reviewed_policy_rules and not (testcase.evaluation.semantic and testcase.evaluation.semantic.enabled):
                     evaluated = apply_heuristic_sufficiency(testcase, evaluated)
             else:
@@ -325,7 +366,7 @@ class Runner:
                     and final_evaluated.status is EvaluationStatus.PASS
                     and observation.metadata.get("response_complete") is not True):
                 verified_exec_pass = (
-                    final_evaluated.matched_rule_type == "asi05_execution"
+                    final_evaluated.matched_rule_type in {"asi05_execution", "evidence_v2_verified_absence"}
                     or (
                         final_evaluated.matched_rule_type == "tool_call"
                         and observation.metadata.get("response_complete") is not False
@@ -341,7 +382,12 @@ class Runner:
                     and final_evaluated.status is EvaluationStatus.FAIL
                     and observation.metadata.get("response_complete") is not True):
                 verified_exec_fail = (
-                    final_evaluated.matched_rule_type in {"collector_receipt", "asi05_execution"}
+                    final_evaluated.matched_rule_type in {
+                        "collector_receipt",
+                        "asi05_execution",
+                        "evidence_v2_execution",
+                        "evidence_v2_simulated_execution",
+                    }
                     or (
                         final_evaluated.matched_rule_type == "tool_call"
                         and classify_observation_evidence(
@@ -496,8 +542,8 @@ class Runner:
                 effective_scope_v2 = None
         else:
             effective_scope_v2 = effective_scope_v2.strip()
-        evidence_v2_payload = None
-        if observed is not None:
+        evidence_v2_payload = self._evidence_v2_payload
+        if evidence_v2_payload is None and observed is not None:
             try:
                 evidence_v2_payload = build_evidence_contract_v2(
                     observation=observed,
@@ -531,6 +577,24 @@ class Runner:
                         "Evidence Contract v2 could not be constructed; existing report fields and verdict were preserved."
                     ],
                 }
+        evaluation_explanation = (
+            diagnostic.get("evaluation_explanation")
+            if diagnostic and isinstance(diagnostic.get("evaluation_explanation"), dict)
+            else build_evaluation_explanation(
+                testcase=testcase,
+                result=result,
+                observation=observed,
+                evidence_v2=evidence_v2_payload,
+                effective_scope=effective_scope_v2,
+                semantic_judge_used=bool(diagnostic and diagnostic.get("semantic_invoked")),
+                asi05_execution_used=bool(diagnostic and diagnostic.get("execution_evaluation") is not None),
+            ).model_dump(mode="json")
+        )
+        if executed is not None and not executed.success and isinstance(evaluation_explanation, dict):
+            evaluation_explanation = {
+                **evaluation_explanation,
+                "summary": final["reason"],
+            }
         report = {
             "run_id": self._current_run_id or uuid4().hex, "timestamp": datetime.now(timezone.utc).isoformat(),
             "target_id": getattr(target, "id", None), "target_name": getattr(target, "name", None), "testcase_id": testcase.id,
@@ -583,6 +647,7 @@ class Runner:
                 observed.evidence, observed.response_text
             ),
             "evidence_v2": evidence_v2_payload,
+            "evaluation_explanation": evaluation_explanation,
             "research_provenance": research_prov,
             "downgrade_reason": top_downgrade_reason,
             "judge_budget": None if self._budget is None else {
@@ -708,6 +773,8 @@ class Runner:
         "execution_kind",
         "intent_origin",
         "explicit_refusal",
+        "evidence_sufficiency",
+        "outcome_reasoning_code",
     })
     _PRESERVED_VALUE_SUFFIXES = ("_sha256", "_fingerprint", "_digest")
     _DYNAMIC_KEY_CONTAINERS = frozenset({"data", "stored_provenance", "extra", "response_sample"})

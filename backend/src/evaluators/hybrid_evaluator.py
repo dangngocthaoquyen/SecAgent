@@ -1,14 +1,21 @@
 """Opt-in rule-first evaluator with a separate external recommendation boundary."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Callable
+from typing import Any, Callable
 
 from core.models import EvaluationResult, EvaluationStatus, Observation, TestCase
 from core.models.asi05_execution import Asi05ExecutionDecision
 from core.models.evidence import classify_observation_evidence, is_execution_verified
+from core.models.evidence_v2 import EvidenceContractV2
 from evaluators.base import BaseEvaluator
 from evaluators.asi05_execution import ExecutionEvidenceRejected
 from evaluators.evaluation_request_builder import EvaluationRequestBuilder, JudgeInputRejected
+from evaluators.evidence_v2_evaluator import (
+    build_evaluation_explanation,
+    enforce_evidence_v2_judge_boundaries,
+    evaluate_with_evidence_v2,
+)
 from evaluators.response_evaluator import ResponseEvaluator
 from evaluators.verdict_resolver import (
     has_verified_context_revision,
@@ -78,6 +85,7 @@ class HybridEvaluationDiagnostic:
     downgrade_reason: str | None = None
     execution_evaluation: dict | None = None
     evidence_classification: dict | None = None
+    evaluation_explanation: dict | None = None
 
 
 class HybridEvaluator(BaseEvaluator):
@@ -89,22 +97,30 @@ class HybridEvaluator(BaseEvaluator):
         request_builder: EvaluationRequestBuilder | None = None,
         diagnostic_sink: Callable[[HybridEvaluationDiagnostic], None] | None = None,
         require_complete_response_for_semantic: bool = False,
+        prefer_deterministic_v2: bool = True,
     ) -> None:
         self._provider = provider
         self._deterministic = deterministic or ResponseEvaluator()
         self._request_builder = request_builder or EvaluationRequestBuilder()
         self._diagnostic_sink = diagnostic_sink
         self._require_complete_response_for_semantic = require_complete_response_for_semantic
+        self._prefer_deterministic_v2 = prefer_deterministic_v2
 
     def evaluate(self, testcase: TestCase, observation: Observation, *,
                  prepared_prompt: str | None = None,
                  reviewed_input_sha256: str | None = None,
-                 sensitive_values: tuple[str, ...] = ()) -> EvaluationResult:
+                 sensitive_values: tuple[str, ...] = (),
+                 evidence_v2: EvidenceContractV2 | Mapping[str, Any] | None = None) -> EvaluationResult:
         baseline = self._deterministic.evaluate(testcase, observation)
         semantic = testcase.evaluation.semantic
         if (testcase.category == "unexpected_code_execution"
                 and semantic is not None
-                and semantic.trusted_context.get("evaluation_scope") == "execution_action"):
+                and semantic.trusted_context.get("evaluation_scope") == "execution_action"
+                and (
+                    testcase.evaluation.strategy == "action"
+                    or "asi05_execution_policy" in semantic.trusted_context
+                    or evidence_v2 is None
+                )):
             try:
                 execution_request = self._request_builder.build_execution(testcase, observation)
                 decision = resolve_asi05_execution(execution_request)
@@ -127,22 +143,70 @@ class HybridEvaluator(BaseEvaluator):
                 status=decision.verdict, reason=decision.rationale,
                 evidence=decision.evidence_references[0] if decision.evidence_references else None,
                 matched_rule_type="asi05_execution" if decision.verdict is not EvaluationStatus.INCONCLUSIVE else None)
+            expl = build_evaluation_explanation(
+                testcase=testcase,
+                result=result,
+                observation=observation,
+                evidence_v2=evidence_v2,
+                semantic_judge_used=False,
+                asi05_execution_used=True,
+            ).model_dump(mode="json")
             self._record(HybridEvaluationDiagnostic(
                 testcase.id, baseline.status, result.status, False,
                 execution_evaluation=decision.model_dump(mode="json"),
+                evaluation_explanation=expl,
             ), baseline, result)
             return result
         # With no semantic opt-in, injection must preserve rule-only behavior.
         # Sufficiency checks below apply only when a semantic fallback is enabled.
         effective = (self._sufficient_result(testcase, observation, baseline)
                      if semantic is not None and semantic.enabled else baseline)
-        if effective.status is not EvaluationStatus.INCONCLUSIVE or semantic is None or not semantic.enabled:
-            self._record(HybridEvaluationDiagnostic(
-                testcase.id, baseline.status, effective.status, False,
-            ), baseline, effective)
-            return effective
 
         ev_class = classify_observation_evidence(observation.evidence, observation.response_text)
+
+        # Evidence Contract v2 deterministic Judge-centric gate: resolves decisive
+        # PASS/FAIL (refusal in complete response-only scope, verified runtime/simulated
+        # violation, verified absence in complete boundary) and blocks wasted Judge calls
+        # on contradicted / cross-run / scope-mismatched / incomplete execution evidence.
+        if evidence_v2 is not None:
+            v2_decision = evaluate_with_evidence_v2(
+                testcase,
+                observation,
+                evidence_v2,
+                deterministic_baseline=effective,
+                raw_baseline=baseline,
+                allow_response_refusal_pass=self._prefer_deterministic_v2,
+            )
+            expl_dict = v2_decision.explanation.model_dump(mode="json")
+            if v2_decision.decisive or not v2_decision.allow_semantic_fallback or semantic is None or not semantic.enabled:
+                self._record(HybridEvaluationDiagnostic(
+                    testcase.id,
+                    baseline.status,
+                    v2_decision.result.status,
+                    False,
+                    downgrade_reason=(
+                        v2_decision.explanation.outcome_reasoning_code
+                        if v2_decision.result.status is EvaluationStatus.INCONCLUSIVE
+                        else None
+                    ),
+                    evidence_classification=ev_class,
+                    evaluation_explanation=expl_dict,
+                ), baseline, v2_decision.result)
+                return v2_decision.result
+
+        if effective.status is not EvaluationStatus.INCONCLUSIVE or semantic is None or not semantic.enabled:
+            expl = build_evaluation_explanation(
+                testcase=testcase,
+                result=effective,
+                observation=observation,
+                evidence_v2=evidence_v2,
+                semantic_judge_used=False,
+            ).model_dump(mode="json")
+            self._record(HybridEvaluationDiagnostic(
+                testcase.id, baseline.status, effective.status, False,
+                evaluation_explanation=expl,
+            ), baseline, effective)
+            return effective
         # Category and skill must agree; never select a rubric from response data.
         if semantic.skill != testcase.category:
             self._record(HybridEvaluationDiagnostic(
@@ -249,11 +313,27 @@ class HybridEvaluator(BaseEvaluator):
             ), baseline, effective)
             return effective
         resolved = resolve_verdict(effective, outcome, request, observation, testcase)
+        boundary_override_code = None
+        if evidence_v2 is not None:
+            resolved, boundary_override_code = enforce_evidence_v2_judge_boundaries(
+                resolved,
+                testcase,
+                observation,
+                evidence_v2,
+            )
         recommendation, validation_fault = validated_recommendation(outcome, request)
         blocked_before_provider = validation_fault in {
             ProviderFaultCode.JUDGE_DISABLED,
             ProviderFaultCode.BUDGET_EXHAUSTED,
         }
+        expl = build_evaluation_explanation(
+            testcase=testcase,
+            result=resolved,
+            observation=observation,
+            evidence_v2=evidence_v2,
+            semantic_judge_used=(not blocked_before_provider),
+            outcome_reasoning_code=boundary_override_code,
+        ).model_dump(mode="json")
         self._record(HybridEvaluationDiagnostic(
             testcase.id, baseline.status, resolved.status, not blocked_before_provider,
             request.sha256, request.skill.version, request.skill.sha256,
@@ -269,6 +349,7 @@ class HybridEvaluator(BaseEvaluator):
             provider_exit_code=outcome.exit_code,
             downgrade_reason=resolved.reason if recommendation and recommendation.verdict != resolved.status else None,
             evidence_classification=ev_class,
+            evaluation_explanation=expl,
         ), baseline, effective)
         return resolved
 

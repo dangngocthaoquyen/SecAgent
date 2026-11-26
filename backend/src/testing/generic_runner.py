@@ -420,6 +420,11 @@ def run_generic_cases(
             "evidence_level": result.evidence_level or ev_class.get("evidence_level"),
             "provenance_tiers": result.evidence_provenance or ev_class.get("provenance_tiers", []),
             **({"evidence_v2": snapshot["evidence_v2"]} if isinstance(snapshot.get("evidence_v2"), dict) else {}),
+            **(
+                {"evaluation_explanation": snapshot["evaluation_explanation"]}
+                if isinstance(snapshot.get("evaluation_explanation"), dict)
+                else {}
+            ),
             "collector_diagnostics": snapshot.get("collector_diagnostics", []),
             "research_provenance": snapshot.get("research_provenance"),
             **({"stored_provenance": stored_prov} if stored_prov is not None else {}),

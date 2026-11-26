@@ -23,6 +23,7 @@ class RunnerEvaluationConfig(BaseModel):
     max_judge_calls: int = Field(default=0, ge=0, strict=True)
     pi: PiEvaluatorConfig | None = None
     require_complete_response_for_semantic: bool = Field(default=False, strict=True)
+    prefer_deterministic_v2: bool = Field(default=False, strict=True)
 
     @model_validator(mode="after")
     def explicit_activation(self):
@@ -116,4 +117,5 @@ def configured_evaluator(config, provider, diagnostic_sink, *, bundle_loader=Non
         request_builder=request_builder,
         diagnostic_sink=diagnostic_sink,
         require_complete_response_for_semantic=config.require_complete_response_for_semantic,
+        prefer_deterministic_v2=config.prefer_deterministic_v2,
     ), budget

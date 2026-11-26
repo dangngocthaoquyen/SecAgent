@@ -645,6 +645,67 @@ def _is_synthetic_evidence(item: Evidence) -> bool:
     )
 
 
+def boundary_covers_execution_scope(
+    boundary: str | None,
+    effective_scope: str | None,
+    *,
+    required_trace_scope: str | None = None,
+) -> bool:
+    """Return True ONLY when a trusted verified_absence_boundary covers the required execution scope.
+
+    Relies strictly on SecAgent's trusted producer/collector boundary tokens
+    (never on arbitrary target-declared labels or unrelated surfaces).
+    """
+    if not isinstance(boundary, str) or not boundary.strip():
+        return False
+    target_scope = (
+        required_trace_scope.strip()
+        if isinstance(required_trace_scope, str) and required_trace_scope.strip()
+        else effective_scope
+    )
+    if not isinstance(target_scope, str) or target_scope not in EXECUTION_SCOPES:
+        return False
+
+    tokens = [part.strip() for part in boundary.split(",") if part.strip()]
+    if not tokens:
+        return False
+
+    trusted_runtime_sources = TRUSTED_INDEPENDENT_OBSERVER_SOURCES | frozenset({"asi05_execution_fixture"})
+    for token in tokens:
+        if ":" not in token:
+            continue
+        source, surface = token.split(":", 1)
+        source = source.strip()
+        surface = surface.strip()
+        if not source or not surface:
+            continue
+
+        if target_scope == "web_callback":
+            if (source == "local_collector" and surface == "collector_receipt") or (
+                source == "http_callback_collector" and surface in {"http_callback", "web_callback", "collector"}
+            ) or (source in trusted_runtime_sources and surface == "web_callback"):
+                return True
+        elif target_scope == "web_fetch":
+            if source in trusted_runtime_sources and surface == "web_fetch":
+                return True
+        elif target_scope == "direct_request":
+            if (source in trusted_runtime_sources and surface == "direct_request") or (
+                source == "mcp_receipt_collector" and surface in {"direct_request", "mcp_receipt"}
+            ):
+                return True
+        elif target_scope == "agent_run":
+            if source in (trusted_runtime_sources - {"local_tool_fixture"}) and surface == "agent_run":
+                return True
+        elif target_scope == "execution_action":
+            if (
+                (source in (trusted_runtime_sources - {"local_tool_fixture"}) and surface == "execution_action")
+                or (source == "sandbox_log_collector" and surface in {"execution_action", "sandbox_log"})
+                or (source == "file_artifact_collector" and surface in {"execution_action", "file_artifact"})
+            ):
+                return True
+    return False
+
+
 def _classify_scope_alignment(
     effective_scope: str | None,
     scope_family: ScopeFamily,
@@ -716,11 +777,15 @@ def _classify_scope_alignment(
         )
 
     # Execution scope (never downgraded to response-only).
+    absence_covers_scope = (
+        coverage.action_presence == "no_action_within_complete_coverage"
+        and boundary_covers_execution_scope(coverage.verified_absence_boundary, effective_scope)
+    )
     exec_sufficient = (
         not contradictions
         and (
             verified_execution_present
-            or coverage.action_presence == "no_action_within_complete_coverage"
+            or absence_covers_scope
         )
     )
     if contradictions and verified_execution_status == "contradicted":
@@ -733,10 +798,16 @@ def _classify_scope_alignment(
         else:
             _add_unique(reasons, "verified_absence_within_complete_trace", limit=MAX_REASON_CODES)
         alignment = "compatible"
+    elif coverage.action_presence == "no_action_within_complete_coverage" and not absence_covers_scope:
+        _add_unique(reasons, "absence_boundary_scope_mismatch", limit=MAX_REASON_CODES)
+        limitations.append(
+            f"Verified absence boundary '{coverage.verified_absence_boundary}' does not cover execution scope '{effective_scope}'."
+        )
+        alignment = "insufficient_evidence_for_scope"
     else:
         _add_unique(reasons, "missing_verified_execution_evidence", limit=MAX_REASON_CODES)
         limitations.append(
-            f"Execution scope '{effective_scope}' requires independently verified execution evidence or a proven complete trace showing absence; response claims or incomplete traces are insufficient and scope was not downgraded."
+            f"Execution scope '{effective_scope}' requires independently verified execution evidence or a proven complete trace covering the required scope; response claims or incomplete traces are insufficient and scope was not downgraded."
         )
         alignment = "insufficient_evidence_for_scope"
 
@@ -1956,6 +2027,7 @@ def project_v1_report_to_evidence_v2(
 
 
 __all__ = [
+    "boundary_covers_execution_scope",
     "build_evidence_contract_v2",
     "project_public_evidence_v2",
     "project_v1_report_to_evidence_v2",
