@@ -62,6 +62,7 @@ class Runner:
         allowed_collector_roots: tuple[Path, ...] = (),
         allowed_collector_endpoints: tuple[str, ...] = (),
         include_submitted_prompt_preview: bool = False,
+        extra_sensitive_values: Sequence[str] = (),
     ) -> None:
         self._executor = executor if executor is not None else Executor()
         self._observer = observer if observer is not None else ResponseObserver()
@@ -97,6 +98,9 @@ class Runner:
         self._allowed_collector_roots = tuple(allowed_collector_roots)
         self._allowed_collector_endpoints = tuple(allowed_collector_endpoints)
         self._include_submitted_prompt_preview = include_submitted_prompt_preview
+        self._extra_sensitive_values = tuple(
+            v for v in (extra_sensitive_values or ()) if isinstance(v, str) and v
+        )
         self._collector_diagnostics: list[CollectorDiagnostic] = []
         self._current_run_id: str | None = None
         self._started_at: str | None = None
@@ -357,9 +361,12 @@ class Runner:
             )
 
     def _judge_sensitive_values(self, target) -> tuple[str, ...]:
-        from targets.validator import parse_header_credential_placeholder
+        from targets.validator import parse_header_credential_reference
 
-        names = list(target.credential_refs)
+        names = [
+            ref for ref in target.credential_refs
+            if isinstance(ref, str) and not ref.startswith("sess_")
+        ]
         if self._evaluation_config.pi:
             names.extend(self._evaluation_config.pi.credential_env)
         for spec in getattr(target, "evidence_sources", []) or []:
@@ -367,11 +374,11 @@ class Runner:
                 for raw_val in spec["headers"].values():
                     if isinstance(raw_val, str):
                         try:
-                            parsed = parse_header_credential_placeholder(raw_val)
+                            parsed = parse_header_credential_reference(raw_val)
                         except ValueError:
                             parsed = None
-                        if parsed is not None:
-                            names.append(parsed[1])
+                        if parsed is not None and parsed[0] == "env":
+                            names.append(parsed[2])
         values = set()
         for name in names:
             raw_secret = os.environ.get(name)
@@ -379,6 +386,14 @@ class Runner:
                 values.add(raw_secret)
                 if raw_secret.strip():
                     values.add(raw_secret.strip())
+        for extra in self._extra_sensitive_values:
+            values.add(extra)
+            if extra.strip():
+                values.add(extra.strip())
+                if extra.strip().lower().startswith("bearer "):
+                    stripped = extra.strip()[7:].strip()
+                    if stripped:
+                        values.add(stripped)
         if self._evaluation_config.pi and self._evaluation_config.pi.use_pi_auth_file:
             auth_path = Path.home() / ".pi" / "agent" / "auth.json"
             if auth_path.is_file():
@@ -545,23 +560,185 @@ class Runner:
                     else {}
                 ),
             }}
-        # Redact configured credential values even if a response/reason echoes
-        # them. Arbitrary private target data still requires caller data policy.
-        return self.redact_report_value(target, report)
+        # Redact configured credential values in untrusted runtime-derived fields
+        # while preserving trusted framework structural keys, enums, IDs, and SHA-256 digests.
+        sanitized = self.redact_report_value(target, report)
+        self._verify_report_integrity(sanitized)
+        return sanitized
+
+    _PRESERVED_VALUE_KEYS = frozenset({
+        # Trusted framework-generated identifiers, schema metadata, enums, and hashes
+        "run_id",
+        "generic_run_id",
+        "batch_id",
+        "case_id",
+        "testcase_id",
+        "target_id",
+        "input_id",
+        "secagent_run_id",
+        "secagent_execution_id",
+        "secagent_testcase_id",
+        "engine",
+        "timestamp",
+        "started_at",
+        "completed_at",
+        "category",
+        "attack_module",
+        "adapter",
+        "adapter_name",
+        "protocol",
+        "execution_mode",
+        "evaluation_mode",
+        "evaluation_strategy",
+        "evaluation_scope",
+        "final_verdict",
+        "verdict",
+        "status",
+        "evaluation_status",
+        "deterministic_verdict",
+        "effective_deterministic_verdict",
+        "decision_source",
+        "matched_rule_id",
+        "matched_rule_type",
+        "deterministic_matched_rule_id",
+        "deterministic_matched_rule_type",
+        "downgrade_reason",
+        "recommendation",
+        "classification",
+        "provider_fault_code",
+        "json_validation_status",
+        "skill",
+        "provider",
+        "model",
+        "source_provenance",
+        "provenance",
+        "evidence_level",
+        "provenance_tiers",
+        "correlation_status",
+        "correlation_strength",
+        "collector_id",
+        "collector_kind",
+        "kind",
+        "source",
+        "dataset_id",
+        "policy_id",
+        "policy_review_status",
+        "reviewed_policy_id",
+        "reviewed_policy_status",
+        "application_context_id",
+        "context_source",
+        "rule_origin",
+        "payload_ref",
+        "source_tool",
+        "report_path",
+        "sanitization",
+        "completeness",
+        "inline_evidence_disclosure",
+        "observes",
+        "limitation",
+        "scope",
+        "attack_surface",
+        "auth_source",
+        "session_auth_type",
+        "session_auth_header",
+        "session_credential_generation",
+    })
+    _PRESERVED_VALUE_SUFFIXES = ("_sha256", "_fingerprint", "_digest")
+    _DYNAMIC_KEY_CONTAINERS = frozenset({"data", "stored_provenance", "extra", "response_sample"})
+    _DYNAMIC_TRUSTED_DIGEST_KEYS = frozenset({
+        "event_fingerprint",
+        "arguments_sha256",
+        "observation_sha256",
+    })
+    _HEX64_PATTERN = None
+
+    @staticmethod
+    def _verify_report_integrity(report: Any) -> None:
+        if not isinstance(report, dict):
+            raise RuntimeError("report_redaction_integrity_failed")
+        required_keys = ("run_id", "testcase_id", "final_verdict", "final_result", "research_provenance")
+        if any(k not in report for k in required_keys):
+            raise RuntimeError("report_redaction_integrity_failed")
+        if report.get("final_verdict") not in {s.value for s in EvaluationStatus}:
+            raise RuntimeError("report_redaction_integrity_failed")
+        if not isinstance(report.get("final_result"), dict) or report["final_result"].get("status") not in {
+            s.value for s in EvaluationStatus
+        }:
+            raise RuntimeError("report_redaction_integrity_failed")
+        prov = report.get("research_provenance")
+        if not isinstance(prov, dict):
+            raise RuntimeError("report_redaction_integrity_failed")
+        Runner._verify_sha256_digests(prov)
+
+    @staticmethod
+    def _verify_sha256_digests(node: Any) -> None:
+        import re as _re
+
+        hex64 = _re.compile(r"^[a-f0-9]{64}$")
+
+        def walk(item: Any) -> None:
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    if isinstance(k, str) and k.endswith("_sha256") and v is not None:
+                        if not isinstance(v, str) or not hex64.fullmatch(v):
+                            raise RuntimeError("report_redaction_integrity_failed")
+                    else:
+                        walk(v)
+            elif isinstance(item, list):
+                for elem in item:
+                    walk(elem)
+
+        walk(node)
 
     def redact_report_value(self, target, value):
-        """Redact configured credential values recursively using Runner's sensitivity list."""
-        secrets = sorted(self._judge_sensitive_values(target), key=len, reverse=True)
+        """Redact configured credential values in untrusted fields while preserving trusted report schema."""
+        import re as _re
+        from reporting.redaction import Redactor
 
-        def sanitize(item):
+        secrets = sorted(self._judge_sensitive_values(target), key=len, reverse=True)
+        if not secrets:
+            return value
+        cleaner = Redactor(secrets)
+        hex64 = _re.compile(r"^[a-f0-9]{64}$")
+        fingerprint_re = _re.compile(r"^(?:sha256:)?[a-f0-9]{64}$")
+        dynamic_trusted_enums = frozenset({"provenance", "correlation_status", "correlation_strength"})
+
+        def sanitize(item, *, key_name: str | None = None, scrub_keys: bool = False):
             if isinstance(item, str):
-                for secret in secrets:
-                    item = item.replace(secret, "[REDACTED]")
-                return item
+                if key_name is not None:
+                    if scrub_keys:
+                        if key_name in dynamic_trusted_enums:
+                            return item
+                        if key_name == "event_fingerprint" and fingerprint_re.fullmatch(item):
+                            return item
+                        if key_name in {"arguments_sha256", "observation_sha256"} and hex64.fullmatch(item):
+                            return item
+                    else:
+                        if key_name in self._PRESERVED_VALUE_KEYS:
+                            return item
+                        if any(key_name.endswith(sfx) for sfx in self._PRESERVED_VALUE_SUFFIXES) and hex64.fullmatch(item):
+                            return item
+                return cleaner.redact_secrets_only(item)
             if isinstance(item, dict):
-                return {sanitize(key): sanitize(val) for key, val in item.items()}
+                out = {}
+                for k, v in item.items():
+                    next_scrub = scrub_keys or (isinstance(k, str) and k in self._DYNAMIC_KEY_CONTAINERS)
+                    if scrub_keys and isinstance(k, str) and k not in dynamic_trusted_enums and k not in self._DYNAMIC_TRUSTED_DIGEST_KEYS:
+                        clean_k = cleaner.redact_secrets_only(k)
+                        if clean_k in out:
+                            idx = 2
+                            while f"{clean_k}#{idx}" in out:
+                                idx += 1
+                            clean_k = f"{clean_k}#{idx}"
+                    else:
+                        clean_k = k
+                    field_key = k if isinstance(k, str) else None
+                    out[clean_k] = sanitize(v, key_name=field_key, scrub_keys=next_scrub)
+                return out
             if isinstance(item, (list, tuple)):
-                return [sanitize(val) for val in item]
+                if not scrub_keys and key_name in self._PRESERVED_VALUE_KEYS:
+                    return [val for val in item]
+                return [sanitize(val, key_name=None, scrub_keys=scrub_keys) for val in item]
             return item
 
         return sanitize(value)

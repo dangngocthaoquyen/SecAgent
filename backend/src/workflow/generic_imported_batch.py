@@ -300,14 +300,37 @@ class GenericImportedBatchWorkflow:
             return "imported_live_transport_required"
         return None
 
+    def _session_credential_generation(self, preset) -> str | None:
+        session_auth = getattr(preset, "session_auth", None)
+        if session_auth is None:
+            return None
+        store = getattr(self.catalog, "session_credentials", None)
+        if store is None:
+            return None
+        return store.generation(
+            session_auth.ref_id,
+            endpoint=preset.endpoint,
+            scope_id=preset.id,
+            scope_kind="target",
+        )
+
+    def invalidate_connection_check(self, target_id: str) -> None:
+        self._connection_proofs.pop(target_id, None)
+
     def record_connection_check(self, preset, result):
         self._connection_proofs.pop(preset.id, None)
-        if (self.live_profile_error(preset) is None and preset.reviewed
+        eligible = (
+            self.live_profile_error(preset) is None
+            or (preset is not None and preset.protocol == "http-json" and preset.http_config is not None)
+        )
+        if (eligible and preset.reviewed
                 and result.connection_status == "succeeded" and result.runtime_protocol_compatible is True
                 and result.target_request_count == 1):
             self._connection_proofs[preset.id] = dict(probe_id=uuid4().hex, target_id=preset.id,
                 profile_revision=self.catalog._revisions[preset.id], endpoint=preset.endpoint,
-                model=preset.default_model, verified_at=datetime.now(timezone.utc))
+                model=preset.default_model,
+                session_credential_generation=self._session_credential_generation(preset),
+                verified_at=datetime.now(timezone.utc))
 
     def _connection_error(self, preset) -> str | None:
         proof = self._connection_proofs.get(preset.id)
@@ -317,6 +340,10 @@ class GenericImportedBatchWorkflow:
                 or proof["profile_revision"] != self.catalog._revisions[preset.id]
                 or proof["endpoint"] != preset.endpoint or proof["model"] != preset.default_model):
             return "imported_live_connection_check_stale"
+        if getattr(preset, "session_auth", None) is not None:
+            current_gen = self._session_credential_generation(preset)
+            if current_gen is None or proof.get("session_credential_generation") != current_gen:
+                return "imported_live_connection_check_stale"
         if datetime.now(timezone.utc) >= proof["verified_at"] + timedelta(minutes=10):
             return "imported_live_connection_check_expired"
         return None

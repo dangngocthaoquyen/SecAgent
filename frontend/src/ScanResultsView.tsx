@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import TestcaseDetailDrawer from './TestcaseDetailDrawer';
 import {
   classifyJudgeFault,
-  computeVerdictCounts,
   copyTextToClipboard,
   deriveRunAsiSummary,
   formatCaseAsiCategory,
@@ -18,6 +17,7 @@ import {
   summarizeRunEvidenceVerification,
   verdictBadgeClass,
 } from './scanFormatters';
+import { resolveUnifiedDisplay } from './scanLineage';
 import {
   testingApi,
   type GenericRunCaseResult,
@@ -30,6 +30,10 @@ export interface ScanResultsViewProps {
   secret: string;
   onNewScan: () => void;
   onExportError?: (message: string) => void;
+  onResumeScan?: () => void;
+  onOpenRun?: (runId: string) => void;
+  resumeBusy?: boolean;
+  resumePanelOpen?: boolean;
 }
 
 export default function ScanResultsView({
@@ -38,6 +42,10 @@ export default function ScanResultsView({
   secret,
   onNewScan,
   onExportError,
+  onResumeScan,
+  onOpenRun,
+  resumeBusy = false,
+  resumePanelOpen = false,
 }: ScanResultsViewProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [verdictFilter, setVerdictFilter] = useState<string>('ALL');
@@ -60,33 +68,42 @@ export default function ScanResultsView({
     setSelectedCase(null);
   }, [runRecord.generic_run_id]);
 
-  const cases = runRecord.cases ?? [];
-  const skippedCases = runRecord.skipped_cases ?? [];
-  const verdictCounts = computeVerdictCounts(runRecord);
-  const status = (runRecord.status ?? 'completed').toLowerCase();
+  const unified = useMemo(() => resolveUnifiedDisplay(runRecord), [runRecord]);
+  const cases = unified.cases;
+  const skippedCases = runRecord.unified_lineage?.skipped_cases ?? runRecord.skipped_cases ?? [];
+  const verdictCounts = {
+    PASS: Number(unified.verdictCounts.PASS ?? 0),
+    FAIL: Number(unified.verdictCounts.FAIL ?? 0),
+    INCONCLUSIVE: Number(unified.verdictCounts.INCONCLUSIVE ?? 0),
+    ERROR: Number(unified.verdictCounts.ERROR ?? 0),
+  };
+  const status = unified.logicalStatus.toLowerCase();
   const isCompleted = status === 'completed';
+  const isCompletedWithErrors = status === 'completed_with_errors';
 
-  const selectedCount = runRecord.selected_cases ?? (runRecord.total_cases + skippedCases.length);
-  const readyCount = runRecord.ready_count ?? runRecord.total_cases;
-  const executedCount = runRecord.executed_cases ?? (isCompleted ? runRecord.total_cases : cases.length);
-  const skippedCount = runRecord.skipped_count ?? skippedCases.length;
+  const selectedCount = unified.selectedCount;
+  const readyCount = unified.readyCount;
+  const executedCount = unified.executedCount;
+  const skippedCount = unified.skippedCount;
 
-  const progressPct = typeof runRecord.progress_percent === 'number'
-    ? runRecord.progress_percent
-    : safePercent(executedCount, readyCount);
+  const progressPct = unified.progressPercent;
 
   const barTotal = Math.max(
     1,
     verdictCounts.PASS + verdictCounts.FAIL + verdictCounts.INCONCLUSIVE + verdictCounts.ERROR,
   );
 
-  const judgeMeta = runRecord.judge_metadata ?? null;
+  const judgeMeta = unified.judgeMetadata;
+  const hasIntegrityError = unified.integrityStatus === 'invalid_checkpoint';
   const judgeOptions = useMemo(
     () => ({ useJudge: runRecord.use_judge, judgeMode: judgeMeta?.mode ?? null }),
     [runRecord.use_judge, judgeMeta?.mode],
   );
-  const asiSummary = useMemo(() => deriveRunAsiSummary(runRecord), [runRecord]);
-  const evidenceEntries = Object.entries(runRecord.evidence_summary ?? {});
+  const asiSummary = useMemo(
+    () => deriveRunAsiSummary({ ...runRecord, cases, skipped_cases: skippedCases }),
+    [runRecord, cases, skippedCases],
+  );
+  const evidenceEntries = Object.entries(unified.evidenceSummary);
   const execVerification = useMemo(() => summarizeRunEvidenceVerification(cases), [cases]);
 
   const availableAsis = useMemo(
@@ -146,12 +163,21 @@ export default function ScanResultsView({
   }
 
   async function handleCopyRunId() {
-    const ok = await copyTextToClipboard(runRecord.generic_run_id);
+    const ok = await copyTextToClipboard(unified.logicalScanId);
     if (ok) {
       setCopiedRunId(true);
       window.setTimeout(() => setCopiedRunId(false), 1600);
     }
   }
+
+  const showResumeAction = Boolean(onResumeScan && unified.hasResumableWork && !hasIntegrityError);
+  const canExportUnified = unified.isUnified && !hasIntegrityError;
+  const primaryExportHref = canExportUnified
+    ? testingApi.genericRunUnifiedExportUrl(unified.logicalScanId)
+    : testingApi.genericRunExportUrl(runRecord.generic_run_id);
+  const primaryExportFilename = canExportUnified
+    ? `secagent-unified-scan-${unified.logicalScanId}.json`
+    : `secagent-generic-run-${runRecord.generic_run_id}.json`;
 
   return (
     <section className="scan-results-shell" aria-label="Step 3: Scan Results">
@@ -160,7 +186,8 @@ export default function ScanResultsView({
         <div className="results-header-main">
           <div className="results-eyebrow-row">
             <span className="eyebrow">
-              STEP 3 OF 3 · SCAN {status.toUpperCase()}
+              STEP 3 OF 3 · SCAN {formatRunStatus(status).toUpperCase()}
+              {unified.sessionCount > 1 ? ` · ${unified.sessionCount} EXECUTION SESSIONS` : ''}
             </span>
             <span className={runStatusBadgeClass(status)}>{formatRunStatus(status)}</span>
           </div>
@@ -172,7 +199,7 @@ export default function ScanResultsView({
             <span>· Mode: <strong>{runRecord.mode === 'offline' ? 'Offline' : 'Live'}</strong></span>
             <span>· Engine: <strong>{runRecord.use_judge ? 'Hybrid LLM Judge' : 'Rule-Only'}</strong></span>
             <span className="run-id-chip">
-              Run ID: <code className="mono">{runRecord.generic_run_id}</code>
+              {unified.isUnified ? 'Scan ID:' : 'Run ID:'} <code className="mono">{unified.logicalScanId}</code>
               <button
                 type="button"
                 className="btn ghost xs"
@@ -186,20 +213,37 @@ export default function ScanResultsView({
         </div>
 
         <div className="results-header-actions">
+          {showResumeAction && (
+            <button
+              type="button"
+              className="btn primary"
+              disabled={resumeBusy}
+              onClick={onResumeScan}
+            >
+              {resumePanelOpen ? 'Resume Preview Open' : resumeBusy ? 'Loading Resume…' : 'Resume Scan'}
+            </button>
+          )}
           <a
-            className="btn primary"
-            href={testingApi.genericRunExportUrl(runRecord.generic_run_id)}
-            download={`secagent-generic-run-${runRecord.generic_run_id}.json`}
+            className={showResumeAction ? 'btn ghost' : 'btn primary'}
+            href={primaryExportHref}
+            download={primaryExportFilename}
             onClick={e => {
               if (!localSingleUser && secret) {
                 e.preventDefault();
-                void testingApi
-                  .downloadGenericRunReport(runRecord.generic_run_id, secret)
-                  .catch(err => onExportError?.(err instanceof Error ? err.message : 'Unable to export scan report.'));
+                const dl = canExportUnified
+                  ? testingApi.downloadGenericRunUnifiedReport(unified.logicalScanId, secret)
+                  : testingApi.downloadGenericRunReport(runRecord.generic_run_id, secret);
+                void dl.catch(err =>
+                  onExportError?.(err instanceof Error ? err.message : 'Unable to export scan report.'),
+                );
               }
             }}
           >
-            Export Report JSON
+            {canExportUnified
+              ? 'Export Unified Report JSON'
+              : hasIntegrityError
+                ? 'Export Session Report JSON'
+                : 'Export Report JSON'}
           </a>
           <a className="btn ghost" href="#executions">
             View in Results History →
@@ -210,7 +254,156 @@ export default function ScanResultsView({
         </div>
       </header>
 
-      {!isCompleted && (
+      {(unified.isUnified ||
+        runRecord.continuation_of_run_id ||
+        (runRecord.child_run_ids && runRecord.child_run_ids.length > 0)) && (
+        <div className="notice" role="region" aria-label="Continuation lineage summary">
+          <strong>
+            Unified Logical Scan ({unified.sessionCount} execution session{unified.sessionCount === 1 ? '' : 's'}
+            {unified.resumeCount > 0 ? ` · ${unified.resumeCount} resume${unified.resumeCount === 1 ? '' : 's'}` : ''}):
+          </strong>{' '}
+          <span>
+            Logical Scan <code className="mono">{unified.logicalScanId}</code> · Selected:{' '}
+            <strong>{selectedCount}</strong> · Recorded outcomes: <strong>{executedCount}</strong> (deduplicated across
+            sessions, no double-counting).
+          </span>
+          {runRecord.continuation_of_run_id && (
+            <span style={{ marginLeft: '0.5rem' }}>
+              {onOpenRun && (
+                <button
+                  type="button"
+                  className="btn ghost xs"
+                  onClick={() => onOpenRun(runRecord.continuation_of_run_id!)}
+                >
+                  Open Parent Run
+                </button>
+              )}
+            </span>
+          )}
+          {runRecord.child_run_ids && runRecord.child_run_ids.length > 0 && (
+            <span style={{ marginLeft: '0.5rem' }}>
+              {runRecord.child_run_ids.map(cid => (
+                <span key={cid} style={{ marginRight: '0.4rem' }}>
+                  {onOpenRun && (
+                    <button
+                      type="button"
+                      className="btn ghost xs"
+                      onClick={() => onOpenRun(cid)}
+                    >
+                      Open Continuation Run
+                    </button>
+                  )}
+                </span>
+              ))}
+            </span>
+          )}
+          {unified.sessions.length > 1 && (
+            <details style={{ marginTop: '0.55rem' }}>
+              <summary style={{ cursor: 'pointer', fontWeight: 600 }}>
+                Execution History ({unified.sessions.length} sessions)
+              </summary>
+              <div className="tablewrap" style={{ marginTop: '0.5rem' }}>
+                <table className="case-table">
+                  <thead>
+                    <tr>
+                      <th>Session</th>
+                      <th>Session Run ID</th>
+                      <th>Started</th>
+                      <th>Recorded</th>
+                      <th>Verdicts</th>
+                      <th>Status</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {unified.sessions.map(sess => {
+                      const p = Number(sess.verdict_counts?.PASS ?? 0);
+                      const f = Number(sess.verdict_counts?.FAIL ?? 0);
+                      const i = Number(sess.verdict_counts?.INCONCLUSIVE ?? 0);
+                      const err = Number(sess.verdict_counts?.ERROR ?? 0);
+                      return (
+                        <tr key={sess.generic_run_id}>
+                          <td>
+                            <strong>{sess.session_index === 1 ? 'Original' : `Resume #${sess.session_index - 1}`}</strong>
+                          </td>
+                          <td>
+                            <code className="mono">{sess.generic_run_id.slice(0, 12)}</code>
+                          </td>
+                          <td>{formatDateTime(sess.started_at)}</td>
+                          <td>{sess.executed_cases}</td>
+                          <td>
+                            {p}P · {f}F · {i}I{err > 0 ? ` · ${err}E` : ''}
+                          </td>
+                          <td>
+                            <span className={runStatusBadgeClass(sess.status)}>{formatRunStatus(sess.status)}</span>
+                          </td>
+                          <td>
+                            <div className="history-actions">
+                              {onOpenRun && sess.generic_run_id !== runRecord.generic_run_id && (
+                                <button
+                                  type="button"
+                                  className="btn ghost xs"
+                                  onClick={() => onOpenRun(sess.generic_run_id)}
+                                >
+                                  Inspect Session
+                                </button>
+                              )}
+                              <a
+                                className="btn ghost xs"
+                                href={testingApi.genericRunExportUrl(sess.generic_run_id)}
+                                download={`secagent-generic-run-${sess.generic_run_id}.json`}
+                                onClick={e => {
+                                  if (!localSingleUser && secret) {
+                                    e.preventDefault();
+                                    void testingApi
+                                      .downloadGenericRunReport(sess.generic_run_id, secret)
+                                      .catch(err2 =>
+                                        onExportError?.(
+                                          err2 instanceof Error ? err2.message : 'Unable to export session report.',
+                                        ),
+                                      );
+                                  }
+                                }}
+                              >
+                                Export Session JSON
+                              </a>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </details>
+          )}
+        </div>
+      )}
+
+      {hasIntegrityError && (
+        <div className="notice error" role="alert">
+          <strong>Lineage Checkpoint Integrity Warning:</strong>{' '}
+          <span>
+            {unified.integrityWarning ||
+              'Persisted checkpoint state failed integrity validation. Unified completion and unified report export are blocked; individual session reports remain accessible.'}
+          </span>
+        </div>
+      )}
+
+      {isCompletedWithErrors && (
+        <div className="notice warn" role="status">
+          <strong>
+            Completed with errors ({executedCount} of {readyCount} ready testcases recorded · {verdictCounts.ERROR}{' '}
+            ERROR):
+          </strong>{' '}
+          <span>
+            All selected testcases reached a recorded outcome, but {verdictCounts.ERROR} testcase(s) encountered
+            operational or runtime errors and were not evaluated as PASS or FAIL.
+          </span>
+        </div>
+      )}
+
+      {!isCompleted && !isCompletedWithErrors && (
         <div className="notice error" role="alert">
           <strong>
             Scan {status.toUpperCase()} ({progressPct}% · {executedCount} of {readyCount} ready cases executed):
@@ -254,13 +447,23 @@ export default function ScanResultsView({
           <div>
             <h3>Verdict Distribution &amp; Coverage</h3>
             <p className="caption">
-              Selected Cases: {selectedCount} · Executed Cases: {executedCount} · Skipped Cases: {skippedCount} · Total Cases: {runRecord.total_cases}
+              {unified.sessionCount > 1 ? (
+                <>
+                  Selected Cases: {selectedCount} · Recorded Outcomes: {executedCount} · Skipped Cases: {skippedCount} ·
+                  Execution Sessions: {unified.sessionCount}
+                </>
+              ) : (
+                <>
+                  Selected Cases: {selectedCount} · Executed Cases: {executedCount} · Skipped Cases: {skippedCount} ·
+                  Total Cases: {runRecord.total_cases}
+                </>
+              )}
             </p>
           </div>
           <div className="dist-times">
-            <span>Started: <strong>{formatDateTime(runRecord.started_at)}</strong></span>
-            <span>Completed: <strong>{formatDateTime(runRecord.completed_at)}</strong></span>
-            <span>Duration: <strong>{formatDurationBetween(runRecord.started_at, runRecord.completed_at)}</strong></span>
+            <span>Started: <strong>{formatDateTime(unified.startedAt)}</strong></span>
+            <span>Completed: <strong>{formatDateTime(unified.completedAt)}</strong></span>
+            <span>Duration: <strong>{formatDurationBetween(unified.startedAt, unified.completedAt)}</strong></span>
           </div>
         </div>
 

@@ -33,8 +33,10 @@ from workflow.models import (
     Identifier,
     ModelName,
     Preset,
+    SessionAuthReference,
 )
 from workflow.plans import ROOT
+from workflow.session_credentials import SessionCredentialError, SessionCredentialStore
 
 
 class ManagedProfile(ClosedModel):
@@ -45,22 +47,33 @@ class ManagedProfile(ClosedModel):
     endpoint: str = Field(min_length=1, max_length=256)
     protocol: str = "openai-chat"
     model: ModelName | None = None
-    timeout_seconds: int = Field(ge=1, le=60)
+    timeout_seconds: int = Field(ge=1, le=600)
     credential_alias: Identifier | None = None
+    session_auth: SessionAuthReference | None = None
     http_config: HttpContractConfig | None = None
     capability_states: dict[Identifier, CapabilityStateLiteral] | None = None
     capability_provenance: dict[Identifier, DeclarableCapabilityProvenanceLiteral] | None = None
 
     @model_validator(mode="after")
     def validate_managed_fields(self):
+        if self.session_auth is not None and self.credential_alias is not None:
+            raise ValueError("Conflicting authentication configuration: cannot combine credential_alias and session_auth.")
         if self.protocol != "http-json" and self.credential_alias is not None:
             raise ValueError("credential_alias cannot be supplied directly on legacy managed profiles.")
+        if self.protocol != "http-json" and self.session_auth is not None:
+            raise ValueError("session_auth is only allowed for http-json profiles.")
         if self.protocol != "http-json" and self.http_config is not None:
             raise ValueError("http_config is only allowed for http-json profiles.")
         if self.protocol == "http-json" and self.http_config is None:
             raise ValueError("http-json profile requires http_config.")
+        if self.protocol == "http-json" and self.session_auth is not None and self.http_config is not None:
+            auth_hdr = self.session_auth.header_name.lower()
+            if any(k.lower() == auth_hdr for k in self.http_config.headers):
+                raise ValueError("Custom HTTP header conflicts with session authentication header.")
         if self.protocol != "http-json" and not self.model:
             raise ValueError("model is required for this protocol.")
+        if self.protocol != "http-json" and self.timeout_seconds > 60:
+            raise ValueError("timeout_seconds exceeds protocol limit.")
         return self
 
 
@@ -164,9 +177,11 @@ def _data_root(path: Path) -> Path:
 
 class ManagedTargetCatalog(TargetCatalog):
     def __init__(self, seed: CatalogConfig, data_dir: Path, *, probe_transport=None,
-                 local_single_user=False):
+                 local_single_user=False, allow_additive_credential_aliases: bool = False,
+                 session_credentials: SessionCredentialStore | None = None):
         self._lock = RLock()
         self.local_single_user = local_single_user
+        self.session_credentials = session_credentials if session_credentials is not None else SessionCredentialStore()
         self.data_dir = _data_root(Path(data_dir))
         self.state_file = self.data_dir / "target-catalog.json"
         self.legacy_backup_file = self.data_dir / "target-catalog.legacy-archived.backup.json"
@@ -216,9 +231,28 @@ class ManagedTargetCatalog(TargetCatalog):
                     raw_state["revision_names"] = rev_names
                 migrated_legacy_archive = True
             state = ManagedState.model_validate(raw_state)
-            if state.catalog.policy_ref != seed.policy_ref or state.catalog.credential_aliases != seed.credential_aliases:
-                raise CatalogError("Stored catalog policy or credential bindings differ from startup configuration.")
-            if migrated_legacy_archive:
+            if state.catalog.policy_ref != seed.policy_ref:
+                raise CatalogError("Stored catalog policy differs from startup configuration.")
+            migrated_credential_aliases = False
+            if state.catalog.credential_aliases != seed.credential_aliases:
+                stored_aliases = state.catalog.credential_aliases
+                seed_aliases = seed.credential_aliases
+                removed_or_changed = any(
+                    seed_aliases.get(alias) != env_ref
+                    for alias, env_ref in stored_aliases.items()
+                )
+                if removed_or_changed or not allow_additive_credential_aliases:
+                    raise CatalogError("Stored catalog policy or credential bindings differ from startup configuration.")
+                # Strictly additive alias registration: validate merged CatalogConfig,
+                # preserve all existing targets/reviews/revisions, write atomic backup first.
+                merged_catalog = CatalogConfig.model_validate(
+                    state.catalog.model_dump() | {"credential_aliases": dict(seed_aliases)}
+                )
+                updated_state = state.model_copy(update={"catalog": merged_catalog})
+                self._write_recovery_backup(raw_bytes, prefix="target-catalog.credential-aliases")
+                state = updated_state
+                migrated_credential_aliases = True
+            if migrated_legacy_archive or migrated_credential_aliases:
                 self._save(state)
             else:
                 self._install(state)
@@ -227,6 +261,24 @@ class ManagedTargetCatalog(TargetCatalog):
             state = ManagedState(catalog=seed.model_copy(update={"targets": unreviewed}),
                 platform_sources={p.id: "seed_configured" for p in seed.targets})
             self._install(state)
+
+    def _write_recovery_backup(self, raw_bytes: bytes, *, prefix: str) -> Path:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_path = self.data_dir / f"{prefix}-{stamp}-{secrets.token_hex(4)}.backup.json"
+        if backup_path.is_symlink():
+            raise CatalogError("Linked target catalog backup is unsupported.")
+        temporary = self.data_dir / (".target-catalog-backup-" + secrets.token_hex(16) + ".tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, backup_path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        return backup_path
 
     def _install(self, state: ManagedState):
         revisions = {p.id: _revision(state.catalog, p, state.revision_names.get(p.id))
@@ -412,9 +464,17 @@ class ManagedTargetCatalog(TargetCatalog):
         try:
             host = urlsplit(preset.endpoint).hostname
             address = ipaddress.ip_address(host or "")
-            return ((preset.protocol == "mcp-jsonrpc" and address.is_loopback)
-                    or (preset.protocol == "openai-chat" and (address.is_private or address.is_loopback)
-                    and not address.is_link_local and not address.is_multicast and not address.is_unspecified))
+            local_or_private = (
+                (address.is_private or address.is_loopback)
+                and not address.is_link_local
+                and not address.is_multicast
+                and not address.is_unspecified
+            )
+            return (
+                (preset.protocol == "mcp-jsonrpc" and address.is_loopback)
+                or (preset.protocol == "openai-chat" and local_or_private)
+                or (preset.protocol == "http-json" and local_or_private and preset.http_config is not None)
+            )
         except ValueError:
             return False
 
@@ -451,16 +511,22 @@ class ManagedTargetCatalog(TargetCatalog):
             models=models,
             default_model=default_model,
             timeout_min=existing.timeout_min if existing else 1,
-            timeout_max=existing.timeout_max if existing else 60,
+            timeout_max=(
+                max(existing.timeout_max, profile.timeout_seconds, 600)
+                if profile.protocol == "http-json" and existing
+                else (600 if profile.protocol == "http-json" else (existing.timeout_max if existing else 60))
+            ),
             timeout_default=profile.timeout_seconds,
             credential_alias=cred_alias,
+            session_auth=profile.session_auth if profile.protocol == "http-json" else None,
             http_config=profile.http_config,
             capability_states=profile.capability_states,
             capability_provenance=profile.capability_provenance,
             reviewed=False,
         )
         make_profile(preset, preset.default_model, preset.timeout_default,
-                     self._state.catalog.credential_aliases.get(preset.credential_alias))
+                     self._state.catalog.credential_aliases.get(preset.credential_alias),
+                     session_auth=preset.session_auth)
         return preset
 
     @staticmethod
@@ -470,7 +536,7 @@ class ManagedTargetCatalog(TargetCatalog):
         Legacy openai-chat and mcp-jsonrpc keep (endpoint, protocol) uniqueness.
         Generic http-json profiles sharing one REST endpoint are distinct when
         their effective invocation contract (body_template, headers, response
-        contract, or credential_alias) differs.
+        contract, credential_alias, or session_auth) differs.
         """
         if preset.protocol == "http-json":
             http_blob = (
@@ -478,7 +544,12 @@ class ManagedTargetCatalog(TargetCatalog):
                 if preset.http_config is not None
                 else ""
             )
-            return (preset.endpoint, preset.protocol, preset.credential_alias or "", http_blob)
+            sess_sig = (
+                f"session:{preset.session_auth.auth_type}:{preset.session_auth.header_name.lower()}:{preset.session_auth.ref_id}"
+                if preset.session_auth is not None
+                else ""
+            )
+            return (preset.endpoint, preset.protocol, preset.credential_alias or "", sess_sig, http_blob)
         return (preset.endpoint, preset.protocol)
 
     def validate_profile(self, profile: ManagedProfile, *, update=False):
@@ -569,76 +640,623 @@ class ManagedTargetCatalog(TargetCatalog):
         with self._lock:
             p = self._targets.get(selection.target_id)
             if p is None:
-                return ConnectionCheckResult(connection_status="rejected", reason="unknown_target"), 404
+                return ConnectionCheckResult(connection_status="rejected", reason="unknown_target",
+                    diagnostic_category="configuration_validation_failure", verification_state="configuration_invalid"), 404
             if selection.profile_revision != self._revisions[p.id] or selection.policy_ref != self._config.policy_ref:
-                return ConnectionCheckResult(connection_status="rejected", reason="stale_profile_or_policy"), 409
+                return ConnectionCheckResult(connection_status="rejected", reason="stale_profile_or_policy",
+                    diagnostic_category="configuration_validation_failure", verification_state="configuration_invalid"), 409
             if not p.reviewed:
-                return ConnectionCheckResult(connection_status="requires_approval", reason="operator_review_required"), 403
+                return ConnectionCheckResult(connection_status="requires_approval", reason="operator_review_required",
+                    diagnostic_category="configuration_validation_failure", verification_state="configuration_invalid"), 403
+            if p.protocol == "http-json" and (
+                getattr(selection, "authorization_confirmed", False) is not True
+                or getattr(selection, "endpoint", None) != p.endpoint
+            ):
+                return ConnectionCheckResult(connection_status="requires_approval", reason="probe_authorization_required",
+                    diagnostic_category="configuration_validation_failure", verification_state="configuration_invalid"), 403
             if not self._probe_supported(p):
-                return ConnectionCheckResult(connection_status="unsupported", reason="safe_probe_not_verified"), 200
-        return self._probe_preset(p)
+                return ConnectionCheckResult(connection_status="unsupported", reason="safe_probe_not_verified",
+                    diagnostic_category="configuration_validation_failure", verification_state="unsupported"), 200
+        return self._probe_preset(p, sample_input=getattr(selection, "sample_input", None))
 
-    def probe_candidate(self, profile: ManagedProfile):
+    def probe_candidate(
+        self,
+        profile: ManagedProfile,
+        *,
+        sample_input: str | None = None,
+        discovery_id: str | None = None,
+    ):
         """One authorized connection check for an unsaved discovery proposal.
 
         The API binds the endpoint and protocol to a discovery ID first. This
         method validates the proposal independently of saved target identities.
         A discovered ID can already exist; a probe never writes or reviews it.
+        When an http-json draft has a resolved request contract but an unresolved
+        response text_path, a bounded sample probe is still permitted so the
+        Response Shape Inspector can suggest mappings from the observed response
+        without marking the Target fully verified.
         """
+        unresolved_text_path = (
+            profile.protocol == "http-json"
+            and profile.http_config is not None
+            and profile.http_config.response.text_path == ""
+        )
+        effective_profile = profile
+        if unresolved_text_path and profile.http_config is not None:
+            effective_profile = profile.model_copy(
+                update={
+                    "http_config": profile.http_config.model_copy(
+                        update={
+                            "response": profile.http_config.response.model_copy(
+                                update={"text_path": "__secagent_unresolved_text_path__"}
+                            )
+                        }
+                    )
+                }
+            )
         with self._lock:
-            candidate = self._preset(profile)
+            candidate = self._preset(effective_profile)
             CatalogConfig.model_validate(self._config.model_dump() | {
                 "targets": [candidate.model_dump()]})
             if not self._probe_supported(candidate):
-                return ConnectionCheckResult(connection_status="unsupported", reason="safe_probe_not_verified"), 200
-        return self._probe_preset(candidate)
+                return ConnectionCheckResult(connection_status="unsupported", reason="safe_probe_not_verified",
+                    diagnostic_category="configuration_validation_failure", verification_state="unsupported"), 200
+        return self._probe_preset(
+            candidate,
+            sample_input=sample_input,
+            unresolved_text_path=unresolved_text_path,
+            discovery_id=discovery_id,
+        )
 
-    def _probe_preset(self, p: Preset):
-        endpoint, model, timeout, protocol = p.endpoint, p.default_model, p.timeout_default, p.protocol
+    @staticmethod
+    def _redacted_request_preview(
+        method: str,
+        url: str,
+        headers: dict[str, str] | None,
+        body: object,
+        secrets_to_redact: list[str],
+        *,
+        secret_header_names: set[str] | None = None,
+    ) -> dict:
+        from reporting.redaction import Redactor
+        cleaner = Redactor(secrets_to_redact)
+        sensitive_headers = {"authorization", "proxy-authorization", "x-api-key", "api-key", "x-auth-token", "cookie"}
+        if secret_header_names:
+            sensitive_headers |= {h.lower() for h in secret_header_names}
+        safe_headers: dict[str, str] = {}
+        for k, v in (headers or {}).items():
+            if k.lower() in sensitive_headers:
+                safe_headers[k] = "Bearer [REDACTED]" if v.lower().startswith("bearer ") else "[REDACTED]"
+            else:
+                safe_headers[k] = cleaner.clean(v, limit=256, opaque=False) or ""
+        try:
+            body_text = json.dumps(body, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            body_text = str(body)
+        redacted_body_text = cleaner.clean(body_text, limit=1536, opaque=False) or ""
+        return {
+            "method": method,
+            "url": url,
+            "headers": safe_headers,
+            "body_preview": redacted_body_text,
+        }
+
+    @staticmethod
+    def _redacted_text_preview(raw_text: str | None, secrets_to_redact: list[str], *, limit: int = 2048) -> str | None:
+        if raw_text is None:
+            return None
+        from reporting.redaction import Redactor
+        cleaner = Redactor(secrets_to_redact)
+        return cleaner.clean(raw_text, limit=limit, opaque=False)
+
+    _TRUSTED_DIAGNOSTIC_KEYS = frozenset({
+        "configured_text_path", "text_extracted", "configured_correlation_id_path",
+        "observed_correlation_id", "configured_status_path", "observed_status_value",
+        "configured_complete_status_values", "configured_incomplete_status_values",
+        "response_complete", "completeness_unresolved", "inline_events_extracted",
+        "evaluation_readiness_limitations", "suggestions", "text_path_candidates",
+        "text_path_ambiguous", "correlation_id_candidates", "status_path_candidates",
+        "evidence_mapping_candidates", "path", "sample_type", "source", "confidence",
+        "ambiguous", "limitation", "observed_value", "items", "items_observed",
+        "item_fields_observed", "observed_item_keys", "suggested_mapping",
+        "ambiguous_fields", "provenance", "execution_verified",
+        "event_id", "action", "arguments", "decision", "status", "observation",
+        "timestamp", "max_events",
+    })
+
+    @staticmethod
+    def _sanitize_diagnostic_tree(
+        value: object,
+        secrets_to_redact: list[str],
+        *,
+        opaque: bool = False,
+        field: str | None = None,
+        preserve_trusted_keys: bool = True,
+    ):
+        from reporting.redaction import Redactor
+        cleaner = Redactor(secrets_to_redact)
+        # Runtime-observed value fields apply opaque-token scrubbing too; structural
+        # path fields keep opaque=False so dotted JSON path names stay intact while
+        # still redacting exact secrets, Bearer/JWT/sk- tokens, and URLs.
+        opaque_value_fields = {"observed_correlation_id", "observed_status_value", "observed_value"}
+        if isinstance(value, str):
+            use_opaque = opaque or (field in opaque_value_fields)
+            return cleaner.clean(value, limit=2048, opaque=use_opaque)
+        if isinstance(value, dict):
+            sanitized_dict = {}
+            for raw_k, raw_v in value.items():
+                if preserve_trusted_keys and isinstance(raw_k, str) and raw_k in ManagedTargetCatalog._TRUSTED_DIAGNOSTIC_KEYS:
+                    clean_k = raw_k
+                else:
+                    clean_k = (
+                        cleaner.clean(raw_k, limit=128, opaque=False)
+                        if isinstance(raw_k, str)
+                        else str(raw_k)
+                    )
+                    if clean_k in sanitized_dict:
+                        idx = 2
+                        while f"{clean_k}#{idx}" in sanitized_dict:
+                            idx += 1
+                        clean_k = f"{clean_k}#{idx}"
+                sanitized_dict[clean_k] = ManagedTargetCatalog._sanitize_diagnostic_tree(
+                    raw_v,
+                    secrets_to_redact,
+                    opaque=opaque,
+                    field=raw_k if isinstance(raw_k, str) else None,
+                    preserve_trusted_keys=preserve_trusted_keys,
+                )
+            return sanitized_dict
+        if isinstance(value, list):
+            return [
+                ManagedTargetCatalog._sanitize_diagnostic_tree(
+                    item,
+                    secrets_to_redact,
+                    opaque=opaque,
+                    field=field,
+                    preserve_trusted_keys=preserve_trusted_keys,
+                )
+                for item in value
+            ]
+        return value
+
+    @staticmethod
+    def _redacted_json_sample(body: object, secrets_to_redact: list[str], *, max_bytes: int = 16384) -> dict | None:
+        if not isinstance(body, dict):
+            return None
+        cleaned = ManagedTargetCatalog._sanitize_diagnostic_tree(
+            body, secrets_to_redact, opaque=True, preserve_trusted_keys=False
+        )
+        if not isinstance(cleaned, dict):
+            return None
+        try:
+            encoded = json.dumps(cleaned, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError):
+            return None
+        if len(encoded) > max_bytes:
+            return None
+        return cleaned
+
+    def _probe_preset(
+        self,
+        p: Preset,
+        *,
+        sample_input: str | None = None,
+        unresolved_text_path: bool = False,
+        discovery_id: str | None = None,
+    ):
+        endpoint, timeout, protocol = p.endpoint, p.timeout_default, p.protocol
         credential_name = self._config.credential_aliases.get(p.credential_alias)
+        session_auth = getattr(p, "session_auth", None)
         # No lock across network I/O. The API holds the dispatcher lock when
         # dispatch is enabled; a concurrent profile edit is otherwise rejected
         # by the API's shared management operation lock.
+        from core.models import TestInput
+        from targets.adapters.base import TargetAdapterError
+        from targets.adapters.http_adapter import HttpTargetAdapter, format_bearer_header_value
         from workflow.dispatch import OneRequestHttpClient
+        from workflow.response_inspector import inspect_http_response_shape
         from tools.http import HttpClientError
-        headers = {"Content-Type": "application/json"}
+
+        secrets_to_redact: list[str] = []
+        secret_header_names: set[str] = set()
         if credential_name:
-            credential = os.environ.get(credential_name)
-            if not credential:
-                return ConnectionCheckResult(connection_status="unavailable", reason="credential_unavailable"), 200
-            headers["Authorization"] = credential
-        client = OneRequestHttpClient(endpoint, timeout, transport=self.probe_transport, max_bytes=16384)
+            raw_secret = os.environ.get(credential_name)
+            if raw_secret and raw_secret.strip():
+                cleaned_secret = raw_secret.strip()
+                secrets_to_redact.append(cleaned_secret)
+                stripped_token = re.sub(r"(?i)^Bearer\s+", "", cleaned_secret).strip()
+                if stripped_token:
+                    secrets_to_redact.append(stripped_token)
+
+        session_resolver = None
+        if session_auth is not None:
+            secret_header_names.add(session_auth.header_name.lower())
+            expected_scope_kind = "discovery" if discovery_id is not None else "target"
+            expected_scope_id = discovery_id if discovery_id is not None else p.id
+            try:
+                _, resolved_session_secret, session_variants = self.session_credentials.resolve(
+                    session_auth.ref_id,
+                    endpoint=endpoint,
+                    scope_id=expected_scope_id,
+                    scope_kind=expected_scope_kind,
+                    expected_auth_type=session_auth.auth_type,
+                    expected_header_name=session_auth.header_name,
+                )
+            except SessionCredentialError as exc:
+                guidance_msg = (
+                    "The session credential is bound to a different origin or target scope. "
+                    "Supply a session credential bound to this exact Target endpoint."
+                    if exc.code in {"session_credential_origin_mismatch", "session_credential_scope_mismatch", "session_credential_header_mismatch"}
+                    else "Session credential is unavailable in Backend memory (for example after a Backend restart). "
+                    "Supply the session credential in Target Authentication and try again."
+                )
+                return ConnectionCheckResult(
+                    connection_status="unavailable",
+                    reason="credential_unavailable",
+                    diagnostic_category="missing_credentials",
+                    verification_state="credentials_missing",
+                    guidance=guidance_msg,
+                ), 200
+            for variant in session_variants:
+                if variant not in secrets_to_redact:
+                    secrets_to_redact.append(variant)
+
+            def _resolve_session(ref: str, _expected_ref=session_auth.ref_id, _secret=resolved_session_secret) -> str | None:
+                if ref != _expected_ref:
+                    return None
+                return _secret
+
+            session_resolver = _resolve_session
+
+        if protocol == "mcp-jsonrpc":
+            headers = {"Content-Type": "application/json"}
+            if credential_name:
+                credential = os.environ.get(credential_name)
+                if not credential or not credential.strip():
+                    return ConnectionCheckResult(connection_status="unavailable", reason="credential_unavailable",
+                        diagnostic_category="missing_credentials", verification_state="credentials_missing",
+                        guidance=f"Required server credential for alias '{p.credential_alias}' is not set in the Workflow service environment."), 200
+                try:
+                    headers["Authorization"] = format_bearer_header_value(credential)
+                except ValueError:
+                    return ConnectionCheckResult(connection_status="unavailable", reason="credential_unavailable",
+                        diagnostic_category="missing_credentials", verification_state="credentials_missing"), 200
+            client = OneRequestHttpClient(endpoint, timeout, transport=self.probe_transport, max_bytes=16384)
+            try:
+                payload = {"jsonrpc": "2.0", "id": "secagent-connection-check", "method": "tools/list", "params": {}}
+                response = client.request(method="POST", url=endpoint, headers=headers, json_body=payload, timeout=timeout)
+            except (HttpClientError, ValueError) as exc:
+                cause = exc.__cause__
+                is_timeout = isinstance(cause, httpx.TimeoutException)
+                reason = ("connection_timeout" if is_timeout else
+                          "connection_refused_or_unreachable" if isinstance(cause, httpx.ConnectError) else
+                          "response_too_large_or_bounded" if isinstance(exc, HttpClientError)
+                              and "size limit" in str(exc) else "request_failed_or_bounded")
+                return ConnectionCheckResult(connection_status="unavailable", reason=reason,
+                    target_request_count=client.used, connection_reachable=None,
+                    runtime_protocol_compatible=None,
+                    diagnostic_category="timeout" if is_timeout else "network_connection_failure",
+                    verification_state="transport_failed"), 200
+            body = response.json_body
+            if response.status_code == 401:
+                return ConnectionCheckResult(connection_status="unavailable", reason="authentication_required",
+                    target_request_count=client.used, connection_reachable=True,
+                    runtime_protocol_compatible=None, http_status=401,
+                    diagnostic_category="http_authentication_failure", verification_state="authentication_failed",
+                    guidance="Target returned HTTP 401 Unauthorized. Select a registered credential alias or verify the configured token."), 200
+            if response.status_code == 403:
+                return ConnectionCheckResult(connection_status="unavailable", reason="authentication_required",
+                    target_request_count=client.used, connection_reachable=True,
+                    runtime_protocol_compatible=None, http_status=403,
+                    diagnostic_category="http_permission_failure", verification_state="permission_denied",
+                    guidance="Target returned HTTP 403 Forbidden. Verify the authenticated user or token has permission to access this endpoint."), 200
+            compatible = (response.status_code == 200 and isinstance(body, dict) and
+                body.get("jsonrpc") == "2.0" and body.get("id") == "secagent-connection-check" and
+                isinstance(body.get("result"), dict) and isinstance(body["result"].get("tools"), list))
+            return ConnectionCheckResult(connection_status="succeeded" if compatible else "incompatible",
+                reason="mcp_tools_list_response" if compatible else (
+                    "http_request_rejected" if response.status_code != 200 else "response_contract_unverified"),
+                target_request_count=client.used, connection_reachable=True,
+                runtime_protocol_compatible=compatible, http_status=response.status_code,
+                diagnostic_category="response_extraction_succeeded" if compatible else (
+                    "http_error" if response.status_code != 200 else "invalid_response_format"),
+                verification_state="connection_verified" if compatible else "response_mapping_unresolved"), 200
+
+        # Shared HTTP path for both http-json and openai-chat:
+        # Build the exact same TargetProfile and prepare request via HttpTargetAdapter.
         try:
-            payload = ({"jsonrpc": "2.0", "id": "secagent-connection-check",
-                        "method": "tools/list", "params": {}} if protocol == "mcp-jsonrpc" else
-                       {"model": model, "messages": [{"role": "user",
-                        "content": "Reply with one word: ready."}], "stream": False})
-            response = client.request(method="POST", url=endpoint, headers=headers,
-                json_body=payload, timeout=timeout)
+            target_profile = make_profile(
+                p,
+                p.default_model,
+                timeout,
+                credential_name,
+                session_auth=session_auth,
+            )
+        except ValueError as exc:
+            return ConnectionCheckResult(
+                connection_status="rejected",
+                reason="invalid_probe_configuration",
+                diagnostic_category="configuration_validation_failure",
+                verification_state="configuration_invalid",
+                guidance=f"Target HTTP configuration is invalid: {exc}",
+            ), 200
+
+        if protocol == "openai-chat":
+            prompt_text = "Reply with one word: ready."
+            # Preserve stream=False on OpenAI-compatible chat probes.
+            target_profile.interface.config["body"] = {
+                **dict(target_profile.interface.config.get("body") or {}),
+                "stream": False,
+            }
+        else:
+            cleaned_sample = sample_input.strip() if isinstance(sample_input, str) and sample_input.strip() else None
+            prompt_text = cleaned_sample or "Hello. Please reply with a brief status confirmation."
+
+        try:
+            method, url, headers, request_body, resolved_timeout = HttpTargetAdapter.prepare_request(
+                target_profile,
+                TestInput(id="secagent-connection-probe", prompt=prompt_text),
+                credential_resolver=session_resolver,
+            )
+        except TargetAdapterError as exc:
+            msg = str(exc)
+            if "credential" in msg.lower():
+                guidance_msg = (
+                    "Required session credential is unavailable in Backend memory. Supply it again and retry."
+                    if session_auth is not None
+                    else f"Required credential for alias '{p.credential_alias}' is unavailable in the Workflow service environment."
+                )
+                return ConnectionCheckResult(
+                    connection_status="unavailable",
+                    reason="credential_unavailable",
+                    diagnostic_category="missing_credentials",
+                    verification_state="credentials_missing",
+                    guidance=guidance_msg,
+                ), 200
+            return ConnectionCheckResult(
+                connection_status="rejected",
+                reason="invalid_probe_configuration",
+                diagnostic_category="configuration_validation_failure",
+                verification_state="configuration_invalid",
+                guidance=self._redacted_text_preview(msg, secrets_to_redact, limit=240),
+            ), 200
+
+        include_previews = protocol == "http-json"
+        req_preview = (
+            self._redacted_request_preview(
+                method,
+                url,
+                headers,
+                request_body,
+                secrets_to_redact,
+                secret_header_names=secret_header_names,
+            )
+            if include_previews
+            else None
+        )
+        max_bytes = 65536 if protocol == "http-json" else 16384
+        client = OneRequestHttpClient(endpoint, timeout, transport=self.probe_transport, max_bytes=max_bytes)
+        try:
+            response = client.request(
+                method=method,
+                url=url,
+                headers=headers,
+                json_body=request_body,
+                timeout=int(resolved_timeout) if resolved_timeout is not None else timeout,
+            )
         except (HttpClientError, ValueError) as exc:
             cause = exc.__cause__
-            reason = ("connection_timeout" if isinstance(cause, httpx.TimeoutException) else
-                      "connection_refused_or_unreachable" if isinstance(cause, httpx.ConnectError) else
-                      "response_too_large_or_bounded" if isinstance(exc, HttpClientError)
-                          and "size limit" in str(exc) else "request_failed_or_bounded")
-            return ConnectionCheckResult(connection_status="unavailable", reason=reason,
-                target_request_count=client.used, connection_reachable=None,
-                runtime_protocol_compatible=None), 200
-        body = response.json_body
-        if response.status_code in {401, 403}:
-            return ConnectionCheckResult(connection_status="unavailable", reason="authentication_required",
-                target_request_count=client.used, connection_reachable=True,
-                runtime_protocol_compatible=None, http_status=response.status_code), 200
-        compatible = (response.status_code == 200 and isinstance(body, dict) and
-            body.get("jsonrpc") == "2.0" and body.get("id") == "secagent-connection-check" and
-            isinstance(body.get("result"), dict) and isinstance(body["result"].get("tools"), list)
-            if protocol == "mcp-jsonrpc" else response.status_code == 200 and isinstance(body, dict)
-            and isinstance(body.get("choices"), list) and bool(body["choices"])
-            and isinstance(body["choices"][0], dict)
-            and isinstance(body["choices"][0].get("message"), dict)
-            and isinstance(body["choices"][0]["message"].get("content"), str))
-        return ConnectionCheckResult(connection_status="succeeded" if compatible else "incompatible",
-            reason=("mcp_tools_list_response" if protocol == "mcp-jsonrpc" else "openai_chat_response") if compatible else
-                   "http_request_rejected" if response.status_code != 200 else "response_contract_unverified",
-            target_request_count=client.used, connection_reachable=True,
-            runtime_protocol_compatible=compatible, http_status=response.status_code), 200
+            is_timeout = isinstance(cause, httpx.TimeoutException)
+            is_connect = isinstance(cause, httpx.ConnectError)
+            is_oversize = isinstance(exc, HttpClientError) and "size limit" in str(exc)
+            reason = (
+                "connection_timeout" if is_timeout else
+                "connection_refused_or_unreachable" if is_connect else
+                "response_too_large_or_bounded" if is_oversize else
+                "request_failed_or_bounded"
+            )
+            guidance = (
+                f"Connection test timed out after {timeout}s without retrying. "
+                "Note: a client-side timeout does not imply that the remote Agent stopped executing. "
+                "Increase Target timeout in Advanced Configuration if your local Agent needs more time."
+                if is_timeout else
+                "Could not connect to the local endpoint. Verify the Target service is running and listening on the configured host and port."
+                if is_connect else
+                f"Target response exceeded the {max_bytes}-byte connection-test safety limit."
+                if is_oversize else
+                "The bounded connection-test request failed."
+            )
+            return ConnectionCheckResult(
+                connection_status="unavailable",
+                reason=reason,
+                target_request_count=client.used,
+                connection_reachable=None,
+                runtime_protocol_compatible=None,
+                diagnostic_category="timeout" if is_timeout else "network_connection_failure",
+                verification_state="transport_failed",
+                guidance=guidance,
+                request_preview=req_preview,
+            ), 200
+
+        resp_preview = (
+            self._redacted_text_preview(response.text, secrets_to_redact, limit=2048)
+            if include_previews
+            else None
+        )
+
+        if response.status_code == 401:
+            return ConnectionCheckResult(
+                connection_status="unavailable",
+                reason="authentication_required",
+                target_request_count=client.used,
+                connection_reachable=True,
+                runtime_protocol_compatible=None,
+                http_status=401,
+                diagnostic_category="http_authentication_failure",
+                verification_state="authentication_failed",
+                guidance=(
+                    "Target returned HTTP 401 Unauthorized. Select a registered credential alias or verify that the "
+                    "server-side credential environment variable contains a valid token."
+                ),
+                request_preview=req_preview,
+                response_preview=resp_preview,
+            ), 200
+
+        if response.status_code == 403:
+            return ConnectionCheckResult(
+                connection_status="unavailable",
+                reason="permission_denied" if protocol == "http-json" else "authentication_required",
+                target_request_count=client.used,
+                connection_reachable=True,
+                runtime_protocol_compatible=None,
+                http_status=403,
+                diagnostic_category="http_permission_failure",
+                verification_state="permission_denied",
+                guidance=(
+                    "Target returned HTTP 403 Forbidden. The request reached the service, but the current credentials "
+                    "lack permission for this endpoint or resource."
+                ),
+                request_preview=req_preview,
+                response_preview=resp_preview,
+            ), 200
+
+        if response.status_code in {400, 422}:
+            return ConnectionCheckResult(
+                connection_status="incompatible",
+                reason="http_request_validation_failed" if protocol == "http-json" else "http_request_rejected",
+                target_request_count=client.used,
+                connection_reachable=True,
+                runtime_protocol_compatible=False,
+                http_status=response.status_code,
+                diagnostic_category="http_request_validation_failure",
+                verification_state="request_rejected",
+                guidance=(
+                    f"Target returned HTTP {response.status_code} validating the request payload. "
+                    "Review required fields, parameter types, and request JSON structure in the response preview."
+                ),
+                request_preview=req_preview,
+                response_preview=resp_preview,
+            ), 200
+
+        if not (200 <= response.status_code < 300):
+            return ConnectionCheckResult(
+                connection_status="incompatible",
+                reason="http_request_rejected",
+                target_request_count=client.used,
+                connection_reachable=True,
+                runtime_protocol_compatible=False,
+                http_status=response.status_code,
+                diagnostic_category="http_error",
+                verification_state="request_rejected",
+                guidance=f"Target returned HTTP {response.status_code}. Inspect the bounded response preview and Target logs.",
+                request_preview=req_preview,
+                response_preview=resp_preview,
+            ), 200
+
+        # 2xx HTTP transport succeeded: extract response via the shared HttpTargetAdapter logic.
+        response_cfg = target_profile.interface.config.get("response")
+        if response.json_body is None or not isinstance(response.json_body, dict):
+            return ConnectionCheckResult(
+                connection_status="incompatible",
+                reason="invalid_response_format" if protocol == "http-json" else "response_contract_unverified",
+                target_request_count=client.used,
+                connection_reachable=True,
+                runtime_protocol_compatible=False,
+                http_status=response.status_code,
+                diagnostic_category="invalid_response_format",
+                verification_state="response_mapping_unresolved",
+                guidance="Target returned HTTP 2xx, but the body was not a JSON object.",
+                request_preview=req_preview,
+                response_preview=resp_preview,
+            ), 200
+
+        exec_result = HttpTargetAdapter._to_execution_result(
+            response,
+            response_cfg,
+            response_only_completion=True,
+        )
+
+        if protocol == "openai-chat":
+            compatible = bool(exec_result.success and isinstance(exec_result.output_text, str))
+            return ConnectionCheckResult(
+                connection_status="succeeded" if compatible else "incompatible",
+                reason="openai_chat_response" if compatible else "response_contract_unverified",
+                target_request_count=client.used,
+                connection_reachable=True,
+                runtime_protocol_compatible=compatible,
+                http_status=response.status_code,
+                diagnostic_category="response_extraction_succeeded" if compatible else "response_extraction_failure",
+                verification_state="connection_verified" if compatible else "response_mapping_unresolved",
+            ), 200
+
+        # Generic http-json: distinguish transport success from response extraction & mapping readiness.
+        effective_response_cfg = (
+            {**dict(response_cfg), "text_path": ""}
+            if unresolved_text_path and isinstance(response_cfg, dict)
+            else response_cfg
+        )
+        text_extracted = (not unresolved_text_path) and bool(exec_result.success and isinstance(exec_result.output_text, str))
+        mapping_diag = self._sanitize_diagnostic_tree(
+            inspect_http_response_shape(
+                response.json_body,
+                effective_response_cfg,
+                extracted_text=exec_result.output_text if text_extracted else None,
+                text_extracted=text_extracted,
+                response_complete=exec_result.response_complete if text_extracted else None,
+            ),
+            secrets_to_redact,
+            opaque=False,
+        )
+        resp_sample = self._redacted_json_sample(response.json_body, secrets_to_redact)
+
+        if not text_extracted:
+            raw_guidance = (
+                f"HTTP {response.status_code} transport succeeded, but response text path is not yet configured. "
+                "Apply a suggested path below and verify against this bounded response sample without sending another request."
+                if unresolved_text_path
+                else (
+                    f"HTTP {response.status_code} transport succeeded, but response text extraction failed "
+                    f"({exec_result.error or 'configured text_path did not match a string'}). "
+                    "Review the response preview and suggested response text paths below."
+                )
+            )
+            return ConnectionCheckResult(
+                connection_status="incompatible",
+                reason="response_extraction_failed",
+                target_request_count=client.used,
+                connection_reachable=True,
+                runtime_protocol_compatible=False,
+                http_status=response.status_code,
+                diagnostic_category="response_extraction_failure",
+                verification_state="response_mapping_unresolved",
+                guidance=self._redacted_text_preview(raw_guidance, secrets_to_redact, limit=512),
+                request_preview=req_preview,
+                response_preview=resp_preview,
+                response_sample=resp_sample,
+                extracted_output=None,
+                mapping_diagnostics=mapping_diag,
+            ), 200
+
+        extracted_preview = self._redacted_text_preview(exec_result.output_text, secrets_to_redact, limit=1024)
+        raw_ok_guidance = (
+            "Connection verified and response text extracted via shared generic_http adapter. "
+            "Note: status completion semantics remain unresolved; confirm complete/incomplete status values before semantic Judge evaluation."
+            if mapping_diag.get("completeness_unresolved")
+            else "Connection verified and response text extracted via shared generic_http adapter. Security testing remains separately authorized."
+        )
+        return ConnectionCheckResult(
+            connection_status="succeeded",
+            reason="http_json_response",
+            target_request_count=client.used,
+            connection_reachable=True,
+            runtime_protocol_compatible=True,
+            http_status=response.status_code,
+            diagnostic_category="response_extraction_succeeded",
+            verification_state="connection_verified",
+            guidance=self._redacted_text_preview(raw_ok_guidance, secrets_to_redact, limit=512),
+            request_preview=req_preview,
+            response_preview=resp_preview,
+            response_sample=resp_sample,
+            extracted_output=extracted_preview,
+            mapping_diagnostics=mapping_diag,
+        ), 200

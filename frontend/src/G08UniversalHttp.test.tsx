@@ -352,6 +352,8 @@ describe('G08 Acceptance Corrections UI (FIX 1, FIX 2, FIX 3, FIX 6)', () => {
         enabled={true}
         localSingleUser={true}
         initialConnect={true}
+        credentialAliases={['bearer_alias']}
+        credentialAliasAvailability={{ bearer_alias: 'available' }}
         nonce={'N'.repeat(43)}
         onChanged={() => {}}
       />,
@@ -527,6 +529,8 @@ describe('G08 Acceptance Corrections UI (FIX 1, FIX 2, FIX 3, FIX 6)', () => {
         enabled={true}
         localSingleUser={true}
         initialConnect={true}
+        credentialAliases={['bearer_alias']}
+        credentialAliasAvailability={{ bearer_alias: 'available' }}
         nonce={'N'.repeat(43)}
         onChanged={() => {}}
       />,

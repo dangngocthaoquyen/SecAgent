@@ -139,43 +139,45 @@ def _classify_openapi_auth(
     op: dict,
     global_security_reqs: list,
     security_schemes: dict,
-) -> tuple[bool, list[str], bool]:
-    """Classify OpenAPI operation authentication requirements and Bearer-alias compatibility.
+) -> tuple[bool, list[str], bool, str, list[str]]:
+    """Classify OpenAPI operation authentication requirements, hints, and Bearer-alias compatibility.
 
-    Returns ``(requires_auth, auth_schemes, auth_scheme_supported)``.
+    Returns ``(requires_auth, auth_schemes, auth_scheme_supported, auth_status, auth_hints)``.
+    ``auth_status`` is one of ``"required"``, ``"may_be_required"``,
+    ``"not_declared"``, or ``"unsupported"``.
     """
     raw_op_sec = op.get("security")
     if isinstance(raw_op_sec, list):
         effective_reqs = raw_op_sec
+        op_declared_empty_sec = len(raw_op_sec) == 0
     else:
         effective_reqs = global_security_reqs
+        op_declared_empty_sec = False
 
-    # Empty security list or an empty requirement object `{}` permits anonymous access.
+    auth_hints: list[str] = []
+    has_anonymous_alt = False
     if effective_reqs:
         has_anonymous_alt = any(isinstance(req, dict) and len(req) == 0 for req in effective_reqs)
         requires_auth = not has_anonymous_alt
     else:
         requires_auth = False
 
-    header_auth_names: list[str] = []
+    required_header_auth_names: list[str] = []
+    optional_header_auth_names: list[str] = []
     if isinstance(op.get("parameters"), list):
         for p in op["parameters"][:50]:
             if (
                 isinstance(p, dict)
                 and p.get("in") == "header"
-                and p.get("required") is not False
                 and str(p.get("name") or "").lower() in {"authorization", "x-api-key"}
             ):
-                header_auth_names.append(str(p.get("name") or "").lower())
-    if not requires_auth and header_auth_names:
+                hname = str(p.get("name") or "").lower()
+                if p.get("required") is True:
+                    required_header_auth_names.append(hname)
+                else:
+                    optional_header_auth_names.append(hname)
+    if not requires_auth and required_header_auth_names:
         requires_auth = True
-
-    if not requires_auth:
-        return False, [], True
-
-    scheme_labels: list[str] = []
-    any_alternative_supported = False
-    has_typed_scheme_req = False
 
     def _scheme_supported(scheme_name: str) -> tuple[str, bool]:
         raw_def = security_schemes.get(scheme_name)
@@ -193,12 +195,24 @@ def _classify_openapi_auth(
             loc = str(resolved.get("in") or "").strip().lower()
             hdr_name = str(resolved.get("name") or "").strip().lower()
             label = f"apiKey:{loc or 'unknown'}" + (f":{hdr_name[:32]}" if hdr_name else "")
-            return label, (loc == "header" and hdr_name == "authorization")
+            valid_hdr = (
+                loc == "header"
+                and bool(re.fullmatch(r"[a-z][a-z0-9-]{0,63}", hdr_name))
+                and hdr_name not in {
+                    "host", "content-type", "content-length", "cookie", "set-cookie",
+                    "proxy-authorization", "transfer-encoding", "connection",
+                }
+            )
+            return label, valid_hdr
         if stype == "basic":
             return "basic", False
         if stype in {"oauth2", "openidconnect", "mutualtls"}:
             return stype, False
         return stype or "unknown", False
+
+    scheme_labels: list[str] = []
+    any_alternative_supported = False
+    has_typed_scheme_req = False
 
     for req in effective_reqs[:10]:
         if not isinstance(req, dict) or not req:
@@ -217,15 +231,161 @@ def _classify_openapi_auth(
         if alt_supported:
             any_alternative_supported = True
 
-    if not has_typed_scheme_req and header_auth_names:
-        for hname in header_auth_names:
+    if not requires_auth:
+        if optional_header_auth_names:
+            for hname in optional_header_auth_names:
+                lbl = f"optional_header:{hname}"
+                if lbl not in auth_hints:
+                    auth_hints.append(lbl)
+        if has_anonymous_alt and has_typed_scheme_req:
+            auth_hints.append("optional_security_requirement")
+        if not op_declared_empty_sec and not effective_reqs and security_schemes:
+            auth_hints.append("security_schemes_declared_in_spec")
+            for sname in list(security_schemes.keys())[:5]:
+                if isinstance(sname, str):
+                    label, _ = _scheme_supported(sname)
+                    if label not in scheme_labels and len(scheme_labels) < 10:
+                        scheme_labels.append(label)
+        auth_status = "may_be_required" if auth_hints else "not_declared"
+        return False, scheme_labels, True, auth_status, auth_hints
+
+    if not has_typed_scheme_req and required_header_auth_names:
+        for hname in required_header_auth_names:
             lbl = f"header:{hname}"
             if lbl not in scheme_labels:
                 scheme_labels.append(lbl)
-            if hname == "authorization":
+            if hname in {"authorization", "x-api-key"}:
                 any_alternative_supported = True
 
-    return True, scheme_labels, any_alternative_supported
+    auth_status = "required" if any_alternative_supported else "unsupported"
+    return True, scheme_labels, any_alternative_supported, auth_status, auth_hints
+
+
+def _find_nested_schema_paths(
+    doc: dict,
+    schema: dict,
+    *,
+    max_depth: int = 3,
+    max_nodes: int = 40,
+) -> list[tuple[str, str, dict, int]]:
+    """Bounded BFS over object schema properties returning (dotted_path, leaf_name, resolved_prop_schema, depth)."""
+    results: list[tuple[str, str, dict, int]] = []
+    queue: list[tuple[str, dict, int]] = [("", schema, 0)]
+    visited = 0
+    while queue and visited < max_nodes:
+        prefix, cur_schema, depth = queue.pop(0)
+        if depth >= max_depth:
+            continue
+        props = cur_schema.get("properties")
+        if not isinstance(props, dict):
+            continue
+        for pname, pval in list(props.items())[:25]:
+            if visited >= max_nodes:
+                break
+            if not isinstance(pname, str) or not pname or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,63}", pname):
+                continue
+            visited += 1
+            resolved = _resolve_local_ref(doc, pval) or {}
+            dotted = f"{prefix}.{pname}" if prefix else pname
+            results.append((dotted, pname, resolved, depth + 1))
+            if resolved.get("type") == "object" and isinstance(resolved.get("properties"), dict) and depth + 1 < max_depth:
+                queue.append((dotted, resolved, depth + 1))
+    return results
+
+
+def _build_request_body_template(
+    doc: dict,
+    schema: dict,
+    input_path: str,
+    *,
+    prefix: str = "",
+    depth: int = 0,
+    max_depth: int = 3,
+) -> tuple[dict[str, object], list[str], list[dict[str, object]], list[dict[str, object]], bool]:
+    """Recursively build a bounded JSON request body template and unresolved required field specs."""
+    props = schema.get("properties")
+    if not isinstance(props, dict) or depth > max_depth:
+        return {}, [], [], [], False
+    required_raw = schema.get("required")
+    required_set = {r for r in required_raw if isinstance(r, str)} if isinstance(required_raw, list) else set()
+    body_template: dict[str, object] = {}
+    unresolved_required: list[str] = []
+    unresolved_required_specs: list[dict[str, object]] = []
+    optional_specs: list[dict[str, object]] = []
+    prop_items = list(props.items())
+    extraction_incomplete = len(prop_items) > 25
+    covered_names: set[str] = set()
+
+    for pname, pval in prop_items[:25]:
+        if not isinstance(pname, str) or not pname:
+            continue
+        covered_names.add(pname)
+        full_name = f"{prefix}.{pname}" if prefix else pname
+        ps = _resolve_local_ref(doc, pval) or {}
+        ptype = ps.get("type") if isinstance(ps.get("type"), str) else "string"
+
+        if full_name == input_path:
+            if full_name == "messages":
+                body_template[pname] = [{"role": "user", "content": "{{input}}"}]
+            else:
+                body_template[pname] = "{{input}}"
+            continue
+
+        # Descend into nested objects that contain input_path or are required objects with properties.
+        is_input_ancestor = input_path.startswith(full_name + ".")
+        if (
+            depth < max_depth
+            and isinstance(ps.get("properties"), dict)
+            and (is_input_ancestor or pname in required_set)
+        ):
+            sub_body, sub_unres, sub_specs, sub_opt, sub_inc = _build_request_body_template(
+                doc, ps, input_path, prefix=full_name, depth=depth + 1, max_depth=max_depth
+            )
+            body_template[pname] = sub_body
+            unresolved_required.extend(sub_unres)
+            unresolved_required_specs.extend(sub_specs)
+            optional_specs.extend(sub_opt)
+            if sub_inc:
+                extraction_incomplete = True
+            continue
+
+        if "default" in ps and isinstance(ps["default"], (str, int, float, bool)):
+            body_template[pname] = ps["default"]
+            if pname not in required_set:
+                opt_entry: dict[str, object] = {"name": full_name, "type": ptype, "default": ps["default"]}
+                optional_specs.append(opt_entry)
+        elif pname in required_set:
+            enum_vals = ps.get("enum")
+            if isinstance(enum_vals, list) and len(enum_vals) == 1 and isinstance(enum_vals[0], (str, int, bool)):
+                body_template[pname] = enum_vals[0]
+            else:
+                unresolved_required.append(full_name)
+                spec_entry: dict[str, object] = {"name": full_name, "type": ptype, "location": "body"}
+                if isinstance(enum_vals, list) and enum_vals and all(isinstance(v, (str, int, float, bool)) for v in enum_vals[:20]):
+                    spec_entry["enum"] = list(enum_vals[:20])
+                unresolved_required_specs.append(spec_entry)
+                body_template[pname] = f"<REQUIRED:{full_name}>"
+        else:
+            # Optional parameter without an explicit scalar default is omitted from the request template.
+            opt_entry = {"name": full_name, "type": ptype}
+            enum_vals = ps.get("enum")
+            if isinstance(enum_vals, list) and enum_vals and all(isinstance(v, (str, int, float, bool)) for v in enum_vals[:20]):
+                opt_entry["enum"] = list(enum_vals[:20])
+            optional_specs.append(opt_entry)
+
+    # Ensure required fields beyond the 25-property cap or absent from properties are NEVER silently dropped.
+    for req_name in sorted(required_set):
+        full_name = f"{prefix}.{req_name}" if prefix else req_name
+        if full_name == input_path or req_name in covered_names:
+            continue
+        extraction_incomplete = True
+        ps = _resolve_local_ref(doc, props.get(req_name)) if req_name in props else None
+        ptype = ps.get("type") if isinstance(ps, dict) and isinstance(ps.get("type"), str) else "unknown"
+        unresolved_required.append(full_name)
+        unresolved_required_specs.append({"name": full_name, "type": ptype, "location": "body"})
+        body_template[req_name] = f"<REQUIRED:{full_name}>"
+
+    return body_template, unresolved_required, unresolved_required_specs, optional_specs, extraction_incomplete
 
 
 def _extract_openapi_candidates(doc: dict, origin: str, *, preferred_path: str | None = None) -> list[dict]:
@@ -276,33 +436,35 @@ def _extract_openapi_candidates(doc: dict, origin: str, *, preferred_path: str |
         props = req_schema.get("properties")
         if not isinstance(props, dict) or not props:
             continue
-        required_raw = req_schema.get("required")
-        required_set = {r for r in required_raw if isinstance(r, str)} if isinstance(required_raw, list) else set()
 
-        # Identify likely input text field (or OpenAI messages array).
+        # Identify likely input text field (top-level or bounded nested object, or OpenAI messages array).
         input_field: str | None = None
         ambiguous_input_field = False
         if "messages" in props and raw_path in {"/v1/chat/completions", "/chat/completions"}:
             input_field = "messages"
         else:
-            priority_matches: list[str] = []
-            for cand_name in _INPUT_FIELD_PRIORITY:
-                if cand_name in props:
-                    ps = _resolve_local_ref(doc, props[cand_name])
-                    if isinstance(ps, dict) and ps.get("type") in {None, "string"}:
-                        priority_matches.append(cand_name)
+            nested_req_nodes = _find_nested_schema_paths(doc, req_schema, max_depth=3, max_nodes=40)
+            priority_matches: list[tuple[int, int, str]] = []
+            for dotted, leaf, ps, depth in nested_req_nodes:
+                if leaf in _INPUT_FIELD_PRIORITY and ps.get("type") in {None, "string"}:
+                    priority_matches.append((_INPUT_FIELD_PRIORITY.index(leaf), depth, dotted))
+            priority_matches.sort(key=lambda x: (x[1], x[0], x[2]))
             if priority_matches:
-                input_field = priority_matches[0]
-                if len(priority_matches) > 1:
+                # Prefer shallowest priority match; mark ambiguous if multiple priority matches exist at that depth.
+                best_depth = priority_matches[0][1]
+                same_depth = [m for m in priority_matches if m[1] == best_depth]
+                input_field = same_depth[0][2]
+                if len(same_depth) > 1:
                     ambiguous_input_field = True
             else:
                 string_fields: list[str] = []
-                for pname, pval in props.items():
-                    if not isinstance(pname, str):
-                        continue
-                    ps = _resolve_local_ref(doc, pval)
-                    if isinstance(ps, dict) and ps.get("type") == "string":
-                        string_fields.append(pname)
+                for dotted, _leaf, ps, depth in nested_req_nodes:
+                    if depth == 1 and ps.get("type") == "string":
+                        string_fields.append(dotted)
+                if not string_fields:
+                    for dotted, _leaf, ps, _depth in nested_req_nodes:
+                        if ps.get("type") == "string":
+                            string_fields.append(dotted)
                 if string_fields:
                     input_field = string_fields[0]
                     if len(string_fields) > 1:
@@ -310,47 +472,13 @@ def _extract_openapi_candidates(doc: dict, origin: str, *, preferred_path: str |
         if input_field is None:
             continue
 
-        body_template: dict[str, object] = {}
-        unresolved_required: list[str] = []
-        unresolved_required_specs: list[dict[str, object]] = []
-        prop_items = list(props.items())
-        extraction_incomplete = len(prop_items) > 25
-        covered_names: set[str] = set()
-        for pname, pval in prop_items[:25]:
-            if not isinstance(pname, str) or not pname:
-                continue
-            covered_names.add(pname)
-            ps = _resolve_local_ref(doc, pval) or {}
-            ptype = ps.get("type") if isinstance(ps.get("type"), str) else "string"
-            if pname == input_field:
-                if pname == "messages":
-                    body_template[pname] = [{"role": "user", "content": "{{input}}"}]
-                else:
-                    body_template[pname] = "{{input}}"
-            elif "default" in ps and isinstance(ps["default"], (str, int, float, bool)):
-                body_template[pname] = ps["default"]
-            elif pname in required_set:
-                enum_vals = ps.get("enum")
-                if isinstance(enum_vals, list) and len(enum_vals) == 1 and isinstance(enum_vals[0], (str, int, bool)):
-                    body_template[pname] = enum_vals[0]
-                else:
-                    unresolved_required.append(pname)
-                    spec_entry: dict[str, object] = {"name": pname, "type": ptype, "location": "body"}
-                    if isinstance(enum_vals, list) and enum_vals and all(isinstance(v, (str, int, float, bool)) for v in enum_vals[:20]):
-                        spec_entry["enum"] = list(enum_vals[:20])
-                    unresolved_required_specs.append(spec_entry)
-                    body_template[pname] = f"<REQUIRED:{pname}>"
-
-        # Ensure required fields beyond the 25-property cap or absent from properties are NEVER silently dropped.
-        for req_name in sorted(required_set):
-            if req_name == input_field or req_name in covered_names:
-                continue
-            extraction_incomplete = True
-            ps = _resolve_local_ref(doc, props.get(req_name)) if req_name in props else None
-            ptype = ps.get("type") if isinstance(ps, dict) and isinstance(ps.get("type"), str) else "unknown"
-            unresolved_required.append(req_name)
-            unresolved_required_specs.append({"name": req_name, "type": ptype, "location": "body"})
-            body_template[req_name] = f"<REQUIRED:{req_name}>"
+        (
+            body_template,
+            unresolved_required,
+            unresolved_required_specs,
+            optional_specs,
+            extraction_incomplete,
+        ) = _build_request_body_template(doc, req_schema, input_field)
 
         # Detect unsupported required query/header parameters (other than standard auth headers).
         unsupported_required_params: list[dict[str, str]] = []
@@ -385,43 +513,57 @@ def _extract_openapi_candidates(doc: dict, origin: str, *, preferred_path: str |
         text_path: str | None = "choices.0.message.content" if raw_path in {"/v1/chat/completions", "/chat/completions"} else None
         correlation_id_path: str | None = None
         status_path: str | None = None
+        status_enum_values: list[str] = []
         evidence_mapping: dict | None = None
         if isinstance(resp_schema, dict) and isinstance(resp_schema.get("properties"), dict):
-            rprops = resp_schema["properties"]
+            nested_resp_nodes = _find_nested_schema_paths(doc, resp_schema, max_depth=3, max_nodes=40)
             if text_path is None:
-                for tname in _RESPONSE_TEXT_PRIORITY:
-                    if tname in rprops:
-                        text_path = tname
-                        break
-            for cname in _CORRELATION_ID_PRIORITY:
-                if cname in rprops:
-                    correlation_id_path = cname
+                text_matches: list[tuple[int, int, str]] = []
+                for dotted, leaf, ps, depth in nested_resp_nodes:
+                    if leaf in _RESPONSE_TEXT_PRIORITY and ps.get("type") in {None, "string"}:
+                        text_matches.append((_RESPONSE_TEXT_PRIORITY.index(leaf), depth, dotted))
+                text_matches.sort(key=lambda x: (x[1], x[0], x[2]))
+                if text_matches:
+                    text_path = text_matches[0][2]
+            corr_matches: list[tuple[int, int, str]] = []
+            for dotted, leaf, _ps, depth in nested_resp_nodes:
+                if leaf in _CORRELATION_ID_PRIORITY:
+                    corr_matches.append((_CORRELATION_ID_PRIORITY.index(leaf), depth, dotted))
+            corr_matches.sort(key=lambda x: (x[1], x[0], x[2]))
+            if corr_matches:
+                correlation_id_path = corr_matches[0][2]
+            for dotted, leaf, ps, _depth in nested_resp_nodes:
+                if leaf == "status":
+                    status_path = dotted
+                    raw_enum = ps.get("enum")
+                    if isinstance(raw_enum, list):
+                        status_enum_values = [str(v) for v in raw_enum[:12] if isinstance(v, str)]
                     break
-            if "status" in rprops:
-                status_path = "status"
-            for ename in _EVIDENCE_ARRAY_PRIORITY:
-                if ename in rprops:
-                    es = _resolve_local_ref(doc, rprops[ename])
-                    if isinstance(es, dict) and es.get("type") == "array":
-                        item_schema = _resolve_local_ref(doc, es.get("items"))
-                        item_props = item_schema.get("properties") if isinstance(item_schema, dict) and isinstance(item_schema.get("properties"), dict) else {}
-                        mapping: dict[str, object] = {"items": ename}
-                        for target_key, aliases in (
-                            ("event_id", ("seq", "id", "event_id", "step_id")),
-                            ("action", ("action", "tool", "operation", "name", "type")),
-                            ("arguments", ("action_input", "arguments", "parameters", "args", "input")),
-                            ("decision", ("decision",)),
-                            ("status", ("status",)),
-                            ("observation", ("observation", "result", "output", "content")),
-                            ("timestamp", ("timestamp", "created_at", "at")),
-                        ):
-                            found_key = next((a for a in aliases if a in item_props), None)
-                            if found_key:
-                                mapping[target_key] = found_key
-                        evidence_mapping = mapping
-                        break
+            ev_matches: list[tuple[int, int, str, dict]] = []
+            for dotted, leaf, ps, depth in nested_resp_nodes:
+                if leaf in _EVIDENCE_ARRAY_PRIORITY and ps.get("type") == "array":
+                    ev_matches.append((_EVIDENCE_ARRAY_PRIORITY.index(leaf), depth, dotted, ps))
+            ev_matches.sort(key=lambda x: (x[1], x[0], x[2]))
+            if ev_matches:
+                _, _, ename, es = ev_matches[0]
+                item_schema = _resolve_local_ref(doc, es.get("items"))
+                item_props = item_schema.get("properties") if isinstance(item_schema, dict) and isinstance(item_schema.get("properties"), dict) else {}
+                mapping: dict[str, object] = {"items": ename}
+                for target_key, aliases in (
+                    ("event_id", ("seq", "id", "event_id", "step_id")),
+                    ("action", ("action", "tool", "operation", "name", "type")),
+                    ("arguments", ("action_input", "arguments", "parameters", "args", "input")),
+                    ("decision", ("decision",)),
+                    ("status", ("status",)),
+                    ("observation", ("observation", "result", "output", "content")),
+                    ("timestamp", ("timestamp", "created_at", "at")),
+                ):
+                    found_key = next((a for a in aliases if a in item_props), None)
+                    if found_key:
+                        mapping[target_key] = found_key
+                evidence_mapping = mapping
 
-        requires_auth, auth_schemes, auth_scheme_supported = _classify_openapi_auth(
+        requires_auth, auth_schemes, auth_scheme_supported, auth_status, auth_hints = _classify_openapi_auth(
             doc, op, global_security_reqs, security_schemes
         )
 
@@ -442,12 +584,24 @@ def _extract_openapi_candidates(doc: dict, origin: str, *, preferred_path: str |
             limitations.append("Multiple candidate string input fields exist; confirm which field receives '{{input}}'.")
         if text_path is None:
             limitations.append("Response text field was not reliably identified from schema; confirm response text path manually.")
-        if requires_auth and not auth_scheme_supported:
+        if status_path:
+            limitations.append(
+                f"Status field '{status_path}' was discovered, but completion semantics (complete/incomplete status values) are not declared in OpenAPI; confirm before semantic Judge evaluation."
+            )
+        if auth_status == "unsupported":
             limitations.append(
                 "Operation requires an authentication scheme not supported by server-managed Bearer credential aliases."
             )
-        elif requires_auth:
+        elif auth_status == "required":
             limitations.append("Operation advertises authentication; select a server-managed credential alias before validating or saving.")
+        elif auth_status == "may_be_required":
+            limitations.append(
+                "Authentication may be required (optional security/header hint or spec securitySchemes detected). Select a credential alias if the service enforces authentication."
+            )
+        else:
+            limitations.append(
+                "OpenAPI does not declare authentication for this operation; this does not verify anonymous access if middleware enforces auth."
+            )
 
         summary = op.get("summary") if isinstance(op.get("summary"), str) else ""
         op_id = op.get("operationId") if isinstance(op.get("operationId"), str) else ""
@@ -466,15 +620,20 @@ def _extract_openapi_candidates(doc: dict, origin: str, *, preferred_path: str |
             "operation_id": op_id[:128],
             "summary": summary[:200],
             "requires_auth": requires_auth,
+            "auth_status": auth_status,
             "auth_schemes": auth_schemes,
+            "auth_hints": auth_hints,
             "auth_scheme_supported": auth_scheme_supported,
             "input_field": input_field,
             "ambiguous_input_field": ambiguous_input_field,
             "extraction_incomplete": extraction_incomplete,
             "unresolved_required_fields": unresolved_required,
             "unresolved_required_field_specs": unresolved_required_specs,
+            "optional_field_specs": optional_specs[:20],
             "unsupported_required_parameters": unsupported_required_params,
             "response_text_path_discovered": text_path is not None,
+            "status_enum_values": status_enum_values,
+            "mapping_provenance": "openapi_schema_heuristic",
             "limitations": limitations,
             "suggested_http_config": {
                 "method": "POST",
@@ -622,7 +781,7 @@ class DiscoveryEngine:
 
     def discover(self, request: DiscoveryRequest, *, allowed_aliases: set[str],
                  testcase_items: list[dict], text_case_ids: set[str]) -> dict:
-        allow_custom_http = request.protocol_hint in {"openapi-http", "http-json"} or bool(request.spec_url)
+        allow_custom_http = request.protocol_hint in {None, "openapi-http", "http-json"} or bool(request.spec_url)
         origin, input_path, canonical = canonical_input(request.url, allow_custom_http_path=allow_custom_http)
         spec_path: str | None = None
         if request.spec_url:
@@ -704,13 +863,21 @@ class DiscoveryEngine:
         finally:
             client.close()
         explicit_chat = input_path in {"/v1/chat/completions", "/chat/completions"}
-        chat_path = input_path if explicit_chat else openapi_chat_path
-        matching_custom_candidate = (
+        custom_path_supplied = input_path not in INPUT_PATHS
+        # Never silently substitute /v1/chat/completions or another operation when
+        # the operator explicitly supplied a specific custom REST endpoint path.
+        chat_path = input_path if explicit_chat else (None if custom_path_supplied else openapi_chat_path)
+        exact_custom_match = (
             next((c for c in openapi_candidates if c["path"] == input_path), None)
-            if input_path not in INPUT_PATHS
+            if custom_path_supplied
+            else None
+        )
+        matching_custom_candidate = (
+            exact_custom_match
+            if custom_path_supplied
             else (openapi_candidates[0] if len(openapi_candidates) == 1 and not chat_path else None)
         )
-        unambiguous_custom = (
+        candidate_ready = (
             matching_custom_candidate is not None
             and not matching_custom_candidate.get("unresolved_required_fields")
             and not matching_custom_candidate.get("unsupported_required_parameters")
@@ -719,27 +886,37 @@ class DiscoveryEngine:
             and matching_custom_candidate.get("response_text_path_discovered") is True
             and not matching_custom_candidate.get("requires_auth")
         )
+        # Separate candidate identification from configuration readiness:
+        # an exact supplied endpoint path matching a supported OpenAPI operation is
+        # automatically proposed as an unconfirmed review draft even when required
+        # application parameters or authentication still need operator resolution.
+        selected_custom_candidate = (
+            exact_custom_match
+            if exact_custom_match is not None
+            else (matching_custom_candidate if candidate_ready else None)
+        )
+        is_http_json = selected_custom_candidate is not None and not (mcp_mode or (chat_path and not exact_custom_match))
         endpoint = (
             canonical
             if mcp_mode and sources[0]["status"] == "advertised"
             else (
-                origin + chat_path
-                if chat_path
-                else (matching_custom_candidate["endpoint"] if unambiguous_custom and matching_custom_candidate else None)
+                selected_custom_candidate["endpoint"]
+                if is_http_json and selected_custom_candidate
+                else (origin + chat_path if chat_path else None)
             )
         )
         protocol_candidates = []
         if mcp_mode and endpoint:
             protocol_candidates.append({"id": "mcp-jsonrpc", "classification": "observed_tools_list",
                 "source": canonical, "runtime_verified": False})
+        elif is_http_json and selected_custom_candidate:
+            protocol_candidates.append({"id": "http-json", "classification": "advertised_metadata",
+                "source": origin + (spec_path or "/openapi.json"),
+                "runtime_verified": False})
         elif chat_path and endpoint:
             protocol_candidates.append({"id": "openai-chat", "classification":
                 "operator_supplied" if explicit_chat else "advertised_metadata",
                 "source": canonical if explicit_chat else origin + "/openapi.json",
-                "runtime_verified": False})
-        elif unambiguous_custom and matching_custom_candidate:
-            protocol_candidates.append({"id": "http-json", "classification": "advertised_metadata",
-                "source": origin + (spec_path or "/openapi.json"),
                 "runtime_verified": False})
         if any((row["url"].endswith("/openapi.json") or (spec_path and row["url"].endswith(spec_path))) and row["status"] == "advertised" for row in sources):
             protocol_candidates.append({"id": "openapi-http", "classification": "advertised_metadata",
@@ -752,28 +929,67 @@ class DiscoveryEngine:
             proposed = {"id": target_id, "name": "Local AI Agent", "platform_id": "local-agent",
                         "platform_name": "Local Agent", "endpoint": endpoint,
                         "protocol": "mcp-jsonrpc", "model": "mcp-service", "timeout_seconds": 30}
+        elif is_http_json and selected_custom_candidate:
+            slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", selected_custom_candidate["path"].strip("/")).strip("-")[:40] or "http-api"
+            http_id = f"local-http-{urlsplit(origin).port}-{slug}"[:120]
+            raw_summary = selected_custom_candidate.get("summary") or ""
+            clean_name = re.sub(r"[^A-Za-z0-9 ._-]+", " ", raw_summary).strip()[:100]
+            fallback_name = re.sub(r"[^A-Za-z0-9 ._-]+", " ", f"HTTP Agent {selected_custom_candidate['path']}").strip()[:100]
+            proposed = {
+                "id": http_id,
+                "name": clean_name or fallback_name or "HTTP Agent",
+                "platform_id": "local-agent",
+                "platform_name": "Local Agent",
+                "endpoint": selected_custom_candidate["endpoint"],
+                "protocol": "http-json",
+                "model": None,
+                "timeout_seconds": 30,
+                "http_config": selected_custom_candidate["suggested_http_config"],
+            }
         elif chat_path and endpoint:
             proposed = {"id": target_id, "name": "Local AI Agent", "platform_id": "local-agent",
                         "platform_name": "Local Agent", "endpoint": endpoint,
                         "protocol": "openai-chat", "model": models[0] if models else "", "timeout_seconds": 30}
-        elif unambiguous_custom and matching_custom_candidate:
-            proposed = {"id": target_id, "name": "Local AI Agent", "platform_id": "local-agent",
-                        "platform_name": "Local Agent", "endpoint": matching_custom_candidate["endpoint"],
-                        "protocol": "http-json", "model": None, "timeout_seconds": 30,
-                        "http_config": matching_custom_candidate["suggested_http_config"]}
         else:
             proposed = None
-        unknown = (["model", "tool_execution", "handler_receipt", "trace_completeness",
-                    "agent_selected_action"] + ([] if endpoint else ["mcp_endpoint"])
-                   if mcp_mode else
-                   [field for field, known in (("runtime_chat_contract", False),
-                    ("tool_execution", False), ("model", bool(models)),
-                    ("chat_endpoint", bool(endpoint))) if not known])
-        if len(openapi_candidates) > 1 and not chat_path:
+
+        if is_http_json and selected_custom_candidate:
+            if selected_custom_candidate.get("auth_scheme_supported") is False:
+                configuration_readiness = "unsupported_authentication"
+            elif candidate_ready:
+                configuration_readiness = "ready_for_review"
+            else:
+                configuration_readiness = "incomplete_configuration"
+        elif proposed is not None:
+            configuration_readiness = "ready_for_review"
+        elif openapi_candidates:
+            configuration_readiness = "selection_required"
+        else:
+            configuration_readiness = "manual_configuration_required"
+
+        has_non_chat_openapi = bool(openapi_candidates) and not chat_path
+        if mcp_mode:
+            unknown = (["model", "tool_execution", "handler_receipt", "trace_completeness",
+                        "agent_selected_action"] + ([] if endpoint else ["mcp_endpoint"]))
+        elif is_http_json or has_non_chat_openapi:
+            unknown = ["runtime_http_contract", "tool_execution"]
+            if not endpoint:
+                unknown.append("http_endpoint")
+            if selected_custom_candidate:
+                if not selected_custom_candidate.get("response_text_path_discovered"):
+                    unknown.append("response_text_path")
+                if selected_custom_candidate.get("suggested_http_config", {}).get("response", {}).get("status_path"):
+                    unknown.append("response_completion_semantics")
+        else:
+            unknown = [field for field, known in (("runtime_chat_contract", False),
+                        ("tool_execution", False), ("model", bool(models)),
+                        ("chat_endpoint", bool(endpoint))) if not known]
+        if len(openapi_candidates) > 1 and not chat_path and exact_custom_match is None:
             unknown.append("ambiguous_openapi_operation_selection")
-        if any(c.get("unresolved_required_fields") for c in openapi_candidates):
+        relevant_candidates = [selected_custom_candidate] if selected_custom_candidate else openapi_candidates
+        if any(c.get("unresolved_required_fields") for c in relevant_candidates):
             unknown.append("unresolved_required_request_parameters")
-        if any(c.get("requires_auth") for c in openapi_candidates):
+        if any(c.get("requires_auth") for c in relevant_candidates):
             unknown.append("authentication_credential_alias")
         warnings = ["Metadata and operator input do not verify runtime behavior or execution authorization."]
         for condition, message in (("timeout", "A metadata request timed out."),
@@ -782,7 +998,11 @@ class DiscoveryEngine:
                                    ("http_error", "A metadata endpoint returned an HTTP error.")):
             if any(row["status"] == condition for row in sources):
                 warnings.append(message)
-        if openapi_candidates and proposed is None:
+        if exact_custom_match is not None and not candidate_ready:
+            warnings.append("Exact OpenAPI operation was matched as a review draft, but unresolved required parameters, authentication, or response mapping still require operator confirmation before saving or probing.")
+        elif custom_path_supplied and exact_custom_match is None and openapi_candidates:
+            warnings.append(f"The requested endpoint path '{input_path}' was not found as a supported POST JSON operation in the discovered OpenAPI specification. Select another discovered operation explicitly or configure manually.")
+        elif openapi_candidates and proposed is None:
             warnings.append("OpenAPI candidates were discovered, but require explicit operator selection and confirmation of unresolved fields or authentication before saving.")
         elif not endpoint:
             warnings.append("No supported target endpoint was verified; configure the target manually.")
@@ -798,9 +1018,10 @@ class DiscoveryEngine:
         connection_status = ("reachable" if any(row["status"] in {"advertised", "missing", "malformed", "http_error"} for row in sources)
                              else "unavailable")
         evidence_candidates = []
+        detected_protocol = "mcp-jsonrpc" if mcp_mode else ("http-json" if is_http_json else "openai-chat")
         for provider in self.evidence_providers:
             evidence_candidates.extend(provider.candidates(origin=origin, endpoint=endpoint,
-                protocol="mcp-jsonrpc" if mcp_mode else "openai-chat", connection_status=connection_status,
+                protocol=detected_protocol, connection_status=connection_status,
                 tools=tuple(advertised_tools), models=tuple(models)))
         evidence_candidates = evidence_candidates[:20]
         recommendations = []
@@ -859,11 +1080,35 @@ class DiscoveryEngine:
             },
             "operator_confirmed": False,
         }
+        selected_text_path = (
+            selected_custom_candidate.get("suggested_http_config", {}).get("response", {}).get("text_path")
+            if selected_custom_candidate
+            else None
+        )
+        possible_contracts = (
+            [{"request": "mcp-tools-call-v1", "response": "mcp-jsonrpc-result-v1",
+              "classification": "tools_list_only_action_unverified"}]
+            if mcp_mode and endpoint
+            else (
+                [{"request": "http-json-template-v1", "response": selected_text_path or "unconfigured",
+                  "classification": "advertised_metadata_unverified"}]
+                if is_http_json and endpoint
+                else (
+                    [{"request": "openai-chat-user-message-v1",
+                      "response": "choices.0.message.content",
+                      "classification": "advertised_or_operator_supplied_unverified"}]
+                    if chat_path and endpoint
+                    else []
+                )
+            )
+        )
         record = {"workflow_schema_version": "1.0.0", "discovery_id": discovery_id,
             "discovered_at": discovered_at,
             "input_url": canonical, "source_endpoint": canonical,
             "canonical_endpoint": endpoint,
             "status": status, "connection_status": connection_status,
+            "configuration_readiness": configuration_readiness,
+            "exact_match_path": exact_custom_match["path"] if exact_custom_match else None,
             "request_count": len(sources), "request_budget": MAX_REQUESTS,
             "metadata_sources": sources, "protocol_candidates": protocol_candidates,
             "openapi_candidates": openapi_candidates,
@@ -877,11 +1122,7 @@ class DiscoveryEngine:
             "advertised_skills": [{"name": name, "source": origin + "/.well-known/agent.json",
                                    "classification": "advertised_metadata"} for name in advertised_skills],
             "suggested_application_details": suggested_details,
-            "possible_contracts": ([{"request": "mcp-tools-call-v1", "response": "mcp-jsonrpc-result-v1",
-                                    "classification": "tools_list_only_action_unverified"}] if mcp_mode and endpoint else
-                [{"request": "openai-chat-user-message-v1",
-                                    "response": "choices.0.message.content",
-                                    "classification": "advertised_or_operator_supplied_unverified"}] if endpoint else []),
+            "possible_contracts": possible_contracts,
             "unknown_fields": unknown, "warnings": warnings,
             "recommendations": recommendations,
             "proposed_profile": proposed, "credential_alias": request.credential_alias,
@@ -947,6 +1188,7 @@ class DiscoveryEngine:
             profile["endpoint"],
             profile["protocol"],
             credential_alias=profile.get("credential_alias"),
+            session_auth=profile.get("session_auth"),
         )
         record["saved_target_id"] = profile["id"]
         record["profile_revision"] = profile["profile_revision"]
@@ -960,17 +1202,11 @@ class DiscoveryEngine:
         protocol: str,
         *,
         credential_alias: str | None = None,
+        session_auth: object | None = None,
     ) -> dict:
         record = self.load(discovery_id)
         if record["profile_revision"] is not None:
             raise DiscoveryError("discovery_profile_mismatch")
-        proposed = record.get("proposed_profile")
-        if (
-            isinstance(proposed, dict)
-            and record.get("canonical_endpoint") == endpoint
-            and proposed.get("protocol") == protocol
-        ):
-            return record
         if protocol == "http-json":
             candidates = record.get("openapi_candidates") or []
             matched = next(
@@ -981,7 +1217,16 @@ class DiscoveryEngine:
                 if matched.get("requires_auth") is True:
                     if matched.get("auth_scheme_supported") is False:
                         raise DiscoveryError("unsupported_authentication_scheme")
-                    if not (isinstance(credential_alias, str) and credential_alias.strip()):
+                    has_alias = isinstance(credential_alias, str) and bool(credential_alias.strip())
+                    has_session = session_auth is not None
+                    if not (has_alias or has_session):
                         raise DiscoveryError("discovery_authentication_required")
                 return record
+        proposed = record.get("proposed_profile")
+        if (
+            isinstance(proposed, dict)
+            and record.get("canonical_endpoint") == endpoint
+            and proposed.get("protocol") == protocol
+        ):
+            return record
         raise DiscoveryError("discovery_profile_mismatch")

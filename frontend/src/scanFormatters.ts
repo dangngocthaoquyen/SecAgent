@@ -60,6 +60,7 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   starting: 'Starting',
   running: 'Running',
   completed: 'Completed',
+  completed_with_errors: 'Completed with errors',
   failed: 'Failed',
   interrupted: 'Interrupted',
   cancelled: 'Cancelled',
@@ -368,6 +369,7 @@ export function verdictBadgeClass(verdict: string | null | undefined): string {
 export function runStatusBadgeClass(status: string | null | undefined): string {
   const s = (status || '').toLowerCase();
   if (s === 'completed') return 'badge pass';
+  if (s === 'completed_with_errors') return 'badge warn';
   if (s === 'preparing' || s === 'running' || s === 'starting' || s === 'queued') return 'badge run';
   if (s === 'interrupted' || s === 'cancelled') return 'badge warn';
   return 'badge err';

@@ -76,7 +76,8 @@ def test_openapi_and_a2a_metadata_only_suggest_a_chat_contract(tmp_path):
     "file:///etc/passwd", "http://example.com:7001/v1/chat/completions",
     "http://localhost:7001/v1/chat/completions", "http://169.254.169.254:80/",
     "http://10.0.0.1:7001/", "http://user:secret@127.0.0.1:7001/",
-    "http://127.0.0.1:7001/?token=secret", "http://127.0.0.1:7001/other",
+    "http://127.0.0.1:7001/?token=secret", "http://127.0.0.1:7001/api/../other",
+    "http://127.0.0.1:7001//other",
     "http://127.0.0.1:7001/%2e%2e/", "http://127.0.0.1:7001\\@evil.example/",
     "http://127.0.0.1:7001/\n", "http://127.0.0.1:7001/#fragment",
 ])

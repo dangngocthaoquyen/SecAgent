@@ -2,7 +2,7 @@
 
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from core.models import ExecutionResult, TargetProfile, TestInput
@@ -18,7 +18,7 @@ from targets.adapters.http_evidence import (
     reported_http_evidence,
     structured_http_tool_calls,
 )
-from targets.validator import parse_header_credential_placeholder
+from targets.validator import parse_header_credential_reference
 from tools.http import HttpClient, HttpClientError, HttpResponse
 
 
@@ -32,13 +32,51 @@ class _ResponsePathError(Exception):
     """Internal error raised when configured response extraction fails."""
 
 
+def format_bearer_header_value(raw_secret: str) -> str:
+    """Format an Authorization Bearer header value without duplicating the Bearer prefix."""
+    cleaned = raw_secret.strip()
+    if not cleaned:
+        raise ValueError("Credential value is empty.")
+    if "\r" in cleaned or "\n" in cleaned:
+        raise ValueError("Credential value contains invalid control characters.")
+    if re.match(r"(?i)^Bearer\s+", cleaned):
+        token = re.sub(r"(?i)^Bearer\s+", "", cleaned).strip()
+        if not token:
+            raise ValueError("Credential value is empty.")
+        return f"Bearer {token}"
+    return f"Bearer {cleaned}"
+
+
 class HttpTargetAdapter(BaseTargetAdapter):
     """Render configured HTTP requests and normalize their responses."""
 
     def __init__(self, http_client: HttpClient | None = None, *,
-                 response_only_completion: bool = False) -> None:
+                 response_only_completion: bool = False,
+                 credential_resolver: Callable[[str], str | None] | None = None) -> None:
         self._http_client = http_client
         self._response_only_completion = response_only_completion
+        self._credential_resolver = credential_resolver
+
+    @classmethod
+    def prepare_request(
+        cls,
+        target: TargetProfile,
+        test_input: TestInput,
+        *,
+        credential_resolver: Callable[[str], str | None] | None = None,
+    ) -> tuple[str, str, dict[str, str] | None, Any, float | None]:
+        """Resolve method, URL, headers (including credentials), rendered body, and timeout."""
+        config = target.interface.config
+        method = cls._required_string(config, "method")
+        url = cls._required_string(config, "url")
+        headers = cls._headers(
+            config.get("headers"),
+            target.credential_refs,
+            credential_resolver=credential_resolver,
+        )
+        request_body = cls._render_template(config.get("body"), test_input.prompt)
+        timeout = cls._timeout(config.get("timeout"))
+        return method, url, headers, request_body, timeout
 
     def execute(
         self,
@@ -48,11 +86,11 @@ class HttpTargetAdapter(BaseTargetAdapter):
         """Execute one test input using the target's HTTP configuration."""
 
         config = target.interface.config
-        method = self._required_string(config, "method")
-        url = self._required_string(config, "url")
-        headers = self._headers(config.get("headers"), target.credential_refs)
-        request_body = self._render_template(config.get("body"), test_input.prompt)
-        timeout = self._timeout(config.get("timeout"))
+        method, url, headers, request_body, timeout = self.prepare_request(
+            target,
+            test_input,
+            credential_resolver=self._credential_resolver,
+        )
 
         try:
             response = (self._http_client or HttpClient(trust_env=config.get("trust_env", True))).request(
@@ -86,6 +124,8 @@ class HttpTargetAdapter(BaseTargetAdapter):
     def _headers(
         value: Any,
         credential_refs: list[str],
+        *,
+        credential_resolver: Callable[[str], str | None] | None = None,
     ) -> dict[str, str] | None:
         if value is None:
             return None
@@ -95,32 +135,63 @@ class HttpTargetAdapter(BaseTargetAdapter):
             raise TargetAdapterError("HTTP target headers must contain string keys and values.")
 
         headers: dict[str, str] = {}
+        seen_lower: set[str] = set()
         for key, item in value.items():
+            low = key.lower()
+            if low in seen_lower:
+                raise TargetAdapterError(f"Duplicate HTTP header {key!r} (case-insensitive).")
+            seen_lower.add(low)
             try:
-                parsed = parse_header_credential_placeholder(item)
+                parsed = parse_header_credential_reference(item)
             except ValueError as exc:
                 raise TargetAdapterError(str(exc)) from exc
             if parsed is None:
                 headers[key] = item
                 continue
 
-            prefix, credential_ref = parsed
+            source, prefix, credential_ref = parsed
             if credential_ref not in credential_refs:
                 raise TargetAdapterError(
                     f"HTTP header references undeclared credential {credential_ref!r}."
                 )
 
-            resolved_value = os.environ.get(credential_ref)
-            if resolved_value is None or not resolved_value.strip():
+            if source == "env":
+                resolved_value = os.environ.get(credential_ref)
+                if resolved_value is None or not resolved_value.strip():
+                    raise TargetAdapterError(
+                        f"Required credential environment variable {credential_ref!r} "
+                        "is missing or empty."
+                    )
+            else:
+                # Session-backed credentials resolve strictly from the explicit
+                # in-memory resolver and NEVER fall back to os.environ.
+                if credential_resolver is None:
+                    raise TargetAdapterError(
+                        f"Required session credential {credential_ref!r} is unavailable."
+                    )
+                try:
+                    resolved_value = credential_resolver(credential_ref)
+                except Exception as exc:
+                    raise TargetAdapterError(
+                        f"Required session credential {credential_ref!r} failed resolution: {exc}"
+                    ) from exc
+                if not isinstance(resolved_value, str) or not resolved_value.strip():
+                    raise TargetAdapterError(
+                        f"Required session credential {credential_ref!r} is missing or unavailable."
+                    )
+
+            if prefix == "Bearer ":
+                try:
+                    headers[key] = format_bearer_header_value(resolved_value)
+                except ValueError as exc:
+                    raise TargetAdapterError(
+                        f"Required credential {credential_ref!r} is invalid: {exc}"
+                    ) from exc
+                continue
+            clean_secret = resolved_value.strip() if (prefix or source == "session") else resolved_value
+            if any(ord(c) < 32 or ord(c) == 127 for c in clean_secret):
                 raise TargetAdapterError(
-                    f"Required credential environment variable {credential_ref!r} "
-                    "is missing or empty."
-                )
-            clean_secret = resolved_value.strip() if prefix else resolved_value
-            if "\r" in clean_secret or "\n" in clean_secret:
-                raise TargetAdapterError(
-                    f"Required credential environment variable {credential_ref!r} "
-                    "contains invalid control characters."
+                    f"Required credential {credential_ref!r} contains invalid control characters."
                 )
             headers[key] = f"{prefix}{clean_secret}"
 

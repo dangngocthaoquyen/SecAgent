@@ -170,6 +170,10 @@ class _PassThroughDelivery(BaseAttackModule):
         return test_input.model_copy(deep=True)
 
 
+class DispatchCheckpointError(RuntimeError):
+    """Raised when persisting the pre-dispatch testcase checkpoint fails."""
+
+
 def run_generic_cases(
     *,
     mode: Literal["live", "offline"],
@@ -187,6 +191,8 @@ def run_generic_cases(
     case_progress_callback: Any = None,
     target_revision_sha256: str | None = None,
     dataset_metadata: dict[str, Any] | None = None,
+    credential_resolver: Any = None,
+    extra_sensitive_values: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Execute one or more cases through Runner -> Collectors -> HybridEvaluator -> Report."""
     out_root = Path(output_dir).resolve()
@@ -194,7 +200,10 @@ def run_generic_cases(
     runs_dir.mkdir(parents=True, exist_ok=True)
 
     resolved_executor = executor or Executor({
-        "generic_http": HttpTargetAdapter(response_only_completion=True),
+        "generic_http": HttpTargetAdapter(
+            response_only_completion=True,
+            credential_resolver=credential_resolver,
+        ),
         "generic_mcp_jsonrpc": McpJsonRpcTargetAdapter(),
         "offline_stored": OfflineStoredTargetAdapter(),
     })
@@ -213,6 +222,8 @@ def run_generic_cases(
                     "category": active_case_meta["category"],
                     "stage": stage,
                 })
+            except DispatchCheckpointError:
+                raise
             except Exception:
                 pass
 
@@ -228,6 +239,7 @@ def run_generic_cases(
         allowed_collector_roots=allowed_collector_roots,
         allowed_collector_endpoints=allowed_collector_endpoints,
         include_submitted_prompt_preview=True,
+        extra_sensitive_values=extra_sensitive_values,
     )
 
     verdict_counts: Counter[str] = Counter()
@@ -246,6 +258,8 @@ def run_generic_cases(
                     "category": testcase.category,
                     "stage": "sending_request_to_target",
                 })
+            except (DispatchCheckpointError, OSError):
+                raise
             except Exception:
                 pass
 
@@ -311,6 +325,18 @@ def run_generic_cases(
             "sent_payload_sha256": sent_payload_sha256,
             **({"stored_provenance": stored_prov} if stored_prov is not None else {}),
         })
+        envelope = runner.redact_report_value(target, envelope)
+        if (
+            not isinstance(envelope, dict)
+            or envelope.get("engine") != "native"
+            or envelope.get("testcase_id") != testcase.id
+            or envelope.get("target_id") != target.id
+            or envelope.get("evaluation_status") != result.status.value
+            or not isinstance(envelope.get("evaluation"), dict)
+            or envelope["evaluation"].get("final_verdict") != result.status.value
+        ):
+            raise RuntimeError("report_redaction_integrity_failed")
+        Runner._verify_report_integrity(envelope["evaluation"])
         report_file = runs_dir / f"native-{testcase.id}-{run_id}.secagent.json"
         report_bytes = (json.dumps(envelope, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
         report_file.write_bytes(report_bytes)
@@ -333,7 +359,7 @@ def run_generic_cases(
             "payload_ref": test_input.payload_ref,
             "sent_payload_sha256": sent_payload_sha256,
             "verdict": result.status.value,
-            "reason": result.reason,
+            "reason": runner.redact_report_value(target, result.reason),
             "decision_source": prov_eval.get("decision_source"),
             "deterministic_verdict": prov_eval.get("deterministic_verdict"),
             "effective_deterministic_verdict": prov_eval.get("effective_deterministic_verdict"),

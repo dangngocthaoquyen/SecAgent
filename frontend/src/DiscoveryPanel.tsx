@@ -35,7 +35,15 @@ export default function DiscoveryPanel({nonce,secret,onUse,onReset}:{nonce:strin
     const cap=await testingApi.getDiscoveryMcpTools(row.discovery_id,secret,nonce).catch(()=>null);
     if(token===sequence.current&&cap)setMcpManifest(cap);
    }
-   if(row.proposed_profile)await onUse({...row.proposed_profile,name:agentName.trim()||row.proposed_profile.name},row.discovery_id,row);
+   if(row.proposed_profile){
+    const matchedCandidate=row.proposed_profile.protocol==='http-json'?row.openapi_candidates?.find(c=>c.endpoint===row.proposed_profile?.endpoint):undefined;
+    const draft={...row.proposed_profile,name:agentName.trim()||row.proposed_profile.name};
+    if(matchedCandidate){
+     await onUse(draft,row.discovery_id,row,matchedCandidate);
+    }else{
+     await onUse(draft,row.discovery_id,row);
+    }
+   }
    if(token===sequence.current)setConfirmed(false);
   }catch(e){if(token===sequence.current)setError(e instanceof Error?e.message:'Discovery unavailable.');}
   finally{if(token===sequence.current)setBusy(false);}
@@ -52,13 +60,16 @@ export default function DiscoveryPanel({nonce,secret,onUse,onReset}:{nonce:strin
   </details>
   {error&&<p role="alert">{error}</p>}
   {result&&<div className="discovery-result" role="status">
-   <p><strong>{result.proposed_profile?'Configuration detected':result.openapi_candidates?.length?'Candidate API operations discovered':'Configuration unverified'}</strong>: {result.canonical_endpoint??result.input_url}</p>
-   <p>{result.proposed_profile?'Review the detected configuration below. A connection check runs automatically when the model is known.':result.openapi_candidates?.length?'Select an API operation below and confirm unresolved required parameters or authentication before saving.':'No supported endpoint was verified. Check the URL or configure a target manually.'}</p>
+   <p><strong>{result.proposed_profile?(result.configuration_readiness==='incomplete_configuration'?'Configuration detected (parameters or authentication required)':result.configuration_readiness==='unsupported_authentication'?'Configuration detected (unsupported authentication scheme)':'Configuration detected'):result.openapi_candidates?.length?'Candidate API operations discovered':'Configuration unverified'}</strong>: {result.canonical_endpoint??result.input_url}</p>
+   <p>{result.proposed_profile?(result.proposed_profile.protocol==='http-json'?'Review the discovered HTTP API draft below. Resolve any required parameters or credential selection, then run an explicit connection test.':'Review the detected configuration below. A connection check runs automatically when the model is known.'):result.openapi_candidates?.length?'Select an API operation below and confirm unresolved required parameters or authentication before saving.':'No supported endpoint was verified. Check the URL or configure a target manually.'}</p>
    {!!result.openapi_candidates?.length&&!result.proposed_profile&&<section className="panel discovery-openapi-candidates" aria-label="Discovered OpenAPI candidates">
     <h4>Discovered HTTP API Candidates ({result.openapi_candidates.length})</h4>
     <p className="caption">Draft suggestions from API specification metadata only (not runtime verified). Resolve any required fields before saving.</p>
-    <ul>{result.openapi_candidates.map(c=><li key={c.endpoint}><strong>{c.method} <code>{c.path}</code></strong>{c.summary?` · ${c.summary}`:''}{c.requires_auth?' · Requires authentication':''}{c.unresolved_required_fields.length>0?` · Unresolved required fields: ${c.unresolved_required_fields.join(', ')}`:''}{c.unsupported_required_parameters?.length?` · Unsupported required params: ${c.unsupported_required_parameters.map(p=>`${p.in}:${p.name}`).join(', ')}`:''} <button type="button" onClick={()=>void selectOpenApiCandidate(c)}>Select &amp; Review Draft</button>{!!c.limitations?.length&&<p className="caption">{c.limitations.join(' ')}</p>}</li>)}</ul>
+    <ul>{result.openapi_candidates.map(c=><li key={c.endpoint}><strong>{c.method} <code>{c.path}</code></strong>{c.summary?` · ${c.summary}`:''}{c.auth_status==='required'||c.requires_auth?' · Authentication required':c.auth_status==='may_be_required'?' · Authentication may be required':c.auth_status==='unsupported'?' · Authentication unsupported':''}{c.unresolved_required_fields.length>0?` · Unresolved required fields: ${c.unresolved_required_fields.join(', ')}`:''}{c.unsupported_required_parameters?.length?` · Unsupported required params: ${c.unsupported_required_parameters.map(p=>`${p.in}:${p.name}`).join(', ')}`:''} <button type="button" onClick={()=>void selectOpenApiCandidate(c)}>Select &amp; Review Draft</button>{!!c.limitations?.length&&<p className="caption">{c.limitations.join(' ')}</p>}</li>)}</ul>
    </section>}
+   {!!result.openapi_candidates?.length&&!!result.proposed_profile&&result.openapi_candidates.some(c=>c.endpoint!==result.proposed_profile?.endpoint)&&<details className="target-advanced"><summary>Other discovered operations ({result.openapi_candidates.filter(c=>c.endpoint!==result.proposed_profile?.endpoint).length})</summary>
+    <ul>{result.openapi_candidates.filter(c=>c.endpoint!==result.proposed_profile?.endpoint).map(c=><li key={c.endpoint}><strong>{c.method} <code>{c.path}</code></strong>{c.summary?` · ${c.summary}`:''} <button type="button" onClick={()=>void selectOpenApiCandidate(c)}>Switch to Draft</button></li>)}</ul>
+   </details>}
    {mcpManifest&&<section className="panel discovery-mcp-manifest" aria-label="Discovered MCP tools">
     <h4>Discovered MCP Tools &amp; Schemas ({mcpManifest.tools.length})</h4>
     <p className="caption">Source: <code>{mcpManifest.source_endpoint}</code> · Manifest SHA-256: <code>{mcpManifest.advertised_tool_manifest_sha256.slice(0,16)}...</code> · Discovery ID: <code>{mcpManifest.discovery_id}</code></p>

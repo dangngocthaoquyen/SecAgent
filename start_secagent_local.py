@@ -67,7 +67,8 @@ def runtime_settings(data: Path, override: str | None) -> dict:
     try:
         value = json.loads(path.read_text(encoding='utf-8'))
         allowed = {'schema_version', 'judge_config', 'evidence_policy', 'mcp_action_catalog',
-                   'reviewed_mcp_catalog_sha256', 'dvaa_mcp_receipt_root', 'agent_bridge_config'}
+                   'reviewed_mcp_catalog_sha256', 'dvaa_mcp_receipt_root', 'agent_bridge_config',
+                   'target_catalog'}
         if not isinstance(value, dict) or set(value) - allowed or value.get('schema_version') != '1.0.0':
             raise ValueError()
         for key in allowed - {'schema_version'}:
@@ -76,6 +77,34 @@ def runtime_settings(data: Path, override: str | None) -> dict:
         return value
     except (ValueError, UnicodeError, OSError):
         raise ValueError('Runtime configuration is invalid.') from None
+
+
+def resolve_target_credential_env_names(catalog_path: Path, target_data_dir: Path) -> set[str]:
+    """Read registered Target credential environment variable names from the active catalog configuration.
+
+    Returns only validated env var reference names (never values). Checks both
+    the active seed catalog file and any persisted managed catalog state file.
+    """
+    sys.path.insert(0, str(BACKEND))
+    from workflow.catalog import load_catalog, read_json
+    from workflow.management import ManagedState
+
+    env_names: set[str] = set()
+    seed_catalog = load_catalog(catalog_path)
+    env_names.update(seed_catalog._config.credential_aliases.values())
+
+    state_file = target_data_dir / "target-catalog.json"
+    if state_file.exists() and state_file.is_file() and not state_file.is_symlink() and state_file.stat().st_size <= 262144:
+        try:
+            raw_state = read_json(state_file.read_bytes())
+            if isinstance(raw_state, dict) and "archived" in raw_state:
+                raw_state = {k: v for k, v in raw_state.items() if k != "archived"}
+            state = ManagedState.model_validate(raw_state)
+            env_names.update(state.catalog.credential_aliases.values())
+        except Exception:
+            # Let workflow.api perform authoritative catalog state validation on startup.
+            pass
+    return env_names
 
 
 def reporting_manifest(data: Path) -> Path:
@@ -114,6 +143,9 @@ def ready(url: str, predicate, *, attempts: int = 60) -> bool:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", help="Optional local operator data directory; default is the user's application data")
+    parser.add_argument("--catalog", help="Optional operator-owned Target catalog JSON (defines registered credential aliases)")
+    parser.add_argument("--sync-credential-aliases", action="store_true",
+                        help="Explicitly register newly added credential aliases from --catalog into an existing managed target catalog (strictly additive, atomic backup)")
     parser.add_argument("--runtime-config", help="Optional operator-owned runtime references; defaults to runtime.json in the local data directory")
     parser.add_argument("--no-browser", action="store_true", help="Print the URL without opening a browser")
     parser.add_argument("--enable-asi01-batch", action="store_true",
@@ -139,6 +171,11 @@ def main(argv=None) -> int:
                 'reviewed_mcp_catalog_sha256','dvaa_mcp_receipt_root','agent_bridge_config'):
         if getattr(args, key) is None and settings.get(key):
             setattr(args, key, settings[key])
+    if args.catalog is None and settings.get('target_catalog'):
+        args.catalog = settings['target_catalog']
+    catalog_path = Path(args.catalog).absolute() if args.catalog else SEED
+    if not catalog_path.is_file() or catalog_path.is_symlink():
+        raise ValueError("Target catalog configuration is unavailable.")
     legacy_batch = any((args.enable_asi01_batch, args.enable_web_lab_batch,
                         args.enable_toolbot_lab_batch, args.enable_custom_imported_batch))
     unified = not legacy_batch
@@ -172,6 +209,16 @@ def main(argv=None) -> int:
         workflow_env = common | {"SECAGENT_WORKFLOW_OPERATOR_TOKEN": token,
                                  "SECAGENT_LOCAL_SINGLE_USER": "1"}
         workflow_credential_names: set[str] = set()
+        # Forward only explicitly registered Target catalog credential references
+        # to the Workflow API process; strip them from common/Frontend/Reporting
+        # regardless of variable naming.
+        target_credential_env_names = resolve_target_credential_env_names(catalog_path, data / "targets")
+        for name in target_credential_env_names:
+            common.pop(name, None)
+            workflow_env.pop(name, None)
+            if os.environ.get(name):
+                workflow_env[name] = os.environ[name]
+                workflow_credential_names.add(name)
         evidence_path = None
         if args.evidence_policy:
             evidence_path = Path(args.evidence_policy).absolute()
@@ -242,9 +289,11 @@ def main(argv=None) -> int:
                   ROOT, bridge_env)
         start([sys.executable, "-m", "reporting.api", "--manifest", str(manifest),
                "--port", str(report_port)], ROOT, common)
-        workflow_command = [sys.executable, "-m", "workflow.api", "--catalog", str(SEED),
+        workflow_command = [sys.executable, "-m", "workflow.api", "--catalog", str(catalog_path),
                "--target-data-dir", str(data / "targets"), "--enable-controlled-runs",
                "--run-output-dir", str(RUNS), "--port", str(workflow_port)]
+        if args.sync_credential_aliases:
+            workflow_command.append("--sync-credential-aliases")
         if unified:
             workflow_command.append('--enable-unified-runtime')
         if args.enable_asi01_batch:

@@ -1,5 +1,6 @@
 import {useEffect,useRef,useState} from 'react';
 import ScanPreviewPanel from './ScanPreviewPanel';
+import ScanResumePanel from './ScanResumePanel';
 import {
  BudgetUsage,
  CurrentTestcase,
@@ -9,6 +10,7 @@ import {
  TestcaseStatusList,
 } from './ScanProgressComponents';
 import ScanResultsView from './ScanResultsView';
+import { resolveUnifiedDisplay } from './scanLineage';
 import {
  clearPendingScanSubmission,
  consumeScanHandoff,
@@ -20,6 +22,7 @@ import {
  type DatasetEnvelope,
  type DatasetSummary,
  type GenericCaseStatus,
+ type GenericResumePreview,
  type GenericRunPreview,
  type GenericRunRecord,
  type GenericRunSummary,
@@ -80,6 +83,16 @@ export default function SecurityScanWizard({
  const [activeRunId,setActiveRunId]=useState<string>(initialRunId||'');
  const [runRecord,setRunRecord]=useState<GenericRunRecord|null>(null);
  const [recoverIdInput,setRecoverIdInput]=useState<string>('');
+
+ const [resumeOpen,setResumeOpen]=useState(false);
+ const [resumePreview,setResumePreview]=useState<GenericResumePreview|null>(null);
+ const [resumePreviewStale,setResumePreviewStale]=useState(false);
+ const [resumeLoading,setResumeLoading]=useState(false);
+ const [resumeStarting,setResumeStarting]=useState(false);
+ const [resumeError,setResumeError]=useState('');
+ const [selectedUncertainIds,setSelectedUncertainIds]=useState<string[]>([]);
+ const [resumeSubmissionId,setResumeSubmissionId]=useState('');
+ const resumePreviewSeqRef=useRef(0);
 
  const [busy,setBusy]=useState(false);
  const [error,setError]=useState('');
@@ -246,7 +259,7 @@ export default function SecurityScanWizard({
  // Poll or load activeRunId from backend
  useEffect(()=>{
   if(!activeRunId||!/^[a-f0-9]{32}$/.test(activeRunId)||!(localSingleUser||unlocked))return;
-  if(runRecord&&runRecord.generic_run_id===activeRunId&&TERMINAL_RUN_STATUSES.has(runRecord.status??'completed'))return;
+  if(runRecord&&runRecord.generic_run_id===activeRunId&&TERMINAL_RUN_STATUSES.has(runRecord.status??'completed')&&!runRecord.lineage_summary?.active_lineage_run_id)return;
   let timer:ReturnType<typeof setTimeout>|undefined;
   let cancelled=false;
 
@@ -268,7 +281,7 @@ export default function SecurityScanWizard({
     setStep(3);
     setError('');
     const st=loaded.status??'completed';
-    if(!TERMINAL_RUN_STATUSES.has(st)){
+    if(!TERMINAL_RUN_STATUSES.has(st)||Boolean(loaded.lineage_summary?.active_lineage_run_id)){
      timer=setTimeout(refreshRun,350);
     }else{
      try{sessionStorage.removeItem('secagent_active_generic_run_id');}catch{}
@@ -367,7 +380,20 @@ export default function SecurityScanWizard({
   }
  }
 
+ function resetResumeState(){
+  resumePreviewSeqRef.current+=1;
+  setResumeOpen(false);
+  setResumePreview(null);
+  setResumePreviewStale(false);
+  setResumeLoading(false);
+  setResumeStarting(false);
+  setResumeError('');
+  setSelectedUncertainIds([]);
+  setResumeSubmissionId('');
+ }
+
  function resetToNewScan(){
+  resetResumeState();
   const unresolved=pendingSubmissionRef.current??loadPendingScanSubmission();
   if(unresolved){
    updatePendingSubmission(unresolved);
@@ -443,6 +469,8 @@ export default function SecurityScanWizard({
     use_judge:useJudge,
     submission_id:activeSubmissionId,
     async_execution:true,
+    ...(preview.target_revision_sha256?{expected_target_revision:preview.target_revision_sha256}:{}),
+    ...(preview.session_credential_generation?{expected_session_credential_generation:preview.session_credential_generation}:{}),
    },secret,nonce);
    clearPendingScanSubmission();
    updatePendingSubmission(null);
@@ -460,7 +488,14 @@ export default function SecurityScanWizard({
   }catch(e){
    // If Backend explicitly rejected before run creation (e.g. preflight blocker / conflict), clear pending submission
    const errMsg=e instanceof Error?e.message:'';
+   const staleAuthError=(
+    errMsg.includes('[credential_unavailable]')||
+    errMsg.includes('[generic_session_credential_stale]')||
+    errMsg.includes('[generic_session_credential_authorization_required]')||
+    errMsg.includes('[generic_target_revision_stale]')
+   );
    if(
+    staleAuthError||
     errMsg.includes('[policy_')||
     errMsg.includes('[judge_provider_unavailable]')||
     errMsg.includes('[unmapped_asi_category]')||
@@ -471,6 +506,12 @@ export default function SecurityScanWizard({
    ){
     clearPendingScanSubmission();
     updatePendingSubmission(null);
+    if(staleAuthError){
+     setScanAuthorized(false);
+     setPreview(null);
+     setSubmissionId('');
+     setStep(1);
+    }
     setError(errMsg);
     return;
    }
@@ -515,14 +556,137 @@ export default function SecurityScanWizard({
    setError('Enter a valid 32-character hexadecimal Generic Run ID.');
    return;
   }
+  resetResumeState();
   setError('');
   setRunRecord(null);
   setActiveRunId(clean);
   setStep(3);
+  if(typeof window!=='undefined'){
+   window.location.hash=`#scan/${clean}`;
+  }
+ }
+
+ async function loadResumePreview(parentRunId:string,includeUncertain:string[],autoIncludeAllUncertain=false){
+  if(!nonce)return;
+  const seq=++resumePreviewSeqRef.current;
+  setResumeLoading(true);
+  setResumePreviewStale(true);
+  setResumeError('');
+  try{
+   let res=await testingApi.previewGenericResume(
+    parentRunId,
+    {include_uncertain_case_ids:includeUncertain},
+    secret,
+    nonce,
+   );
+   if(seq!==resumePreviewSeqRef.current)return;
+   if(autoIncludeAllUncertain&&res.uncertain_case_ids.length>0){
+    const allUncertain=res.uncertain_case_ids;
+    res=await testingApi.previewGenericResume(
+     parentRunId,
+     {include_uncertain_case_ids:allUncertain},
+     secret,
+     nonce,
+    );
+    if(seq!==resumePreviewSeqRef.current)return;
+    setSelectedUncertainIds(allUncertain);
+   }else{
+    setSelectedUncertainIds(res.included_uncertain_case_ids);
+   }
+   setResumePreview(res);
+   setResumePreviewStale(false);
+   setResumeSubmissionId(randomHex32());
+  }catch(e){
+   if(seq!==resumePreviewSeqRef.current)return;
+   // R06: Invalidate stale preview immediately on refresh failure; require fresh preview before confirming.
+   setResumePreview(null);
+   setResumePreviewStale(true);
+   setResumeSubmissionId('');
+   setResumeError(e instanceof Error?e.message:'Failed to load resume preview.');
+  }finally{
+   if(seq===resumePreviewSeqRef.current){
+    setResumeLoading(false);
+   }
+  }
+ }
+
+ async function openResumePreview(){
+  if(!runRecord||resumeLoading||resumeStarting||isActionLocked())return;
+  const resumeSourceId=runRecord.unified_lineage?.resumable_run_id||runRecord.lineage_summary?.resumable_run_id||runRecord.generic_run_id;
+  setResumeOpen(true);
+  setResumePreview(null);
+  setResumePreviewStale(true);
+  setSelectedUncertainIds([]);
+  await loadResumePreview(resumeSourceId,[],true);
+ }
+
+ async function handleToggleUncertain(caseId:string,checked:boolean){
+  if(!runRecord||resumeLoading||resumeStarting)return;
+  const resumeSourceId=resumePreview?.parent_run_id||runRecord.unified_lineage?.resumable_run_id||runRecord.lineage_summary?.resumable_run_id||runRecord.generic_run_id;
+  const nextIds=checked
+   ?(selectedUncertainIds.includes(caseId)?selectedUncertainIds:[...selectedUncertainIds,caseId])
+   :selectedUncertainIds.filter(id=>id!==caseId);
+  setSelectedUncertainIds(nextIds);
+  setResumePreviewStale(true);
+  await loadResumePreview(resumeSourceId,nextIds,false);
+ }
+
+ async function handleConfirmAndResume(){
+  if(
+   !runRecord||
+   !resumePreview||
+   resumePreviewStale||
+   !resumePreview.eligible||
+   resumePreview.selected_resume_case_ids.length===0||
+   resumePreview.included_uncertain_case_ids.length!==selectedUncertainIds.length||
+   !selectedUncertainIds.every(id=>resumePreview.included_uncertain_case_ids.includes(id))||
+   resumeLoading||
+   resumeStarting||
+   isActionLocked()
+  )return;
+  const resumeSourceId=resumePreview.parent_run_id;
+  const activeSubId=resumeSubmissionId||randomHex32();
+  if(!resumeSubmissionId)setResumeSubmissionId(activeSubId);
+  const includedUncertain=resumePreview.included_uncertain_case_ids;
+  setResumeStarting(true);
+  setResumeError('');
+  try{
+   const rec=await testingApi.startGenericResume(
+    resumeSourceId,
+    {
+     authorization_confirmed:true,
+     expected_resume_digest:resumePreview.resume_digest,
+     include_uncertain_case_ids:includedUncertain,
+     uncertain_reexecution_confirmed:includedUncertain.length>0,
+     stateful_target_acknowledged:resumePreview.mode==='live',
+     expected_target_revision:resumePreview.target_revision_sha256,
+     expected_session_credential_generation:resumePreview.session_credential_generation,
+     submission_id:activeSubId,
+     async_execution:true,
+    },
+    secret,
+    nonce,
+   );
+   resetResumeState();
+   pollFailureCount.current=0;
+   setPollConnectionLost(false);
+   setPollStopped(false);
+   setError('');
+   setRunRecord(rec);
+   setActiveRunId(rec.generic_run_id);
+   setStep(3);
+   if(typeof window!=='undefined'){
+    window.location.hash=`#scan/${rec.generic_run_id}`;
+   }
+  }catch(e){
+   setResumeError(e instanceof Error?e.message:'Failed to start resumed scan.');
+  }finally{
+   setResumeStarting(false);
+  }
  }
 
  const canOperatorAct=localSingleUser||unlocked;
- const isRunningRecord=Boolean(runRecord&&!TERMINAL_RUN_STATUSES.has(runRecord.status??'completed'));
+ const isRunningRecord=Boolean(runRecord&&(!TERMINAL_RUN_STATUSES.has(runRecord.status??'completed')||Boolean(runRecord.lineage_summary?.active_lineage_run_id)));
  const hasUnresolvedSubmission=Boolean(pendingSubmission);
  const isSubmissionLocked=busy||hasUnresolvedSubmission;
 
@@ -850,22 +1014,18 @@ export default function SecurityScanWizard({
    )}
 
    {canOperatorAct&&step===3&&runRecord&&isRunningRecord&&(()=>{
-    const caseStatuses:GenericCaseStatus[]=runRecord.case_statuses??runRecord.cases.map(c=>({
-     case_id:c.case_id,
-     category:c.category,
-     status:c.verdict==='ERROR'?'error':'completed',
-     stage:'completed',
-     verdict:c.verdict,
-     reason:c.reason,
-     evidence_level:c.evidence_level,
-     run_id:c.run_id,
-    }));
+    const unified=resolveUnifiedDisplay(runRecord);
+    const caseStatuses:GenericCaseStatus[]=unified.caseStatuses;
     return (
      <section className="panel" aria-label="Step 3: Live Scan Progress">
       <div className="section-title">
        <div>
-        <span className="eyebrow">STEP 3 OF 3 · LIVE SCAN IN PROGRESS</span>
-        <h2>3 · Live Scan Progress: <code className="mono">{runRecord.generic_run_id}</code></h2>
+        <span className="eyebrow">
+         STEP 3 OF 3 · LIVE SCAN IN PROGRESS{unified.isUnified&&unified.resumeCount>0?` · RESUME SESSION #${unified.resumeCount}`:''}
+        </span>
+        <h2>
+         3 · Live Scan Progress: <code className="mono">{unified.logicalScanId}</code>
+        </h2>
        </div>
       </div>
       <ProgressMetadata record={runRecord}/>
@@ -881,13 +1041,36 @@ export default function SecurityScanWizard({
    })()}
 
    {canOperatorAct&&step===3&&runRecord&&!isRunningRecord&&(
-    <ScanResultsView
-     runRecord={runRecord}
-     localSingleUser={localSingleUser}
-     secret={secret}
-     onNewScan={resetToNewScan}
-     onExportError={setError}
-    />
+    <>
+     {resumeOpen&&(
+      <ScanResumePanel
+       preview={resumePreview}
+       previewStale={resumePreviewStale}
+       loading={resumeLoading}
+       starting={resumeStarting}
+       error={resumeError}
+       selectedUncertainIds={selectedUncertainIds}
+       onToggleUncertain={(cid,checked)=>{void handleToggleUncertain(cid,checked);}}
+       onRecheck={()=>{
+        const resumeSourceId=resumePreview?.parent_run_id||runRecord.unified_lineage?.resumable_run_id||runRecord.lineage_summary?.resumable_run_id||runRecord.generic_run_id;
+        void loadResumePreview(resumeSourceId,selectedUncertainIds,false);
+       }}
+       onConfirmAndResume={()=>{void handleConfirmAndResume();}}
+       onCancel={resetResumeState}
+      />
+     )}
+     <ScanResultsView
+      runRecord={runRecord}
+      localSingleUser={localSingleUser}
+      secret={secret}
+      onNewScan={resetToNewScan}
+      onExportError={setError}
+      onResumeScan={()=>{void openResumePreview();}}
+      onOpenRun={id=>{void openExistingRun(id);}}
+      resumeBusy={resumeLoading||resumeStarting||busy}
+      resumePanelOpen={resumeOpen}
+     />
+    </>
    )}
   </div>
  );

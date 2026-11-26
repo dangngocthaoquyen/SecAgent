@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
 import { safeLabel } from './api';
 import {
-  computeVerdictCounts,
   deriveRunAsiSummary,
   formatCaseAsiCategory,
   formatDateTime,
@@ -10,6 +9,7 @@ import {
   normalizeVerdict,
   verdictBadgeClass,
 } from './scanFormatters';
+import { resolveUnifiedDisplay } from './scanLineage';
 import type { GenericCaseStatus, GenericRunEvent, GenericRunRecord } from './testingApi';
 
 const readableStage = (stage: string | null | undefined) => {
@@ -46,6 +46,7 @@ export function ExecutionStatusIndicator({ status, stage }: { status: string; st
 
 export function ProgressMetadata({ record }: { record: GenericRunRecord }) {
   const asiSummary = deriveRunAsiSummary(record);
+  const unified = resolveUnifiedDisplay(record);
   return (
     <div className="card live-meta-card" aria-label="Scan Progress Metadata">
       <div className="live-meta-row">
@@ -61,18 +62,25 @@ export function ProgressMetadata({ record }: { record: GenericRunRecord }) {
       </div>
       <div className="live-meta-row">
         <span>
-          <strong>Run ID:</strong> <code className="mono">{record.generic_run_id}</code>
+          <strong>{unified.isUnified ? 'Scan ID:' : 'Run ID:'}</strong>{' '}
+          <code className="mono">{unified.logicalScanId}</code>
         </span>
+        {unified.isUnified && unified.activeSessionId !== unified.logicalScanId && (
+          <span>
+            · <strong>Resume Session #{unified.resumeCount}:</strong>{' '}
+            <code className="mono">{unified.activeSessionId}</code>
+          </span>
+        )}
         <span>
           · <strong>Mode:</strong> <code className="mono">{record.mode.toUpperCase()}</code>
         </span>
         <span>
           · <strong>Engine:</strong> {record.use_judge ? 'Hybrid LLM Judge + Rules' : 'Deterministic Rules / Evidence Only'}
         </span>
-        {record.started_at && (
+        {unified.startedAt && (
           <span>
             · <strong>Started:</strong>{' '}
-            <time dateTime={record.started_at}>{formatDateTime(record.started_at)}</time>
+            <time dateTime={unified.startedAt}>{formatDateTime(unified.startedAt)}</time>
           </span>
         )}
       </div>
@@ -81,15 +89,16 @@ export function ProgressMetadata({ record }: { record: GenericRunRecord }) {
 }
 
 export function ScanProgressBar({ record }: { record: GenericRunRecord }) {
-  const executed = record.executed_cases ?? record.cases.length;
-  const skipped = record.skipped_count ?? (record.skipped_cases?.length ?? 0);
-  const selected = record.selected_cases ?? executed + skipped;
-  const ready = record.ready_count ?? Math.max(executed, selected - skipped);
-  const status = record.status ?? 'completed';
+  const unified = resolveUnifiedDisplay(record);
+  const executed = unified.executedCount;
+  const skipped = unified.skippedCount;
+  const selected = unified.selectedCount;
+  const ready = unified.readyCount;
+  const status = unified.logicalStatus;
   const active = status === 'preparing' || status === 'running';
-  const rawPercent = record.progress_percent ?? (ready > 0 ? Math.floor((executed / ready) * 100) : 0);
+  const rawPercent = unified.progressPercent;
   const percent =
-    status === 'completed' && ready > 0 && executed >= ready
+    (status === 'completed' || status === 'completed_with_errors') && ready > 0 && executed >= ready
       ? 100
       : Math.min(rawPercent, executed < ready ? 99 : 100);
 
@@ -98,10 +107,15 @@ export function ScanProgressBar({ record }: { record: GenericRunRecord }) {
       <div className="live-hero-top">
         <div>
           <ExecutionStatusIndicator status={status} stage={record.current_stage} />
-          <h2>Scan {status.replaceAll('_', ' ')}</h2>
+          <h2>
+            Scan {status.replaceAll('_', ' ')}
+            {unified.isUnified && unified.resumeCount > 0 ? ` · Session ${unified.sessionCount}` : ''}
+          </h2>
           <p className="caption">
             {active
-              ? 'Results persist to disk incrementally as each testcase finishes. Re-opening this Run ID never replays payloads.'
+              ? unified.isUnified
+                ? `Continuing logical scan ${unified.logicalScanId.slice(0, 12)} (preserving previously completed results without re-running them).`
+                : 'Results persist to disk incrementally as each testcase finishes. Re-opening this Run ID never replays payloads.'
               : 'Scan execution finished and results are persisted.'}
           </p>
         </div>
@@ -119,6 +133,7 @@ export function ScanProgressBar({ record }: { record: GenericRunRecord }) {
         <strong>Executed: {executed}/{ready}</strong>
         <span>
           Selected: {selected} · Ready: {ready} · Executed: {executed}/{ready} · Skipped: {skipped}
+          {unified.isUnified ? ` · Sessions: ${unified.sessionCount}` : ''}
         </span>
       </div>
 
@@ -137,18 +152,18 @@ export function ScanProgressBar({ record }: { record: GenericRunRecord }) {
 }
 
 export function ExecutionCounters({ record }: { record: GenericRunRecord }) {
-  const counts = computeVerdictCounts(record);
-  const executed = record.executed_cases ?? record.cases.length;
-  const skipped = record.skipped_count ?? (record.skipped_cases?.length ?? 0);
-  const selected = record.selected_cases ?? executed + skipped;
-  const ready = record.ready_count ?? Math.max(executed, selected - skipped);
+  const unified = resolveUnifiedDisplay(record);
+  const vc = unified.verdictCounts;
+  const executed = unified.executedCount;
+  const skipped = unified.skippedCount;
+  const ready = unified.readyCount;
   const remaining = Math.max(0, ready - executed);
 
   const cards = [
-    { label: 'PASS', value: counts.PASS, cls: 'ok' },
-    { label: 'FAIL', value: counts.FAIL, cls: 'fail' },
-    { label: 'INCONCLUSIVE', value: counts.INCONCLUSIVE, cls: 'warn' },
-    { label: 'ERROR', value: counts.ERROR, cls: 'err' },
+    { label: 'PASS', value: Number(vc.PASS ?? 0), cls: 'ok' },
+    { label: 'FAIL', value: Number(vc.FAIL ?? 0), cls: 'fail' },
+    { label: 'INCONCLUSIVE', value: Number(vc.INCONCLUSIVE ?? 0), cls: 'warn' },
+    { label: 'ERROR', value: Number(vc.ERROR ?? 0), cls: 'err' },
     { label: 'SKIPPED', value: skipped, cls: '' },
     { label: 'REMAINING', value: remaining, cls: '' },
   ] as const;
@@ -166,18 +181,21 @@ export function ExecutionCounters({ record }: { record: GenericRunRecord }) {
 }
 
 export function CurrentTestcase({ record }: { record: GenericRunRecord }) {
-  const status = record.status ?? 'completed';
+  const unified = resolveUnifiedDisplay(record);
+  const status = unified.logicalStatus;
   const active = status === 'preparing' || status === 'running';
 
   return (
     <section className="card" aria-label="Current testcase execution stage">
       {active ? (
         <>
-          <span className="eyebrow">CURRENTLY EXECUTING</span>
+          <span className="eyebrow">
+            CURRENTLY EXECUTING{unified.isUnified && unified.resumeCount > 0 ? ` · RESUME SESSION #${unified.resumeCount}` : ''}
+          </span>
           <h3>
             Current case:{' '}
-            {record.current_case_id ? (
-              <code className="mono">{safeLabel(record.current_case_id)}</code>
+            {unified.currentCaseId ? (
+              <code className="mono">{safeLabel(unified.currentCaseId)}</code>
             ) : (
               'Preparing next case'
             )}
@@ -185,16 +203,16 @@ export function CurrentTestcase({ record }: { record: GenericRunRecord }) {
           <div className="batch-stage" style={{ marginTop: '0.6rem' }}>
             <span className="running-indicator" aria-hidden="true" />
             <span>
-              Stage: <strong>{readableStage(record.current_stage)}</strong>
+              Stage: <strong>{readableStage(unified.currentStage)}</strong>
             </span>
           </div>
         </>
       ) : (
         <>
           <span className="eyebrow">EXECUTION STATUS</span>
-          <h3>{status === 'completed' ? 'All ready testcases completed' : `Scan ${status}`}</h3>
+          <h3>{status === 'completed' ? 'All ready testcases completed' : `Scan ${status.replaceAll('_', ' ')}`}</h3>
           <p className="caption">
-            Executed {record.executed_cases ?? record.cases.length} of {record.ready_count ?? record.total_cases} ready testcases ({record.skipped_count ?? 0} skipped).
+            Executed {unified.executedCount} of {unified.readyCount} ready testcases ({unified.skippedCount} skipped).
           </p>
         </>
       )}
@@ -203,31 +221,38 @@ export function CurrentTestcase({ record }: { record: GenericRunRecord }) {
 }
 
 export function BudgetUsage({ record, events }: { record: GenericRunRecord; events?: GenericRunEvent[] }) {
-  const active = record.status === 'preparing' || record.status === 'running';
+  const unified = resolveUnifiedDisplay(record);
+  const active = unified.logicalStatus === 'preparing' || unified.logicalStatus === 'running';
   const [nowIso, setNowIso] = useState<string>(() => new Date().toISOString());
 
   useEffect(() => {
-    if (!active || !record.started_at) return undefined;
+    if (!active || !unified.startedAt) return undefined;
     setNowIso(new Date().toISOString());
     const id = window.setInterval(() => {
       setNowIso(new Date().toISOString());
     }, 1000);
     return () => window.clearInterval(id);
-  }, [active, record.started_at]);
+  }, [active, unified.startedAt]);
 
-  const targetUsed =
+  const activity = events ?? unified.activeSessionEvents;
+  const elapsed = formatDurationBetween(unified.startedAt, unified.completedAt || (active ? nowIso : null));
+
+  const formatMetric = (value: number | null | undefined, offlineDefaultZero = false): string => {
+    if (typeof value === 'number') return String(value);
+    return offlineDefaultZero ? '0' : 'Not recorded';
+  };
+
+  const singleTargetUsed =
     record.target_requests_used !== undefined && record.target_requests_used !== null
       ? String(record.target_requests_used)
       : record.mode === 'offline'
         ? '0'
         : 'Unknown';
-  const targetBudget =
+  const singleTargetBudget =
     record.target_request_budget ?? (record.mode === 'offline' ? 0 : record.ready_count ?? record.total_cases);
-  const judgeUsed = record.judge_requests_used ?? (record.judge_metadata?.request_count ?? 0);
-  const judgeBudget =
+  const singleJudgeUsed = record.judge_requests_used ?? (record.judge_metadata?.request_count ?? 0);
+  const singleJudgeBudget =
     record.judge_request_budget ?? (record.use_judge ? record.ready_count ?? record.total_cases : 0);
-  const activity = events ?? record.events ?? [];
-  const elapsed = formatDurationBetween(record.started_at, record.completed_at || (active ? nowIso : null));
 
   return (
     <section className="card" aria-label="Budget usage and activity">
@@ -236,14 +261,43 @@ export function BudgetUsage({ record, events }: { record: GenericRunRecord; even
         <span className="pill">{activity.length} events</span>
       </div>
       <div className="detail-grid compact" style={{ marginBottom: '0.65rem' }}>
-        <div className="detail-pair">
-          <span>Target Requests</span>
-          <strong>{targetUsed} / {targetBudget}</strong>
-        </div>
-        <div className="detail-pair">
-          <span>Judge Calls</span>
-          <strong>{judgeUsed} / {judgeBudget}</strong>
-        </div>
+        {unified.isUnified ? (
+          <>
+            <div className="detail-pair">
+              <span>Cumulative Target Requests</span>
+              <strong>{formatMetric(unified.targetRequestsUsed, record.mode === 'offline')}</strong>
+            </div>
+            <div className="detail-pair">
+              <span>Current Session Target Budget</span>
+              <strong>
+                {formatMetric(unified.activeSessionTargetUsed, record.mode === 'offline')} /{' '}
+                {formatMetric(unified.activeSessionTargetBudget, record.mode === 'offline')}
+              </strong>
+            </div>
+            <div className="detail-pair">
+              <span>Cumulative Judge Calls</span>
+              <strong>{formatMetric(unified.judgeRequestsUsed, !record.use_judge)}</strong>
+            </div>
+            <div className="detail-pair">
+              <span>Current Session Judge Budget</span>
+              <strong>
+                {formatMetric(unified.activeSessionJudgeUsed, !record.use_judge)} /{' '}
+                {formatMetric(unified.activeSessionJudgeBudget, !record.use_judge)}
+              </strong>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="detail-pair">
+              <span>Target Requests</span>
+              <strong>{singleTargetUsed} / {singleTargetBudget}</strong>
+            </div>
+            <div className="detail-pair">
+              <span>Judge Calls</span>
+              <strong>{singleJudgeUsed} / {singleJudgeBudget}</strong>
+            </div>
+          </>
+        )}
         {elapsed !== 'Not recorded' && (
           <div className="detail-pair">
             <span>{active ? 'Elapsed' : 'Duration'}</span>

@@ -13,7 +13,7 @@ from targets.validator import validate_target
 from workflow.models import CatalogConfig, TargetDraft, ConnectionCheckResult
 
 
-_OPTIONAL_EXTENSION_PRESET_FIELDS = ("http_config", "capability_states", "capability_provenance")
+_OPTIONAL_EXTENSION_PRESET_FIELDS = ("http_config", "capability_states", "capability_provenance", "session_auth")
 
 
 def serialize_preset_for_revision(preset, *, exclude=frozenset()):
@@ -69,15 +69,20 @@ def read_json(raw):
     return json.loads(raw.decode("utf-8"), object_pairs_hook=pairs, parse_constant=bad_constant)
 
 
-def make_profile(preset, model, timeout, credential_env=None):
+def make_profile(preset, model, timeout, credential_env=None, *, session_auth=None):
     endpoint = preset.endpoint
     parts = urlsplit(endpoint)
+    effective_session_auth = session_auth if session_auth is not None else getattr(preset, "session_auth", None)
+    if credential_env is not None and effective_session_auth is not None:
+        raise ValueError("Conflicting authentication configuration: cannot combine environment credential and session credential.")
     # Tighten the shared runtime builder for this web preset: no encoded path,
     # traversal, empty segments or parser ambiguities; no DNS resolution.
     if (not parts.path.startswith("/") or "%" in endpoint or "?" in endpoint or "#" in endpoint
             or any(s in {".", ".."} for s in parts.path.split("/")) or "//" in parts.path):
         raise ValueError("Invalid preset endpoint.")
     if preset.protocol == "mcp-jsonrpc":
+        if effective_session_auth is not None:
+            raise ValueError("session_auth is only valid for http-json targets.")
         if preset.id == "dvaa-toolbot-lab":
             if (endpoint != "http://127.0.0.1:17022/mcp"
                     or model != "toolbot-lab" or credential_env is not None):
@@ -124,14 +129,42 @@ def make_profile(preset, model, timeout, credential_env=None):
             safe = (parts.hostname or "").lower() == "localhost" and parts.username is None and parts.password is None
         if not safe:
             raise ValueError("HTTP JSON target requires an authorized local or private IP/localhost endpoint.")
-        headers = {"Content-Type": "application/json", **dict(preset.http_config.headers)}
+        headers = {"Content-Type": "application/json"}
+        for h_key, h_val in preset.http_config.headers.items():
+            if h_key.lower() == "content-type":
+                headers["Content-Type"] = h_val
+            else:
+                headers[h_key] = h_val
         credential_refs = []
+        auth_source = "none"
         if credential_env is not None:
+            if any(k.lower() == "authorization" for k in headers):
+                raise ValueError("Conflicting Authorization header.")
             headers["Authorization"] = f"Bearer {{{{credential:{credential_env}}}}}"
             credential_refs.append(credential_env)
+            auth_source = "env_alias"
+        elif effective_session_auth is not None:
+            auth_header = effective_session_auth.header_name
+            if any(k.lower() == auth_header.lower() for k in headers):
+                raise ValueError("Custom HTTP header conflicts with session authentication header.")
+            if effective_session_auth.auth_type == "bearer":
+                headers["Authorization"] = f"Bearer {{{{session_credential:{effective_session_auth.ref_id}}}}}"
+            else:
+                headers[auth_header] = f"{{{{session_credential:{effective_session_auth.ref_id}}}}}"
+            credential_refs.append(effective_session_auth.ref_id)
+            auth_source = "session_memory"
         obs = ["response"]
         if preset.http_config.response.evidence_mapping is not None:
             obs.append("inline_evidence")
+        metadata = {
+            "configuration_source": "operator_configured",
+            "protocol": "http-json",
+            "auth_source": auth_source,
+        }
+        if effective_session_auth is not None:
+            metadata["session_credential_ref"] = effective_session_auth.ref_id
+            metadata["session_auth_type"] = effective_session_auth.auth_type
+            metadata["session_auth_header"] = effective_session_auth.header_name
         profile = TargetProfile(
             id=preset.id,
             name=preset.name,
@@ -152,12 +185,16 @@ def make_profile(preset, model, timeout, credential_env=None):
             capability_states=default_capability_states_for_preset(preset),
             observability=obs,
             credential_refs=credential_refs,
-            metadata={"configuration_source": "operator_configured", "protocol": "http-json"},
+            metadata=metadata,
         )
     else:
+        if effective_session_auth is not None:
+            raise ValueError("session_auth is only valid for http-json targets.")
         profile = build_runtime_target(endpoint, preset.id, protocol=preset.protocol,
             authorized_origin=f"{parts.scheme}://{parts.netloc}", model=model or "default",
             credential_env=credential_env, discover=False)
+        if credential_env is not None:
+            profile.interface.config["headers"]["Authorization"] = f"Bearer {{{{credential:{credential_env}}}}}"
         if preset.capability_states:
             profile = profile.model_copy(
                 update={"capability_states": default_capability_states_for_preset(preset)}
@@ -187,6 +224,25 @@ class TargetCatalog:
             return "not_required"
         return "available" if os.environ.get(self._config.credential_aliases[alias], "").strip() else "unavailable"
 
+    def _preset_credential_status(self, preset) -> tuple[str, str]:
+        if preset.credential_alias is not None:
+            return self._available(preset.credential_alias), "env_alias"
+        session_auth = getattr(preset, "session_auth", None)
+        if session_auth is not None:
+            store = getattr(self, "session_credentials", None)
+            if store is None:
+                return "unavailable", "session_memory"
+            avail = store.availability(
+                session_auth.ref_id,
+                endpoint=preset.endpoint,
+                scope_id=preset.id,
+                scope_kind="target",
+                expected_auth_type=session_auth.auth_type,
+                expected_header_name=session_auth.header_name,
+            )
+            return avail, "session_memory"
+        return "not_required", "none"
+
     def public_targets(self):
         rows = []
         for p in self._config.targets:
@@ -209,6 +265,7 @@ class TargetCatalog:
                 observability=["tool_result"] if p.protocol == "mcp-jsonrpc" else ["response"],
                 has_inline_evidence=has_inline,
             )
+            cred_availability, auth_source = self._preset_credential_status(p)
             row = {
                 "id": p.id, "name": p.name,
                 "platform_id": p.platform_id, "platform_name": p.platform_name,
@@ -218,7 +275,8 @@ class TargetCatalog:
                 "endpoint": p.endpoint, "protocol": p.protocol, "method": "POST",
                 "models": list(p.models), "default_model": p.default_model or "",
                 "timeout_min": p.timeout_min, "timeout_max": p.timeout_max, "timeout_default": p.timeout_default,
-                "credential_alias": p.credential_alias, "credential_availability": self._available(p.credential_alias),
+                "credential_alias": p.credential_alias, "credential_availability": cred_availability,
+                "auth_source": auth_source,
                 "request_mapping": req_mapping,
                 "response_parser": resp_parser,
                 "capabilities": caps,
@@ -231,6 +289,8 @@ class TargetCatalog:
                 "limitations": ["Offline configuration only; no target request is authorized or sent by this service.",
                                 "Reachability and runtime protocol compatibility have not been checked."],
             }
+            if p.session_auth is not None:
+                row["session_auth"] = p.session_auth.model_dump(mode="json")
             if p.http_config is not None:
                 row["http_config"] = p.http_config.model_dump(mode="json")
             rows.append(row)

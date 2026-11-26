@@ -39,6 +39,7 @@ from observers.evidence_collectors import (
 from reporting.redaction import Redactor
 from testing.evaluation_config import RunnerEvaluationConfig, _has_pi_auth_provider
 from testing.generic_runner import (
+    DispatchCheckpointError,
     _SEMANTIC_LABELS_BY_CATEGORY,
     build_blind_record_testcase,
     build_offline_target_profile,
@@ -51,8 +52,10 @@ from testing.runner import Runner
 from workflow.catalog import (
     build_http_response_config_dict,
     default_capability_states_for_preset,
+    make_profile,
     read_json,
 )
+from workflow.session_credentials import SessionCredentialError
 from workflow.dataset_models import infer_testcase_asi_code
 from workflow.evidence_sources import EvidenceSourceError
 from workflow.response_policies import (
@@ -128,17 +131,81 @@ def _merge_authoritative_capability_states(
     return merged
 
 
-def _sanitize_for_api(value: Any) -> Any:
+_API_PRESERVED_VALUE_KEYS = Runner._PRESERVED_VALUE_KEYS | frozenset({
+    "execution_status",
+    "judge_recommendation",
+    "judge_classification",
+    "semantic_invoked",
+    "provider_duration_ms",
+    "response_complete",
+    "source_eval_id",
+    "source_timestamp",
+    "source_filename",
+})
+
+
+_HEX64_RE = re.compile(r"^[a-f0-9]{64}$")
+_EVENT_FINGERPRINT_RE = re.compile(r"^(?:sha256:)?[a-f0-9]{64}$")
+_DYNAMIC_TRUSTED_ENUMS = frozenset({"provenance", "correlation_status", "correlation_strength"})
+
+
+def _sanitize_for_api(
+    value: Any,
+    *,
+    extra_secrets: tuple[str, ...] | list[str] = (),
+    _key_name: str | None = None,
+    _scrub_keys: bool = False,
+) -> Any:
+    cleaner = Redactor(extra_secrets)
     if isinstance(value, str):
-        return Redactor().clean(value, opaque=False, limit=max(4096, len(value) * 2))
+        if _key_name is not None:
+            if _scrub_keys:
+                if _key_name in _DYNAMIC_TRUSTED_ENUMS:
+                    return value
+                if _key_name == "event_fingerprint" and _EVENT_FINGERPRINT_RE.fullmatch(value):
+                    return value
+                if _key_name in {"arguments_sha256", "observation_sha256"} and _HEX64_RE.fullmatch(value):
+                    return value
+            else:
+                if _key_name in _API_PRESERVED_VALUE_KEYS:
+                    return value
+                if any(_key_name.endswith(sfx) for sfx in Runner._PRESERVED_VALUE_SUFFIXES) and _HEX64_RE.fullmatch(value):
+                    return value
+        return cleaner.clean(value, opaque=False, limit=max(4096, len(value) * 2))
     if isinstance(value, dict):
-        return {
-            k: _sanitize_for_api(v)
-            for k, v in value.items()
-            if str(k).lower() not in {"authorization", "api_key", "secret", "password", "access_token"}
-        }
+        out: dict[Any, Any] = {}
+        for k, v in value.items():
+            if str(k).lower() in {"authorization", "api_key", "secret", "password", "access_token"}:
+                continue
+            next_scrub = _scrub_keys or (isinstance(k, str) and k in Runner._DYNAMIC_KEY_CONTAINERS)
+            if (
+                _scrub_keys
+                and isinstance(k, str)
+                and k not in _DYNAMIC_TRUSTED_ENUMS
+                and k not in Runner._DYNAMIC_TRUSTED_DIGEST_KEYS
+            ):
+                clean_k = cleaner.clean(k, opaque=False, limit=256)
+                if clean_k in out:
+                    idx = 2
+                    while f"{clean_k}#{idx}" in out:
+                        idx += 1
+                    clean_k = f"{clean_k}#{idx}"
+            else:
+                clean_k = k
+            out[clean_k] = _sanitize_for_api(
+                v,
+                extra_secrets=extra_secrets,
+                _key_name=k if isinstance(k, str) else None,
+                _scrub_keys=next_scrub,
+            )
+        return out
     if isinstance(value, list):
-        return [_sanitize_for_api(item) for item in value]
+        if not _scrub_keys and _key_name in _API_PRESERVED_VALUE_KEYS:
+            return list(value)
+        return [
+            _sanitize_for_api(item, extra_secrets=extra_secrets, _key_name=None, _scrub_keys=_scrub_keys)
+            for item in value
+        ]
     return value
 
 
@@ -191,6 +258,7 @@ class GenericRunService:
         self.evidence_source_store = evidence_source_store
         self._active_target_counts: dict[str, int] = {}
         self._in_progress_runs: dict[str, Thread] = {}
+        self._active_resumes_by_root: dict[str, str] = {}
         self._submissions_in_flight: dict[str, dict[str, Any]] = {}
         self.submission_wait_timeout: float = 30.0
         self._lock = RLock()
@@ -423,6 +491,7 @@ class GenericRunService:
 
         cred_refs: list[str] = []
         headers: dict[str, str] = {"Content-Type": "application/json"}
+        env_name: str | None = None
         if getattr(preset, "credential_alias", None):
             cat_cfg = getattr(self.catalog, "_config", None) or getattr(self.catalog, "config", None)
             aliases = getattr(cat_cfg, "credential_aliases", {}) or {}
@@ -443,26 +512,22 @@ class GenericRunService:
             observability = ["tool_result"]
             target_type = "mcp_server"
         elif preset.protocol == "http-json" and getattr(preset, "http_config", None) is not None:
-            http_cfg = preset.http_config
-            merged_headers = {**headers, **dict(http_cfg.headers)}
-            iface = {
-                "type": "http",
-                "adapter": "generic_http",
-                "config": {
-                    "url": preset.endpoint,
-                    "method": http_cfg.method,
-                    "timeout": preset.timeout_default,
-                    "headers": merged_headers,
-                    "trust_env": False,
-                    "body": dict(http_cfg.body_template),
-                    "response": build_http_response_config_dict(http_cfg),
-                },
-            }
-            default_caps = default_capability_states_for_preset(preset)
-            observability = ["response"] + (
-                ["inline_evidence"] if http_cfg.response.evidence_mapping is not None else []
+            # Share the exact same TargetProfile & header construction with Test Connection.
+            base_profile = make_profile(
+                preset,
+                preset.default_model,
+                preset.timeout_default,
+                credential_env=env_name,
+                session_auth=getattr(preset, "session_auth", None),
             )
-            target_type = "ai_agent"
+            default_caps = default_capability_states_for_preset(preset)
+            return base_profile.model_copy(
+                update={
+                    "capabilities": list(getattr(preset, "capabilities", []) or base_profile.capabilities or [preset.protocol]),
+                    "capability_states": _merge_authoritative_capability_states(default_caps, capability_states),
+                    "evidence_sources": resolved_evidence,
+                }
+            )
         else:
             iface = {
                 "type": "http",
@@ -741,13 +806,32 @@ class GenericRunService:
         context_sources_seen: set[str] = set()
         overall_blocker: str | None = None
 
-        missing_live_cred = (
-            mode == "live"
-            and any(
-                isinstance(env_name, str) and env_name and not os.environ.get(env_name, "").strip()
-                for env_name in (target.credential_refs or [])
-            )
-        )
+        missing_live_cred = False
+        if mode == "live":
+            session_store = getattr(self.catalog, "session_credentials", None)
+            target_url = str(target.interface.config.get("url") or "")
+            target_meta = target.metadata if isinstance(target.metadata, dict) else {}
+            for ref in (target.credential_refs or []):
+                if not isinstance(ref, str) or not ref:
+                    continue
+                if ref.startswith("sess_"):
+                    if session_store is None:
+                        missing_live_cred = True
+                        break
+                    avail = session_store.availability(
+                        ref,
+                        endpoint=target_url,
+                        scope_id=target.id,
+                        scope_kind="target",
+                        expected_auth_type=target_meta.get("session_auth_type"),
+                        expected_header_name=target_meta.get("session_auth_header"),
+                    )
+                    if avail != "available":
+                        missing_live_cred = True
+                        break
+                elif not os.environ.get(ref, "").strip():
+                    missing_live_cred = True
+                    break
 
         for idx, row in enumerate(raw_cases):
             case_id = str(row.get("case_id") or f"case-{idx + 1}")
@@ -1040,6 +1124,69 @@ class GenericRunService:
             "items": preview_items,
         }
 
+    def _resolve_target_auth_binding(self, *, mode: str, target: TargetProfile) -> dict[str, Any]:
+        target_rev = self._current_target_revision(target.id)
+        if mode == "offline":
+            return {
+                "target_revision_sha256": target_rev,
+                "auth_source": "none",
+                "session_credential_ref": None,
+                "session_credential_generation": None,
+                "session_auth_type": None,
+                "session_auth_header": None,
+            }
+        session_refs = [
+            ref for ref in (target.credential_refs or [])
+            if isinstance(ref, str) and ref.startswith("sess_")
+        ]
+        if session_refs:
+            ref = session_refs[0]
+            target_url = str(target.interface.config.get("url") or "")
+            target_meta = target.metadata if isinstance(target.metadata, dict) else {}
+            session_store = getattr(self.catalog, "session_credentials", None)
+            gen: str | None = None
+            if session_store is not None:
+                avail = session_store.availability(
+                    ref,
+                    endpoint=target_url,
+                    scope_id=target.id,
+                    scope_kind="target",
+                    expected_auth_type=target_meta.get("session_auth_type"),
+                    expected_header_name=target_meta.get("session_auth_header"),
+                )
+                if avail == "available":
+                    gen = session_store.generation(
+                        ref,
+                        endpoint=target_url,
+                        scope_id=target.id,
+                        scope_kind="target",
+                    )
+            return {
+                "target_revision_sha256": target_rev,
+                "auth_source": "session_memory",
+                "session_credential_ref": ref,
+                "session_credential_generation": gen,
+                "session_auth_type": target_meta.get("session_auth_type"),
+                "session_auth_header": target_meta.get("session_auth_header"),
+            }
+        if target.credential_refs:
+            return {
+                "target_revision_sha256": target_rev,
+                "auth_source": "env_alias",
+                "session_credential_ref": None,
+                "session_credential_generation": None,
+                "session_auth_type": None,
+                "session_auth_header": None,
+            }
+        return {
+            "target_revision_sha256": target_rev,
+            "auth_source": "none",
+            "session_credential_ref": None,
+            "session_credential_generation": None,
+            "session_auth_type": None,
+            "session_auth_header": None,
+        }
+
     def preview_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         mode = payload.get("mode", "offline")
         if mode not in {"live", "offline"}:
@@ -1060,6 +1207,7 @@ class GenericRunService:
             evidence_sources=payload.get("evidence_sources"),
             for_execution=True,
         )
+        auth_binding = self._resolve_target_auth_binding(mode=mode, target=target)
         raw_sources = payload.get("evidence_sources")
         evidence_source_diagnostics: list[dict[str, Any]] = []
         if isinstance(raw_sources, list):
@@ -1107,6 +1255,11 @@ class GenericRunService:
             "mode": mode,
             "target_id": target.id,
             "target_name": target.name,
+            "target_revision_sha256": auth_binding["target_revision_sha256"],
+            "auth_source": auth_binding["auth_source"],
+            "session_credential_generation": auth_binding["session_credential_generation"],
+            "session_auth_type": auth_binding["session_auth_type"],
+            "session_auth_header": auth_binding["session_auth_header"],
             "dataset_id": dataset_id,
             "dataset_name": dataset_name,
             "asi_category": asi_category,
@@ -1202,7 +1355,12 @@ class GenericRunService:
             "capability_states": payload.get("capability_states"),
             "evidence_sources": payload.get("evidence_sources"),
             "allowed_collector_roots": payload.get("allowed_collector_roots"),
+            "expected_target_revision": payload.get("expected_target_revision"),
+            "expected_session_credential_generation": payload.get("expected_session_credential_generation"),
         }
+        if payload.get("continuation_of_run_id") or payload.get("expected_resume_digest"):
+            canonical["continuation_of_run_id"] = payload.get("continuation_of_run_id")
+            canonical["expected_resume_digest"] = payload.get("expected_resume_digest")
         return sha256(json.dumps(canonical, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
     def _build_judge_metadata(
@@ -1384,7 +1542,13 @@ class GenericRunService:
         if dict(sorted(actual_verdicts.items())) != dict(sorted((k, int(v)) for k, v in v_counts.items() if int(v) > 0)):
             raise RuntimeError("completion_invariant_verdict_distribution_mismatch")
 
-    def start_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def start_run(
+        self,
+        payload: dict[str, Any],
+        *,
+        _continuation_meta: dict[str, Any] | None = None,
+        _owns_root_lock: str | None = None,
+    ) -> dict[str, Any]:
         if payload.get("authorization_confirmed") is not True:
             raise ValueError("generic_authorization_required")
         mode = payload.get("mode", "offline")
@@ -1403,6 +1567,15 @@ class GenericRunService:
             submission_id = str(submission_id_raw).strip()
             if not _HEX32_RE.fullmatch(submission_id):
                 raise ValueError("generic_invalid_submission_id")
+
+        expected_target_revision = payload.get("expected_target_revision")
+        if expected_target_revision is not None:
+            if not isinstance(expected_target_revision, str) or not _HEX64_RE.fullmatch(expected_target_revision):
+                raise ValueError("generic_target_revision_stale")
+        expected_session_gen = payload.get("expected_session_credential_generation")
+        if expected_session_gen is not None:
+            if not isinstance(expected_session_gen, str) or not _HEX32_RE.fullmatch(expected_session_gen):
+                raise ValueError("generic_session_credential_stale")
 
         fingerprint = (
             self._submission_fingerprint(payload, mode, target_id, asi_category, use_judge)
@@ -1479,6 +1652,8 @@ class GenericRunService:
         released = False
         try:
             cat_lock = getattr(self.catalog, "_lock", None)
+            session_resolver = None
+            session_secrets: list[str] = []
             with (cat_lock if cat_lock is not None else nullcontext()), self._lock:
                 target = self._resolve_target(
                     mode=mode,
@@ -1488,6 +1663,57 @@ class GenericRunService:
                     evidence_sources=payload.get("evidence_sources"),
                     for_execution=True,
                 )
+                auth_binding = self._resolve_target_auth_binding(mode=mode, target=target)
+                current_target_rev = auth_binding["target_revision_sha256"]
+                if expected_target_revision is not None and current_target_rev is not None:
+                    if expected_target_revision != current_target_rev:
+                        raise ValueError("generic_target_revision_stale")
+
+                # Snapshot & validate session-memory credential generation and target revision
+                # under lock BEFORE acquiring run or sending any target request.
+                if mode == "live" and auth_binding["auth_source"] == "session_memory":
+                    session_store = getattr(self.catalog, "session_credentials", None)
+                    if session_store is None:
+                        raise ValueError("credential_unavailable")
+                    current_gen = auth_binding["session_credential_generation"]
+                    if not current_gen:
+                        raise ValueError("credential_unavailable")
+                    if not expected_session_gen:
+                        raise ValueError("generic_session_credential_authorization_required")
+                    if expected_session_gen != current_gen:
+                        raise ValueError("generic_session_credential_stale")
+                    if current_target_rev is not None and not expected_target_revision:
+                        raise ValueError("generic_target_revision_stale")
+                    target_url = str(target.interface.config.get("url") or "")
+                    target_meta = target.metadata if isinstance(target.metadata, dict) else {}
+                    resolved_map: dict[str, str] = {}
+                    for ref in (target.credential_refs or []):
+                        if not isinstance(ref, str) or not ref.startswith("sess_"):
+                            continue
+                        try:
+                            _, raw_secret, variants = session_store.resolve(
+                                ref,
+                                endpoint=target_url,
+                                scope_id=target.id,
+                                scope_kind="target",
+                                expected_auth_type=target_meta.get("session_auth_type"),
+                                expected_header_name=target_meta.get("session_auth_header"),
+                            )
+                        except SessionCredentialError as exc:
+                            raise ValueError("credential_unavailable") from exc
+                        resolved_map[ref] = raw_secret
+                        for variant in variants:
+                            if variant not in session_secrets:
+                                session_secrets.append(variant)
+
+                    def _resolve_scan_session_cred(ref_id: str, _snap=dict(resolved_map)) -> str | None:
+                        return _snap.get(ref_id)
+
+                    session_resolver = _resolve_scan_session_cred
+                elif expected_session_gen is not None:
+                    # Authorization was bound to a session credential generation, but target is no longer session-backed.
+                    raise ValueError("generic_session_credential_stale")
+
                 tracked_ids = tuple(dict.fromkeys((target_id, target.id)))
                 for tid in tracked_ids:
                     self._acquire_target_run(tid)
@@ -1655,6 +1881,13 @@ class GenericRunService:
                 "target_id": target.id,
                 "target_name": target.name,
                 "target_revision_sha256": target_revision_sha256,
+                "authentication_provenance": {
+                    "auth_source": auth_binding["auth_source"],
+                    "session_auth_type": auth_binding["session_auth_type"],
+                    "session_auth_header": auth_binding["session_auth_header"],
+                    "session_credential_generation": auth_binding["session_credential_generation"],
+                    "identity_verified": False,
+                },
                 "dataset_id": dataset_id,
                 "dataset_name": dataset_name,
                 "dataset_revision_sha256": dataset_revision_sha256,
@@ -1702,10 +1935,21 @@ class GenericRunService:
                 "case_statuses": case_statuses,
                 "events": [{"at": started_at, "stage": "run_started", "case_id": None}],
                 "cases": [],
+                **(
+                    {
+                        "continuation_of_run_id": _continuation_meta["parent_run_id"],
+                        "root_run_id": _continuation_meta["root_run_id"],
+                        "resume_metadata": dict(_continuation_meta),
+                    }
+                    if isinstance(_continuation_meta, dict)
+                    else {}
+                ),
             }
             with self._lock:
                 # Register in-progress run BEFORE writing generic-run.json to disk so get_run/list_runs never see a false orphan
                 self._in_progress_runs[run_id] = Thread(name=f"init-{run_id[:8]}")
+                if _owns_root_lock:
+                    self._active_resumes_by_root[_owns_root_lock] = run_id
             try:
                 self._write_run_record(run_dir, record)
                 if submission_id and fingerprint:
@@ -1747,6 +1991,7 @@ class GenericRunService:
                 cid = str(evt.get("case_id") or "")
                 if ev_type in {"case_started", "case_stage"}:
                     stage_name = str(evt.get("stage") or "running")
+                    is_pre_dispatch = ev_type == "case_started" or stage_name == "sending_request_to_target"
                     with self._lock:
                         record["current_case_id"] = cid
                         record["current_stage"] = stage_name
@@ -1760,8 +2005,9 @@ class GenericRunService:
                         )[-120:]
                     try:
                         self._write_run_record(run_dir, record)
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        if is_pre_dispatch:
+                            raise DispatchCheckpointError("dispatch_checkpoint_write_failed") from exc
                 elif ev_type == "case_completed":
                     idx = int(evt.get("index", len(enriched_cases)))
                     item = evt["case_summary"]
@@ -1837,7 +2083,7 @@ class GenericRunService:
                         **({"source_provenance": source_prov} if source_prov is not None else {}),
                         **({"historical_verdict": hist_verdict} if isinstance(hist_verdict, dict) else {}),
                         "report_path": str(report_path),
-                    })
+                    }, extra_secrets=session_secrets)
                     with self._lock:
                         enriched_cases.append(enriched_case)
                         verdict_counter[item["verdict"]] += 1
@@ -1891,6 +2137,8 @@ class GenericRunService:
                         case_progress_callback=_on_progress,
                         target_revision_sha256=target_revision_sha256,
                         dataset_metadata=run_dataset_metadata,
+                        credential_resolver=session_resolver,
+                        extra_sensitive_values=tuple(session_secrets),
                     )
                     done_iso = datetime.now(timezone.utc).isoformat()
                     with self._lock:
@@ -1922,9 +2170,13 @@ class GenericRunService:
                 except Exception as exc:
                     fail_iso = datetime.now(timezone.utc).isoformat()
                     err_code = (
-                        "persistence_integrity_failed"
-                        if isinstance(exc, (OSError, RuntimeError))
-                        else "runner_execution_failed"
+                        "dispatch_checkpoint_write_failed"
+                        if isinstance(exc, DispatchCheckpointError)
+                        else (
+                            "persistence_integrity_failed"
+                            if isinstance(exc, (OSError, RuntimeError))
+                            else "runner_execution_failed"
+                        )
                     )
                     with self._lock:
                         record["status"] = "failed"
@@ -1947,6 +2199,8 @@ class GenericRunService:
                 finally:
                     with self._lock:
                         self._in_progress_runs.pop(run_id, None)
+                        if _owns_root_lock and self._active_resumes_by_root.get(_owns_root_lock) in {run_id, "reserving"}:
+                            self._active_resumes_by_root.pop(_owns_root_lock, None)
                     for tid in tracked_ids:
                         self._release_target_run(tid)
 
@@ -1957,7 +2211,10 @@ class GenericRunService:
                 released = True
                 worker_thread.start()
                 with self._lock:
-                    return dict(record)
+                    snap = dict(record)
+                if isinstance(_continuation_meta, dict):
+                    return self._enrich_loaded_run(run_id, snap, run_dir, is_in_progress=True)
+                return snap
 
             released = True
             _execute_worker()
@@ -1977,6 +2234,9 @@ class GenericRunService:
                     if in_flight_entry is not None and not in_flight_entry["event"].is_set():
                         in_flight_entry["event"].set()
             if not released:
+                if _owns_root_lock:
+                    with self._lock:
+                        self._active_resumes_by_root.pop(_owns_root_lock, None)
                 for tid in tracked_ids:
                     self._release_target_run(tid)
 
@@ -2151,7 +2411,1360 @@ class GenericRunService:
                 if isinstance(s, dict)
             ]
             record["case_statuses"] = reconstructed
+        lineage_info = self._scan_lineage(run_id)
+        record["child_run_ids"] = lineage_info["child_run_ids"]
+        is_multi_session = len(lineage_info["lineage_run_ids"]) > 1 or bool(record.get("continuation_of_run_id"))
+        if (
+            is_multi_session
+            or record.get("status") == "interrupted"
+            or (record.get("status") == "completed" and int((record.get("verdict_counts") or {}).get("ERROR", 0)) > 0)
+        ):
+            cls = self._classify_resume_cases(raw, lineage_info)
+            unified = self._build_unified_lineage_view(run_id, raw, record, lineage_info, cls)
+            record["lineage_summary"] = unified["lineage_summary"]
+            if is_multi_session:
+                record["unified_lineage"] = unified["unified_lineage"]
         return record
+
+    def _build_unified_lineage_view(
+        self,
+        run_id: str,
+        raw: dict[str, Any],
+        current_record: dict[str, Any],
+        lineage_info: dict[str, Any],
+        cls: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build read-only unified logical scan summary & deduplicated lineage view without mutating disk records."""
+        lineage_docs: list[tuple[str, dict[str, Any]]] = list(lineage_info.get("lineage_docs") or [])
+        if not lineage_docs:
+            lineage_docs = [(run_id, raw)]
+        root_id = str(lineage_info["root_run_id"])
+        root_doc = lineage_info.get("root_doc") if isinstance(lineage_info.get("root_doc"), dict) else raw
+        active_id = lineage_info.get("active_lineage_run_id")
+
+        with self._lock:
+            in_progress_ids = set(self._in_progress_runs.keys())
+
+        sessions: list[dict[str, Any]] = []
+        unified_cases_by_id: dict[str, dict[str, Any]] = {}
+        active_case_status_by_id: dict[str, dict[str, Any]] = {}
+        active_session_doc: dict[str, Any] | None = None
+        total_target_req_used: int = 0
+        saw_target_req_used = False
+        total_judge_req_used: int = 0
+        saw_judge_req_used = False
+        recorded_judge_provider: str | None = None
+        recorded_judge_model: str | None = None
+        saw_any_judge_metadata = False
+
+        for idx, (rid, doc) in enumerate(lineage_docs, start=1):
+            raw_st = str(doc.get("status") or "completed")
+            if rid in in_progress_ids:
+                sess_status = "running"
+            elif raw_st in {"preparing", "running"}:
+                sess_status = "interrupted"
+            else:
+                sess_status = raw_st
+
+            sess_cases = doc.get("cases") if isinstance(doc.get("cases"), list) else []
+            sess_vc = doc.get("verdict_counts") if isinstance(doc.get("verdict_counts"), dict) else {}
+            if not sess_vc and sess_cases:
+                c_cnt: Counter[str] = Counter()
+                for c in sess_cases:
+                    if isinstance(c, dict) and isinstance(c.get("verdict"), str):
+                        c_cnt[c["verdict"]] += 1
+                sess_vc = dict(sorted(c_cnt.items()))
+
+            sess_t_used = (
+                int(doc["target_requests_used"])
+                if isinstance(doc.get("target_requests_used"), int) and not isinstance(doc.get("target_requests_used"), bool)
+                else None
+            )
+            sess_t_budget = (
+                int(doc["target_request_budget"])
+                if isinstance(doc.get("target_request_budget"), int) and not isinstance(doc.get("target_request_budget"), bool)
+                else None
+            )
+            sess_j_used = (
+                int(doc["judge_requests_used"])
+                if isinstance(doc.get("judge_requests_used"), int) and not isinstance(doc.get("judge_requests_used"), bool)
+                else None
+            )
+            sess_j_budget = (
+                int(doc["judge_request_budget"])
+                if isinstance(doc.get("judge_request_budget"), int) and not isinstance(doc.get("judge_request_budget"), bool)
+                else None
+            )
+            sess_jm = doc.get("judge_metadata") if isinstance(doc.get("judge_metadata"), dict) else None
+            if sess_jm is not None:
+                saw_any_judge_metadata = True
+                if not recorded_judge_provider and isinstance(sess_jm.get("provider"), str) and sess_jm["provider"].strip():
+                    recorded_judge_provider = sess_jm["provider"].strip()
+                if not recorded_judge_model and isinstance(sess_jm.get("model"), str) and sess_jm["model"].strip():
+                    recorded_judge_model = sess_jm["model"].strip()
+
+            if sess_t_used is not None:
+                total_target_req_used += sess_t_used
+                saw_target_req_used = True
+            if sess_j_used is not None:
+                total_judge_req_used += sess_j_used
+                saw_judge_req_used = True
+
+            sessions.append({
+                "session_index": idx,
+                "generic_run_id": rid,
+                "continuation_of_run_id": doc.get("continuation_of_run_id"),
+                "status": sess_status,
+                "started_at": doc.get("started_at"),
+                "completed_at": doc.get("completed_at") if sess_status not in {"preparing", "running"} else None,
+                "selected_cases": int(doc.get("selected_cases") or len(sess_cases)),
+                "ready_count": int(doc.get("ready_count") or doc.get("total_cases") or len(sess_cases)),
+                "executed_cases": len(sess_cases),
+                "verdict_counts": sess_vc,
+                "target_requests_used": sess_t_used,
+                "target_request_budget": sess_t_budget,
+                "judge_requests_used": sess_j_used,
+                "judge_request_budget": sess_j_budget,
+                "judge_metadata": sess_jm,
+                "error_code": doc.get("error_code"),
+                "interrupted_reason": (
+                    doc.get("interrupted_reason")
+                    or ("process_restarted_before_completion" if sess_status == "interrupted" else None)
+                ),
+            })
+
+            if rid == active_id or (rid == run_id and sess_status in {"preparing", "running"}):
+                active_session_doc = doc
+                for cs in doc.get("case_statuses") or []:
+                    if isinstance(cs, dict) and isinstance(cs.get("case_id"), str):
+                        active_case_status_by_id[cs["case_id"]] = cs
+
+            for c in sess_cases:
+                if not isinstance(c, dict):
+                    continue
+                cid = c.get("case_id")
+                verdict = c.get("verdict")
+                if not isinstance(cid, str) or not cid or not isinstance(verdict, str) or not verdict:
+                    continue
+                if cid not in unified_cases_by_id:
+                    c_copy = dict(c)
+                    c_copy["source_generic_run_id"] = rid
+                    c_copy["session_index"] = idx
+                    unified_cases_by_id[cid] = c_copy
+
+        # R05: Strictly enforce validated root testcase scope & checkpoint integrity.
+        # Never append out-of-scope cases into cumulative counts or report verified completion for an invalid lineage.
+        state_incomplete = bool(cls.get("state_incomplete"))
+        root_selected_ids: list[str] = list(cls.get("root_selected_ids") or [])
+        root_selected_set: set[str] = set(root_selected_ids)
+
+        out_of_scope_case_ids: list[str] = []
+        if root_selected_set:
+            out_of_scope_case_ids = sorted(cid for cid in unified_cases_by_id if cid not in root_selected_set)
+            if out_of_scope_case_ids:
+                state_incomplete = True
+
+        ordered_case_ids: list[str] = []
+        if root_selected_ids:
+            seen_cids: set[str] = set()
+            for cid in root_selected_ids:
+                if cid in unified_cases_by_id and cid not in seen_cids:
+                    ordered_case_ids.append(cid)
+                    seen_cids.add(cid)
+        elif not state_incomplete:
+            ordered_case_ids = list(unified_cases_by_id.keys())
+
+        unified_cases = [unified_cases_by_id[cid] for cid in ordered_case_ids]
+
+        verdict_counter: Counter[str] = Counter()
+        evidence_counter: Counter[str] = Counter()
+        for c in unified_cases:
+            verdict_counter[str(c["verdict"])] += 1
+            ev_lvl = c.get("evidence_level")
+            if isinstance(ev_lvl, str) and ev_lvl:
+                evidence_counter[ev_lvl] += 1
+        unified_verdict_counts = dict(sorted(verdict_counter.items()))
+        unified_evidence_summary = dict(sorted(evidence_counter.items()))
+
+        root_skipped_cases = root_doc.get("skipped_cases") if isinstance(root_doc.get("skipped_cases"), list) else []
+        root_skipped_count = (
+            int(root_doc["skipped_count"])
+            if isinstance(root_doc.get("skipped_count"), int) and not isinstance(root_doc.get("skipped_count"), bool)
+            else len(root_skipped_cases)
+        )
+        orig_selected = int(lineage_info.get("original_selected_cases") or len(root_selected_ids) or 0)
+        root_ready_count = (
+            int(root_doc["ready_count"])
+            if isinstance(root_doc.get("ready_count"), int) and not isinstance(root_doc.get("ready_count"), bool)
+            else max(0, orig_selected - root_skipped_count)
+        )
+        executed_unique = len(unified_cases)
+
+        integrity_status = "invalid_checkpoint" if state_incomplete else "valid"
+        integrity_warning: str | None = None
+        if state_incomplete:
+            if out_of_scope_case_ids:
+                integrity_warning = (
+                    f"Lineage checkpoint integrity failed (resume_state_incomplete): out-of-scope testcase(s) detected "
+                    f"({', '.join(out_of_scope_case_ids[:10])}). Unified completion and export are blocked; inspect individual session reports."
+                )
+            else:
+                integrity_warning = (
+                    "Lineage checkpoint integrity failed (resume_state_incomplete): persisted testcase state is incomplete or inconsistent. "
+                    "Unified completion and export are blocked; inspect individual session reports."
+                )
+
+        # Authoritative logical status distinguishing execution completion from evaluation errors and invalid checkpoints.
+        latest_sess = sessions[-1] if sessions else None
+        if state_incomplete:
+            if active_id is not None:
+                logical_status = "running"
+            elif any(s["status"] == "interrupted" for s in sessions):
+                logical_status = "interrupted"
+            else:
+                logical_status = "failed"
+        elif active_id is not None:
+            logical_status = "running"
+        elif root_ready_count > 0 and executed_unique >= root_ready_count:
+            logical_status = "completed_with_errors" if int(unified_verdict_counts.get("ERROR", 0)) > 0 else "completed"
+        elif latest_sess and latest_sess["status"] in {"interrupted", "cancelled", "failed"}:
+            logical_status = latest_sess["status"]
+        elif any(s["status"] == "interrupted" for s in sessions):
+            logical_status = "interrupted"
+        else:
+            logical_status = str(current_record.get("status") or "failed")
+
+        has_remaining_cases = len(cls["pending_case_ids"]) > 0 or len(cls["uncertain_case_ids"]) > 0
+        interrupted_sessions = [s["generic_run_id"] for s in sessions if s["status"] == "interrupted"]
+        resumable_run_id: str | None = None
+        if active_id is None and not state_incomplete and has_remaining_cases and interrupted_sessions:
+            resumable_run_id = run_id if run_id in interrupted_sessions else interrupted_sessions[-1]
+
+        has_resumable_work = resumable_run_id is not None
+
+        # R04: Aggregated Judge metadata across deduplicated unified_cases (consistent from root or continuation).
+        root_use_judge = bool(root_doc.get("use_judge", current_record.get("use_judge")))
+        root_mode = str(root_doc.get("mode", current_record.get("mode") or "live"))
+        has_per_case_judge_signal = any(
+            isinstance(c, dict)
+            and (
+                "semantic_invoked" in c
+                or c.get("judge_classification") is not None
+                or c.get("judge_reason") is not None
+                or c.get("provider_fault_code") is not None
+            )
+            for c in unified_cases
+        )
+        if not root_use_judge:
+            unified_judge_metadata = self._build_judge_metadata(
+                use_judge=False,
+                run_status="running" if active_id is not None else "completed",
+                cases=unified_cases,
+                pi_cfg=None,
+                is_historical=True,
+            )
+        elif has_per_case_judge_signal or saw_any_judge_metadata:
+            unified_judge_metadata = self._build_judge_metadata(
+                use_judge=True,
+                run_status="running" if active_id is not None else "completed",
+                cases=unified_cases,
+                pi_cfg=None,
+                is_historical=True,
+                recorded_provider=recorded_judge_provider,
+                recorded_model=recorded_judge_model,
+            )
+        else:
+            unified_judge_metadata = None
+
+        # Distinguish missing request counter metadata (None) from recorded zero (0).
+        cumulative_target_requests_used: int | None = (
+            total_target_req_used if saw_target_req_used else (0 if root_mode == "offline" else None)
+        )
+        cumulative_judge_requests_used: int | None = (
+            total_judge_req_used
+            if saw_judge_req_used
+            else (
+                int(unified_judge_metadata["request_count"])
+                if isinstance(unified_judge_metadata, dict)
+                else (0 if not root_use_judge else None)
+            )
+        )
+
+        # Resolve active/latest session live progress details (CurrentTestcase & BudgetUsage).
+        latest_doc = lineage_docs[-1][1] if lineage_docs else raw
+        live_doc = active_session_doc if active_session_doc is not None else latest_doc
+        active_sess_summary = (
+            next((s for s in sessions if s["generic_run_id"] == active_id), None)
+            if active_id is not None
+            else latest_sess
+        )
+        active_current_case_id = live_doc.get("current_case_id") if active_id is not None else None
+        active_current_stage = (
+            live_doc.get("current_stage") if active_id is not None else logical_status
+        )
+        active_session_events = (
+            live_doc.get("events") if isinstance(live_doc.get("events"), list) else []
+        )
+
+        # Unified case_statuses across ALL originally selected testcases in root order.
+        root_row_by_id = {
+            row["case_id"]: row
+            for row in (root_doc.get("case_statuses") or [])
+            if isinstance(row, dict) and isinstance(row.get("case_id"), str)
+        }
+        uncertain_set = set(cls["uncertain_case_ids"])
+        skipped_set = set(cls["skipped_case_ids"])
+        unified_case_statuses: list[dict[str, Any]] = []
+        for cid in root_selected_ids:
+            base_row = root_row_by_id.get(cid) or {}
+            cat = base_row.get("category")
+            asi_code = base_row.get("asi_code") or _ASI_CODE_BY_POLICY_CATEGORY.get(str(cat or ""), str(cat or ""))
+            if cid in unified_cases_by_id:
+                c = unified_cases_by_id[cid]
+                unified_case_statuses.append({
+                    "case_id": cid,
+                    "category": c.get("category") or cat,
+                    "asi_code": _ASI_CODE_BY_POLICY_CATEGORY.get(str(c.get("category") or ""), asi_code),
+                    "status": "error" if c.get("verdict") == "ERROR" else "completed",
+                    "stage": "completed",
+                    "verdict": c.get("verdict"),
+                    "reason": c.get("reason"),
+                    "evidence_level": c.get("evidence_level"),
+                    "run_id": c.get("run_id"),
+                    "source_generic_run_id": c.get("source_generic_run_id"),
+                    "session_index": c.get("session_index"),
+                })
+            elif cid in active_case_status_by_id and active_case_status_by_id[cid].get("status") == "running":
+                ar = active_case_status_by_id[cid]
+                unified_case_statuses.append({
+                    "case_id": cid,
+                    "category": ar.get("category") or cat,
+                    "asi_code": ar.get("asi_code") or asi_code,
+                    "status": "running",
+                    "stage": ar.get("stage") or "running",
+                    "verdict": None,
+                    "reason": ar.get("reason"),
+                    "evidence_level": None,
+                    "run_id": None,
+                    "source_generic_run_id": active_id or run_id,
+                })
+            elif cid in skipped_set:
+                unified_case_statuses.append({
+                    "case_id": cid,
+                    "category": cat,
+                    "asi_code": asi_code,
+                    "status": base_row.get("status", "unsupported"),
+                    "stage": "skipped",
+                    "verdict": None,
+                    "reason": base_row.get("reason"),
+                    "evidence_level": None,
+                    "run_id": None,
+                })
+            elif cid in uncertain_set:
+                unified_case_statuses.append({
+                    "case_id": cid,
+                    "category": cat,
+                    "asi_code": asi_code,
+                    "status": "queued",
+                    "stage": "interrupted",
+                    "verdict": None,
+                    "reason": "Interrupted in-flight before result was recorded",
+                    "evidence_level": None,
+                    "run_id": None,
+                })
+            else:
+                unified_case_statuses.append({
+                    "case_id": cid,
+                    "category": cat,
+                    "asi_code": asi_code,
+                    "status": "queued",
+                    "stage": "queued",
+                    "verdict": None,
+                    "reason": None,
+                    "evidence_level": None,
+                    "run_id": None,
+                })
+
+        progress_pct = (
+            100
+            if (not state_incomplete and logical_status in {"completed", "completed_with_errors"} and root_ready_count > 0)
+            else int(round((executed_unique / max(1, root_ready_count)) * 100)) if root_ready_count > 0 else 0
+        )
+        started_at = root_doc.get("started_at") or (sessions[0]["started_at"] if sessions else None)
+        completed_at = None if (active_id is not None or state_incomplete) else (latest_sess["completed_at"] if latest_sess else None)
+
+        lineage_summary = {
+            "root_run_id": root_id,
+            "parent_run_id": lineage_info["parent_run_id"],
+            "child_run_ids": lineage_info["child_run_ids"],
+            "lineage_run_ids": lineage_info["lineage_run_ids"],
+            "latest_run_id": sessions[-1]["generic_run_id"] if sessions else run_id,
+            "active_lineage_run_id": active_id,
+            "resumable_run_id": resumable_run_id,
+            "logical_status": logical_status,
+            "integrity_status": integrity_status,
+            "integrity_warning": integrity_warning,
+            "session_count": len(sessions),
+            "resume_count": max(0, len(sessions) - 1),
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "original_selected_cases": orig_selected,
+            "ready_count": root_ready_count,
+            "skipped_count": root_skipped_count,
+            "lineage_completed_count": executed_unique,
+            "lineage_verdict_counts": unified_verdict_counts,
+            "remaining_pending_count": len(cls["pending_case_ids"]),
+            "remaining_uncertain_count": len(cls["uncertain_case_ids"]),
+            "has_resumable_work": has_resumable_work,
+        }
+
+        unified_lineage = {
+            "logical_scan_id": root_id,
+            "root_run_id": root_id,
+            "latest_run_id": sessions[-1]["generic_run_id"] if sessions else run_id,
+            "active_session_run_id": active_id,
+            "resumable_run_id": resumable_run_id,
+            "logical_status": logical_status,
+            "integrity_status": integrity_status,
+            "integrity_warning": integrity_warning,
+            "out_of_scope_case_ids": out_of_scope_case_ids,
+            "execution_completed": (
+                not state_incomplete
+                and root_ready_count > 0
+                and executed_unique >= root_ready_count
+                and active_id is None
+            ),
+            "has_evaluation_errors": int(unified_verdict_counts.get("ERROR", 0)) > 0,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "session_count": len(sessions),
+            "resume_count": max(0, len(sessions) - 1),
+            "selected_cases": orig_selected,
+            "ready_count": root_ready_count,
+            "executed_cases": executed_unique,
+            "skipped_count": root_skipped_count,
+            "skipped_cases": root_skipped_cases,
+            "progress_percent": progress_pct,
+            "verdict_counts": unified_verdict_counts,
+            "evidence_summary": unified_evidence_summary,
+            "judge_metadata": unified_judge_metadata,
+            "target_requests_used": cumulative_target_requests_used,
+            "judge_requests_used": cumulative_judge_requests_used,
+            "current_case_id": active_current_case_id,
+            "current_stage": active_current_stage,
+            "active_session_started_at": active_sess_summary["started_at"] if active_sess_summary else None,
+            "active_session_target_requests_used": active_sess_summary["target_requests_used"] if active_sess_summary else None,
+            "active_session_target_request_budget": active_sess_summary["target_request_budget"] if active_sess_summary else None,
+            "active_session_judge_requests_used": active_sess_summary["judge_requests_used"] if active_sess_summary else None,
+            "active_session_judge_request_budget": active_sess_summary["judge_request_budget"] if active_sess_summary else None,
+            "active_session_events": active_session_events,
+            "sessions": sessions,
+            "case_statuses": unified_case_statuses,
+            "cases": unified_cases,
+        }
+        return {"lineage_summary": lineage_summary, "unified_lineage": unified_lineage}
+
+    def get_unified_report(self, run_id: str) -> dict[str, Any] | None:
+        """Build a read-only unified lineage report JSON without modifying historical artifacts."""
+        record = self.get_run(run_id)
+        if record is None:
+            return None
+        raw = self._read_raw_run_disk(run_id)
+        if raw is None:
+            return None
+        lineage_info = self._scan_lineage(run_id)
+        cls = self._classify_resume_cases(raw, lineage_info)
+        built = self._build_unified_lineage_view(run_id, raw, record, lineage_info, cls)
+        ul = built["unified_lineage"]
+        if ul.get("integrity_status") != "valid":
+            raise ValueError("unified_report_integrity_failed")
+        root_doc = lineage_info.get("root_doc") if isinstance(lineage_info.get("root_doc"), dict) else raw
+        return {
+            "workflow_schema_version": "1.0.0",
+            "report_kind": "unified_generic_scan_lineage",
+            "logical_scan_id": ul["logical_scan_id"],
+            "root_run_id": ul["root_run_id"],
+            "requested_run_id": run_id,
+            "latest_run_id": ul["latest_run_id"],
+            "logical_status": ul["logical_status"],
+            "integrity_status": ul["integrity_status"],
+            "execution_completed": ul["execution_completed"],
+            "has_evaluation_errors": ul["has_evaluation_errors"],
+            "mode": root_doc.get("mode", record.get("mode")),
+            "target_id": root_doc.get("target_id", record.get("target_id")),
+            "target_name": root_doc.get("target_name", record.get("target_name")),
+            "target_revision_sha256": root_doc.get("target_revision_sha256"),
+            "dataset_id": root_doc.get("dataset_id", record.get("dataset_id")),
+            "dataset_name": root_doc.get("dataset_name", record.get("dataset_name")),
+            "dataset_revision_sha256": root_doc.get("dataset_revision_sha256"),
+            "asi_category": root_doc.get("asi_category", record.get("asi_category")),
+            "use_judge": bool(root_doc.get("use_judge", record.get("use_judge"))),
+            "started_at": ul["started_at"],
+            "completed_at": ul["completed_at"],
+            "selected_cases": ul["selected_cases"],
+            "ready_count": ul["ready_count"],
+            "skipped_count": ul["skipped_count"],
+            "recorded_outcomes": ul["executed_cases"],
+            "verdict_counts": ul["verdict_counts"],
+            "evidence_summary": ul["evidence_summary"],
+            "target_requests_used": ul["target_requests_used"],
+            "judge_requests_used": ul["judge_requests_used"],
+            "judge_metadata": ul["judge_metadata"],
+            "session_count": ul["session_count"],
+            "resume_count": ul["resume_count"],
+            "sessions": ul["sessions"],
+            "skipped_cases": ul["skipped_cases"],
+            "cases": ul["cases"],
+        }
+
+    def _read_raw_run_disk(self, run_id: str) -> dict[str, Any] | None:
+        if not _HEX32_RE.fullmatch(run_id):
+            return None
+        path = self.runs_root / run_id / "generic-run.json"
+        with self._lock:
+            if not path.is_file():
+                return None
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return None
+        return raw if isinstance(raw, dict) else None
+
+    def _scan_lineage(self, run_id: str, *, ignore_root_lock: bool = False) -> dict[str, Any]:
+        raw_by_id: dict[str, dict[str, Any]] = {}
+        with self._lock:
+            if self.runs_root.is_dir():
+                for entry in self.runs_root.iterdir():
+                    if not entry.is_dir() or not _HEX32_RE.fullmatch(entry.name):
+                        continue
+                    path = entry / "generic-run.json"
+                    if not path.is_file():
+                        continue
+                    try:
+                        doc = json.loads(path.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    if isinstance(doc, dict):
+                        raw_by_id[entry.name] = doc
+            in_progress_ids = set(self._in_progress_runs.keys())
+            active_resumes = dict(self._active_resumes_by_root)
+
+        def _resolve_root(rid: str) -> str:
+            cur = rid
+            seen: set[str] = set()
+            while cur in raw_by_id and cur not in seen:
+                seen.add(cur)
+                doc = raw_by_id[cur]
+                explicit_root = doc.get("root_run_id")
+                if isinstance(explicit_root, str) and _HEX32_RE.fullmatch(explicit_root):
+                    return explicit_root
+                parent = doc.get("continuation_of_run_id")
+                if isinstance(parent, str) and _HEX32_RE.fullmatch(parent) and parent != cur:
+                    cur = parent
+                    continue
+                break
+            return cur
+
+        root_id = _resolve_root(run_id)
+        self_raw = raw_by_id.get(run_id) or {}
+        parent_id = (
+            self_raw.get("continuation_of_run_id")
+            if isinstance(self_raw.get("continuation_of_run_id"), str)
+            else None
+        )
+        lineage_ids = [rid for rid in raw_by_id if _resolve_root(rid) == root_id]
+        lineage_ids.sort(key=lambda rid: (str(raw_by_id[rid].get("started_at") or ""), rid))
+        child_ids = [
+            rid
+            for rid in lineage_ids
+            if raw_by_id[rid].get("continuation_of_run_id") == run_id
+        ]
+
+        active_lineage_run_id: str | None = None
+        for rid in lineage_ids:
+            if rid in in_progress_ids:
+                active_lineage_run_id = rid
+                break
+        if active_lineage_run_id is None and not ignore_root_lock:
+            locked_val = active_resumes.get(root_id)
+            if isinstance(locked_val, str) and locked_val:
+                active_lineage_run_id = locked_val
+
+        lineage_completed_by_case_id: dict[str, dict[str, Any]] = {}
+        verdict_counter: Counter[str] = Counter()
+        for rid in lineage_ids:
+            doc = raw_by_id[rid]
+            for c in doc.get("cases") or []:
+                if not isinstance(c, dict):
+                    continue
+                cid = c.get("case_id")
+                verdict = c.get("verdict")
+                if not isinstance(cid, str) or not cid or not isinstance(verdict, str) or not verdict:
+                    continue
+                if cid not in lineage_completed_by_case_id:
+                    lineage_completed_by_case_id[cid] = {
+                        "case_id": cid,
+                        "verdict": verdict,
+                        "run_id": c.get("run_id"),
+                        "generic_run_id": rid,
+                        "report_path": c.get("report_path"),
+                        "category": c.get("category"),
+                    }
+                    verdict_counter[verdict] += 1
+
+        root_doc = raw_by_id.get(root_id)
+        root_statuses = root_doc.get("case_statuses") if (isinstance(root_doc, dict) and isinstance(root_doc.get("case_statuses"), list)) else []
+        orig_selected = (
+            int(root_doc["selected_cases"])
+            if isinstance(root_doc, dict) and isinstance(root_doc.get("selected_cases"), int) and not isinstance(root_doc.get("selected_cases"), bool)
+            else len(root_statuses)
+        )
+        lineage_docs = [(rid, raw_by_id[rid]) for rid in lineage_ids]
+        return {
+            "root_run_id": root_id,
+            "root_doc": root_doc,
+            "parent_run_id": parent_id,
+            "child_run_ids": child_ids,
+            "lineage_run_ids": lineage_ids,
+            "lineage_docs": lineage_docs,
+            "active_lineage_run_id": active_lineage_run_id,
+            "lineage_completed_by_case_id": lineage_completed_by_case_id,
+            "lineage_verdict_counts": dict(sorted(verdict_counter.items())),
+            "original_selected_cases": orig_selected,
+        }
+
+    @staticmethod
+    def _validate_run_checkpoint(doc: dict[str, Any]) -> dict[str, Any]:
+        """Validate a single persisted generic-run.json checkpoint fail-closed."""
+        valid_statuses = {"queued", "running", "completed", "error", "unsupported", "blocked"}
+        valid_verdicts = {"PASS", "FAIL", "INCONCLUSIVE", "ERROR"}
+
+        if not isinstance(doc, dict):
+            return {"valid": False}
+
+        raw_statuses = doc.get("case_statuses")
+        expected_selected = doc.get("selected_cases")
+        if (
+            not isinstance(raw_statuses, list)
+            or not raw_statuses
+            or not isinstance(expected_selected, int)
+            or isinstance(expected_selected, bool)
+            or expected_selected <= 0
+        ):
+            return {"valid": False}
+
+        unique_ids: list[str] = []
+        status_by_id: dict[str, dict[str, Any]] = {}
+        for row in raw_statuses:
+            if not isinstance(row, dict):
+                return {"valid": False}
+            cid = row.get("case_id")
+            st = row.get("status")
+            stage = row.get("stage")
+            if (
+                not isinstance(cid, str)
+                or not cid
+                or cid.strip() != cid
+                or cid in status_by_id
+                or not isinstance(st, str)
+                or st not in valid_statuses
+            ):
+                return {"valid": False}
+            if stage is not None and not isinstance(stage, str):
+                return {"valid": False}
+            unique_ids.append(cid)
+            status_by_id[cid] = row
+
+        if len(unique_ids) != expected_selected:
+            return {"valid": False}
+
+        raw_cases = doc.get("cases")
+        if not isinstance(raw_cases, list):
+            return {"valid": False}
+        completed_in_doc: dict[str, dict[str, Any]] = {}
+        for c in raw_cases:
+            if not isinstance(c, dict):
+                return {"valid": False}
+            cid = c.get("case_id")
+            verdict = c.get("verdict")
+            if (
+                not isinstance(cid, str)
+                or not cid
+                or cid.strip() != cid
+                or cid in completed_in_doc
+                or cid not in status_by_id
+                or not isinstance(verdict, str)
+                or verdict not in valid_verdicts
+            ):
+                return {"valid": False}
+            completed_in_doc[cid] = c
+
+        executed_cases = doc.get("executed_cases")
+        if executed_cases is not None:
+            if (
+                not isinstance(executed_cases, int)
+                or isinstance(executed_cases, bool)
+                or executed_cases != len(raw_cases)
+            ):
+                return {"valid": False}
+
+        skipped_ids: set[str] = set()
+        raw_skipped = doc.get("skipped_cases")
+        if raw_skipped is not None:
+            if not isinstance(raw_skipped, list):
+                return {"valid": False}
+            for s in raw_skipped:
+                if not isinstance(s, dict):
+                    return {"valid": False}
+                scid = s.get("case_id")
+                if not isinstance(scid, str) or not scid or scid not in status_by_id:
+                    return {"valid": False}
+                skipped_ids.add(scid)
+
+        dispatched_ids: set[str] = set()
+        for cid, row in status_by_id.items():
+            st = str(row["status"])
+            stage = str(row.get("stage") or "")
+            if st in {"unsupported", "blocked"} or stage == "skipped":
+                skipped_ids.add(cid)
+            elif st == "running":
+                dispatched_ids.add(cid)
+            elif st in {"completed", "error"} and cid not in completed_in_doc:
+                # Status claims terminal completion without a persisted result -> uncertain, never pending.
+                dispatched_ids.add(cid)
+            elif st == "queued" and stage not in {"", "queued"}:
+                dispatched_ids.add(cid)
+
+        curr_cid = doc.get("current_case_id")
+        if curr_cid is not None:
+            if not isinstance(curr_cid, str) or not curr_cid or curr_cid not in status_by_id:
+                return {"valid": False}
+            curr_stage = str(doc.get("current_stage") or "")
+            if curr_stage not in {"", "queued"}:
+                dispatched_ids.add(curr_cid)
+
+        raw_events = doc.get("events")
+        if raw_events is not None:
+            if not isinstance(raw_events, list):
+                return {"valid": False}
+            for ev in raw_events:
+                if not isinstance(ev, dict):
+                    return {"valid": False}
+                ev_cid = ev.get("case_id")
+                ev_stage = str(ev.get("stage") or "")
+                if isinstance(ev_cid, str) and ev_cid:
+                    if ev_cid not in status_by_id:
+                        return {"valid": False}
+                    if ev_stage not in {"", "queued", "skipped"}:
+                        dispatched_ids.add(ev_cid)
+
+        return {
+            "valid": True,
+            "unique_ids": unique_ids,
+            "status_by_id": status_by_id,
+            "skipped_ids": skipped_ids,
+            "dispatched_ids": dispatched_ids,
+            "completed_in_doc": completed_in_doc,
+        }
+
+    @classmethod
+    def _classify_resume_cases(
+        cls,
+        parent_raw: dict[str, Any],
+        lineage_info: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Authoritatively classify cases across the entire root lineage in original root order."""
+        root_doc = lineage_info.get("root_doc")
+        lineage_docs: list[tuple[str, dict[str, Any]]] = list(lineage_info.get("lineage_docs") or [])
+        if not isinstance(root_doc, dict):
+            return {
+                "completed_case_ids": [],
+                "completed_cases_summary": [],
+                "pending_case_ids": [],
+                "uncertain_case_ids": [],
+                "skipped_case_ids": [],
+                "root_selected_ids": [],
+                "state_incomplete": True,
+            }
+
+        root_chk = cls._validate_run_checkpoint(root_doc)
+        if not root_chk["valid"]:
+            return {
+                "completed_case_ids": [],
+                "completed_cases_summary": [],
+                "pending_case_ids": [],
+                "uncertain_case_ids": [],
+                "skipped_case_ids": [],
+                "root_selected_ids": [],
+                "state_incomplete": True,
+            }
+
+        root_selected_ids: list[str] = list(root_chk["unique_ids"])
+        root_selected_set: set[str] = set(root_selected_ids)
+        root_skipped_ids: set[str] = set(root_chk["skipped_ids"])
+
+        # Validate every lineage member checkpoint and aggregate completed & dispatched/uncertain states across the lineage.
+        state_incomplete = False
+        completed_map: dict[str, dict[str, Any]] = {}
+        lineage_dispatched_ids: set[str] = set()
+
+        parent_rid = str(parent_raw.get("generic_run_id") or "")
+        docs_to_check = list(lineage_docs)
+        if parent_rid and all(rid != parent_rid for rid, _ in docs_to_check):
+            docs_to_check.append((parent_rid, parent_raw))
+
+        for rid, doc in docs_to_check:
+            chk = root_chk if doc is root_doc else cls._validate_run_checkpoint(doc)
+            if not chk["valid"]:
+                state_incomplete = True
+                continue
+            # Every continuation member's cases must remain strictly inside the root run's original scope.
+            if not set(chk["unique_ids"]).issubset(root_selected_set):
+                state_incomplete = True
+                continue
+            lineage_dispatched_ids.update(chk["dispatched_ids"])
+            for cid, c in chk["completed_in_doc"].items():
+                if cid not in completed_map:
+                    completed_map[cid] = {
+                        "case_id": cid,
+                        "verdict": c["verdict"],
+                        "run_id": c.get("run_id"),
+                        "generic_run_id": rid,
+                        "report_path": c.get("report_path"),
+                        "category": c.get("category"),
+                    }
+
+        if state_incomplete:
+            return {
+                "completed_case_ids": [cid for cid in root_selected_ids if cid in completed_map],
+                "completed_cases_summary": [completed_map[cid] for cid in root_selected_ids if cid in completed_map],
+                "pending_case_ids": [],
+                "uncertain_case_ids": [],
+                "skipped_case_ids": [],
+                "root_selected_ids": root_selected_ids,
+                "state_incomplete": True,
+            }
+
+        completed_case_ids: list[str] = []
+        completed_cases_summary: list[dict[str, Any]] = []
+        pending_case_ids: list[str] = []
+        uncertain_case_ids: list[str] = []
+        skipped_case_ids: list[str] = []
+
+        # Preserve exact original root testcase order.
+        # Precedence across lineage: Completed > Uncertain (dispatched in ANY lineage run) > Skipped > Definitely Pending.
+        for cid in root_selected_ids:
+            if cid in completed_map:
+                completed_case_ids.append(cid)
+                completed_cases_summary.append(completed_map[cid])
+            elif cid in lineage_dispatched_ids:
+                uncertain_case_ids.append(cid)
+            elif cid in root_skipped_ids:
+                skipped_case_ids.append(cid)
+            else:
+                pending_case_ids.append(cid)
+
+        return {
+            "completed_case_ids": completed_case_ids,
+            "completed_cases_summary": completed_cases_summary,
+            "pending_case_ids": pending_case_ids,
+            "uncertain_case_ids": uncertain_case_ids,
+            "skipped_case_ids": skipped_case_ids,
+            "root_selected_ids": root_selected_ids,
+            "state_incomplete": False,
+        }
+
+    def preview_resume(
+        self,
+        parent_run_id: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        _ignore_root_lock: bool = False,
+    ) -> dict[str, Any]:
+        """Read-only Resume Preview for an interrupted Generic Scan run (0 Target / 0 Judge requests)."""
+        if not _HEX32_RE.fullmatch(parent_run_id):
+            raise ValueError("generic_run_not_found")
+        parent_record = self.get_run(parent_run_id)
+        parent_raw = self._read_raw_run_disk(parent_run_id)
+        if parent_record is None or parent_raw is None:
+            raise ValueError("generic_run_not_found")
+
+        req = payload if isinstance(payload, dict) else {}
+        lineage_info = self._scan_lineage(parent_run_id, ignore_root_lock=_ignore_root_lock)
+        cls = self._classify_resume_cases(parent_raw, lineage_info)
+
+        raw_inc = req.get("include_uncertain_case_ids")
+        included_uncertain: list[str] = []
+        if raw_inc is not None:
+            if not isinstance(raw_inc, list) or not all(isinstance(x, str) and x.strip() for x in raw_inc):
+                raise ValueError("generic_resume_invalid_uncertain_selection")
+            uncertain_set = set(cls["uncertain_case_ids"])
+            for x in raw_inc:
+                cid = x.strip()
+                if cid not in uncertain_set:
+                    raise ValueError("generic_resume_invalid_uncertain_selection")
+                if cid not in included_uncertain:
+                    included_uncertain.append(cid)
+
+        pending_case_ids: list[str] = list(cls["pending_case_ids"])
+        uncertain_case_ids: list[str] = list(cls["uncertain_case_ids"])
+        selected_set = set(pending_case_ids) | set(included_uncertain)
+        root_selected_ids: list[str] = list(cls.get("root_selected_ids") or [])
+        selected_resume_case_ids: list[str] = (
+            [cid for cid in root_selected_ids if cid in selected_set]
+            if root_selected_ids
+            else (list(pending_case_ids) + [cid for cid in included_uncertain if cid not in pending_case_ids])
+        )
+
+        blockers: list[str] = []
+
+        def _add_blocker(code: str) -> None:
+            if code and code not in blockers:
+                blockers.append(code)
+
+        if parent_record.get("status") != "interrupted":
+            _add_blocker("generic_resume_not_interrupted")
+        if lineage_info["active_lineage_run_id"] is not None:
+            _add_blocker("generic_resume_already_active")
+        if cls["state_incomplete"]:
+            _add_blocker("resume_state_incomplete")
+        if not cls["state_incomplete"] and not pending_case_ids and not uncertain_case_ids:
+            _add_blocker("generic_resume_no_remaining_cases")
+
+        mode = str(parent_raw.get("mode") or "offline")
+        target_id = str(parent_raw.get("target_id") or "")
+        asi_category = str(parent_raw.get("asi_category") or "auto")
+        use_judge = bool(parent_raw.get("use_judge", False))
+        policy_id = parent_raw.get("policy_id")
+        parent_cap_states = (
+            parent_raw.get("capability_states")
+            if isinstance(parent_raw.get("capability_states"), dict)
+            else None
+        )
+        dataset_id = parent_raw.get("dataset_id") if isinstance(parent_raw.get("dataset_id"), str) else None
+        dataset_name = parent_raw.get("dataset_name")
+        parent_dataset_rev = parent_raw.get("dataset_revision_sha256")
+        dataset_consistent = False
+        env = None
+        if not dataset_id or self.dataset_repo is None:
+            _add_blocker("resume_dataset_not_found")
+        else:
+            env = self.dataset_repo.get_dataset(dataset_id)
+            if env is None:
+                _add_blocker("resume_dataset_not_found")
+            else:
+                dataset_name = env.name
+                available_tc_ids = {tc.testcase_id for tc in env.testcases}
+                needed_ids = list(dict.fromkeys(pending_case_ids + uncertain_case_ids))
+                if not isinstance(parent_dataset_rev, str) or not _HEX64_RE.fullmatch(parent_dataset_rev):
+                    _add_blocker("resume_dataset_revision_missing")
+                else:
+                    rev_ok = env.file_sha256 == parent_dataset_rev
+                    ids_ok = all(cid in available_tc_ids for cid in needed_ids)
+                    if not rev_ok or not ids_ok:
+                        _add_blocker("resume_dataset_mismatch")
+                    else:
+                        dataset_consistent = True
+
+        target = None
+        target_name = str(parent_raw.get("target_name") or target_id)
+        target_consistent = False
+        auth_binding: dict[str, Any] = {
+            "target_revision_sha256": None,
+            "auth_source": "none",
+            "session_credential_ref": None,
+            "session_credential_generation": None,
+            "session_auth_type": None,
+            "session_auth_header": None,
+        }
+        credential_availability = "not_required"
+        try:
+            target = self._resolve_target(
+                mode=mode,
+                target_id=target_id,
+                capability_states=parent_cap_states,
+                for_execution=True,
+            )
+            target_name = target.name
+            auth_binding = self._resolve_target_auth_binding(mode=mode, target=target)
+            parent_target_rev = parent_raw.get("target_revision_sha256")
+            if mode == "live":
+                if not isinstance(parent_target_rev, str) or not _HEX64_RE.fullmatch(parent_target_rev):
+                    _add_blocker("resume_target_revision_missing")
+                elif auth_binding["target_revision_sha256"] != parent_target_rev:
+                    _add_blocker("resume_target_configuration_changed")
+                else:
+                    target_consistent = True
+            else:
+                target_consistent = True
+
+            if mode == "live":
+                if auth_binding["auth_source"] == "session_memory":
+                    credential_availability = (
+                        "available" if auth_binding["session_credential_generation"] else "unavailable"
+                    )
+                elif auth_binding["auth_source"] == "env_alias":
+                    credential_availability = (
+                        "available"
+                        if all(bool(os.environ.get(ref)) for ref in (target.credential_refs or []))
+                        else "unavailable"
+                    )
+                else:
+                    credential_availability = "not_required"
+                if credential_availability == "unavailable":
+                    _add_blocker("credential_unavailable")
+        except ValueError as exc:
+            if str(exc) == "generic_target_not_found":
+                _add_blocker("resume_target_not_found")
+            else:
+                _add_blocker("resume_target_configuration_changed")
+
+        config_consistent = dataset_consistent and target_consistent
+
+        # R02: Bind & validate Judge provider/model consistency for Hybrid runs.
+        current_judge_status = self.judge_status()
+        curr_judge_provider = current_judge_status.get("provider") if use_judge else None
+        curr_judge_model = current_judge_status.get("model") if use_judge else None
+        orig_judge_provider: str | None = None
+        orig_judge_model: str | None = None
+        if use_judge:
+            root_doc = lineage_info.get("root_doc") if isinstance(lineage_info.get("root_doc"), dict) else None
+            parent_jm = parent_raw.get("judge_metadata") if isinstance(parent_raw.get("judge_metadata"), dict) else {}
+            root_jm = root_doc.get("judge_metadata") if (isinstance(root_doc, dict) and isinstance(root_doc.get("judge_metadata"), dict)) else {}
+            raw_jp = parent_jm.get("provider") or root_jm.get("provider")
+            raw_jm = parent_jm.get("model") or root_jm.get("model")
+            orig_judge_provider = raw_jp.strip() if isinstance(raw_jp, str) and raw_jp.strip() else None
+            orig_judge_model = raw_jm.strip() if isinstance(raw_jm, str) and raw_jm.strip() else None
+            if not orig_judge_provider or not orig_judge_model:
+                config_consistent = False
+                _add_blocker("resume_judge_configuration_missing")
+            elif current_judge_status.get("judge_ready") and (
+                curr_judge_provider != orig_judge_provider or curr_judge_model != orig_judge_model
+            ):
+                config_consistent = False
+                _add_blocker("resume_judge_configuration_changed")
+
+        preview_meta: dict[str, Any] | None = None
+        target_request_budget = 0
+        judge_request_budget = 0
+        probe_case_ids = selected_resume_case_ids if selected_resume_case_ids else list(uncertain_case_ids)
+        if env is not None and target is not None and dataset_consistent and probe_case_ids:
+            try:
+                raw_cases = self._extract_raw_cases({"dataset_id": dataset_id, "testcase_ids": probe_case_ids})
+                _, preview_meta = self._build_cases(
+                    mode=mode,
+                    target=target,
+                    asi_category=asi_category,
+                    raw_cases=raw_cases,
+                    use_judge=use_judge,
+                    policy_id=policy_id,
+                )
+
+                # R02: Strict Policy consistency (distinguish legitimate None absence vs missing history vs drift).
+                has_hist_policy_rev = "policy_revision_sha256" in parent_raw
+                hist_policy_id = parent_raw.get("policy_id")
+                hist_policy_rev = parent_raw.get("policy_revision_sha256")
+                curr_policy_id = preview_meta.get("policy_id")
+                curr_policy_rev = preview_meta.get("policy_revision_sha256")
+                if hist_policy_id is not None and (
+                    not isinstance(hist_policy_rev, str) or not _HEX64_RE.fullmatch(hist_policy_rev)
+                ):
+                    config_consistent = False
+                    _add_blocker("resume_configuration_incomplete")
+                elif not has_hist_policy_rev:
+                    if curr_policy_rev is not None or curr_policy_id is not None or use_judge:
+                        config_consistent = False
+                        _add_blocker("resume_configuration_incomplete")
+                else:
+                    if hist_policy_rev is not None and (
+                        not isinstance(hist_policy_rev, str) or not _HEX64_RE.fullmatch(hist_policy_rev)
+                    ):
+                        config_consistent = False
+                        _add_blocker("resume_configuration_incomplete")
+                    elif (
+                        (hist_policy_rev is None) != (curr_policy_rev is None)
+                        or hist_policy_rev != curr_policy_rev
+                        or hist_policy_id != curr_policy_id
+                    ):
+                        config_consistent = False
+                        _add_blocker("resume_policy_changed")
+                    elif isinstance(parent_raw.get("reviewed_policies"), list):
+                        hist_by_cat = {
+                            p.get("category"): (p.get("policy_id"), p.get("revision_sha256"))
+                            for p in parent_raw["reviewed_policies"]
+                            if isinstance(p, dict) and p.get("category")
+                        }
+                        curr_by_cat = {
+                            p.get("category"): (p.get("policy_id"), p.get("revision_sha256"))
+                            for p in (preview_meta.get("reviewed_policies") or [])
+                            if isinstance(p, dict) and p.get("category")
+                        }
+                        rem_cats = {
+                            item.get("category")
+                            for item in (preview_meta.get("items") or [])
+                            if isinstance(item, dict) and item.get("category")
+                        }
+                        for cat in rem_cats:
+                            if hist_by_cat.get(cat) != curr_by_cat.get(cat):
+                                config_consistent = False
+                                _add_blocker("resume_policy_changed")
+                                break
+
+                # R02: Strict Application Context consistency (detect absent->configured, configured->absent, revision change, or missing history).
+                has_hist_ctx_rev = "application_context_revision_sha256" in parent_raw
+                hist_ctx_id = parent_raw.get("application_context_id")
+                hist_ctx_rev = parent_raw.get("application_context_revision_sha256")
+                curr_ctx_id = preview_meta.get("application_context_id")
+                curr_ctx_rev = preview_meta.get("application_context_revision_sha256")
+                if hist_ctx_id is not None and (
+                    not isinstance(hist_ctx_rev, str) or not _HEX64_RE.fullmatch(hist_ctx_rev)
+                ):
+                    config_consistent = False
+                    _add_blocker("resume_configuration_incomplete")
+                elif not has_hist_ctx_rev:
+                    if curr_ctx_rev is not None or curr_ctx_id is not None or use_judge:
+                        config_consistent = False
+                        _add_blocker("resume_configuration_incomplete")
+                else:
+                    if hist_ctx_rev is not None and (
+                        not isinstance(hist_ctx_rev, str) or not _HEX64_RE.fullmatch(hist_ctx_rev)
+                    ):
+                        config_consistent = False
+                        _add_blocker("resume_configuration_incomplete")
+                    elif (
+                        (hist_ctx_rev is None) != (curr_ctx_rev is None)
+                        or hist_ctx_rev != curr_ctx_rev
+                        or ("application_context_id" in parent_raw and hist_ctx_id != curr_ctx_id)
+                    ):
+                        config_consistent = False
+                        _add_blocker("resume_application_context_changed")
+
+                if preview_meta.get("blocker"):
+                    _add_blocker(str(preview_meta["blocker"]))
+                if selected_resume_case_ids:
+                    ready_n = int(preview_meta.get("ready_count") or 0)
+                    target_request_budget = ready_n if mode == "live" else 0
+                    judge_request_budget = ready_n if use_judge else 0
+            except ValueError as exc:
+                _add_blocker(str(exc))
+
+        if not selected_resume_case_ids and uncertain_case_ids:
+            _add_blocker("generic_resume_no_cases_selected")
+
+        blocker = blockers[0] if blockers else None
+        eligible = blocker is None and len(selected_resume_case_ids) > 0
+
+        warnings: list[str] = []
+        if mode == "live":
+            warnings.append(
+                "Stateful target notice: previously completed or interrupted testcases may have modified target application state. Restarting containers or services does not automatically restore baseline state."
+            )
+        if uncertain_case_ids:
+            if included_uncertain:
+                warnings.append(
+                    f"Uncertain in-flight testcase(s) opted in ({', '.join(included_uncertain)}): the previous request may already have executed on the target before interruption. Verify remote execution state before confirming."
+                )
+            else:
+                warnings.append(
+                    f"Uncertain in-flight testcase(s) excluded by default ({', '.join(uncertain_case_ids)}): execution started before interruption with no completed result. Opt in explicitly only after checking target state."
+                )
+
+        digest_material = {
+            "parent_run_id": parent_run_id,
+            "root_run_id": lineage_info["root_run_id"],
+            "mode": mode,
+            "target_id": target_id,
+            "target_revision_sha256": auth_binding["target_revision_sha256"],
+            "dataset_id": dataset_id,
+            "dataset_revision_sha256": env.file_sha256 if env is not None else parent_dataset_rev,
+            "asi_category": asi_category,
+            "use_judge": use_judge,
+            "judge_provider": curr_judge_provider if use_judge else None,
+            "judge_model": curr_judge_model if use_judge else None,
+            "policy_id": preview_meta.get("policy_id") if preview_meta else policy_id,
+            "policy_revision_sha256": preview_meta.get("policy_revision_sha256") if preview_meta else parent_raw.get("policy_revision_sha256"),
+            "application_context_id": preview_meta.get("application_context_id") if preview_meta else parent_raw.get("application_context_id"),
+            "application_context_revision_sha256": preview_meta.get("application_context_revision_sha256") if preview_meta else parent_raw.get("application_context_revision_sha256"),
+            "selected_resume_case_ids": selected_resume_case_ids,
+            "included_uncertain_case_ids": included_uncertain,
+            "session_credential_generation": auth_binding["session_credential_generation"],
+        }
+        resume_digest = sha256(json.dumps(digest_material, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+        return {
+            "workflow_schema_version": "1.0.0",
+            "parent_run_id": parent_run_id,
+            "root_run_id": lineage_info["root_run_id"],
+            "parent_status": parent_record.get("status"),
+            "original_selected_cases": lineage_info["original_selected_cases"],
+            "completed_count": len(cls["completed_case_ids"]),
+            "completed_case_ids": cls["completed_case_ids"],
+            "completed_cases_summary": cls["completed_cases_summary"],
+            "pending_case_ids": pending_case_ids,
+            "uncertain_case_ids": uncertain_case_ids,
+            "included_uncertain_case_ids": included_uncertain,
+            "skipped_case_ids": cls["skipped_case_ids"],
+            "selected_resume_case_ids": selected_resume_case_ids,
+            "target_id": target_id,
+            "target_name": target_name,
+            "target_revision_sha256": auth_binding["target_revision_sha256"],
+            "target_ready": target_consistent and credential_availability != "unavailable",
+            "auth_source": auth_binding["auth_source"],
+            "credential_availability": credential_availability,
+            "session_credential_generation": auth_binding["session_credential_generation"],
+            "session_auth_type": auth_binding["session_auth_type"],
+            "session_auth_header": auth_binding["session_auth_header"],
+            "dataset_id": dataset_id,
+            "dataset_name": dataset_name,
+            "dataset_consistent": dataset_consistent,
+            "config_consistent": config_consistent,
+            "mode": mode,
+            "asi_category": asi_category,
+            "use_judge": use_judge,
+            "original_judge_provider": orig_judge_provider,
+            "original_judge_model": orig_judge_model,
+            "current_judge_provider": curr_judge_provider,
+            "current_judge_model": curr_judge_model,
+            "judge_status": current_judge_status,
+            "target_request_budget": target_request_budget,
+            "judge_request_budget": judge_request_budget,
+            "resume_digest": resume_digest,
+            "eligible": eligible,
+            "blocker": blocker,
+            "blockers": blockers,
+            "warnings": warnings,
+        }
+
+    def start_resume(self, parent_run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Start a linked continuation run for an interrupted Generic Scan run."""
+        if not isinstance(payload, dict):
+            raise ValueError("generic_run_rejected")
+        if payload.get("authorization_confirmed") is not True:
+            raise ValueError("generic_authorization_required")
+        if not _HEX32_RE.fullmatch(parent_run_id):
+            raise ValueError("generic_run_not_found")
+        parent_raw = self._read_raw_run_disk(parent_run_id)
+        if parent_raw is None:
+            raise ValueError("generic_run_not_found")
+
+        expected_resume_digest = payload.get("expected_resume_digest")
+        if not isinstance(expected_resume_digest, str) or not _HEX64_RE.fullmatch(expected_resume_digest):
+            raise ValueError("generic_resume_digest_stale")
+
+        raw_inc = payload.get("include_uncertain_case_ids")
+        include_uncertain: list[str] = []
+        if raw_inc is not None:
+            if not isinstance(raw_inc, list) or not all(isinstance(x, str) and x.strip() for x in raw_inc):
+                raise ValueError("generic_resume_invalid_uncertain_selection")
+            include_uncertain = list(dict.fromkeys(x.strip() for x in raw_inc))
+        if include_uncertain and payload.get("uncertain_reexecution_confirmed") is not True:
+            raise ValueError("generic_resume_uncertain_confirmation_required")
+
+        submission_id_raw = payload.get("submission_id")
+        submission_id: str | None = None
+        if submission_id_raw is not None:
+            submission_id = str(submission_id_raw).strip()
+            if not _HEX32_RE.fullmatch(submission_id):
+                raise ValueError("generic_invalid_submission_id")
+            sub_file = self.runs_root / "submissions" / f"{submission_id}.json"
+            with self._lock:
+                has_sub = sub_file.is_file()
+            if has_sub:
+                try:
+                    sub_doc = json.loads(sub_file.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    raise ValueError("generic_submission_record_unavailable") from exc
+                existing_id = str(sub_doc.get("generic_run_id") or "")
+                existing_rec = self.get_run(existing_id) if existing_id else None
+                if existing_rec is None:
+                    raise ValueError("generic_submission_record_unavailable")
+                ex_meta = existing_rec.get("resume_metadata") if isinstance(existing_rec.get("resume_metadata"), dict) else {}
+                if (
+                    existing_rec.get("continuation_of_run_id") != parent_run_id
+                    or ex_meta.get("resume_digest") != expected_resume_digest
+                ):
+                    raise ValueError("generic_submission_conflict")
+                return existing_rec
+
+        lineage_info = self._scan_lineage(parent_run_id)
+        root_run_id = lineage_info["root_run_id"]
+
+        with self._lock:
+            if lineage_info["active_lineage_run_id"] is not None or root_run_id in self._active_resumes_by_root:
+                raise ValueError("generic_resume_already_active")
+            self._active_resumes_by_root[root_run_id] = "reserving"
+
+        lock_transferred = False
+        try:
+            preview = self.preview_resume(
+                parent_run_id,
+                {"include_uncertain_case_ids": include_uncertain},
+                _ignore_root_lock=True,
+            )
+            if preview["mode"] == "live" and payload.get("stateful_target_acknowledged") is not True:
+                raise ValueError("generic_resume_stateful_acknowledgement_required")
+            if preview["blocker"] is not None or not preview["eligible"]:
+                raise ValueError(preview["blocker"] or "generic_resume_not_eligible")
+            if expected_resume_digest != preview["resume_digest"]:
+                raise ValueError("generic_resume_digest_stale")
+
+            expected_target_revision = (
+                payload.get("expected_target_revision")
+                if "expected_target_revision" in payload
+                else preview["target_revision_sha256"]
+            )
+            expected_session_gen = (
+                payload.get("expected_session_credential_generation")
+                if "expected_session_credential_generation" in payload
+                else preview["session_credential_generation"]
+            )
+            start_payload: dict[str, Any] = {
+                "authorization_confirmed": True,
+                "mode": preview["mode"],
+                "target_id": preview["target_id"],
+                "dataset_id": preview["dataset_id"],
+                "testcase_ids": list(preview["selected_resume_case_ids"]),
+                "asi_category": preview["asi_category"],
+                "use_judge": preview["use_judge"],
+                "policy_id": parent_raw.get("policy_id"),
+                "capability_states": parent_raw.get("capability_states"),
+                "async_execution": bool(payload.get("async_execution", False)),
+                "expected_target_revision": expected_target_revision,
+                "expected_session_credential_generation": expected_session_gen,
+                "continuation_of_run_id": parent_run_id,
+                "expected_resume_digest": preview["resume_digest"],
+            }
+            if submission_id is not None:
+                start_payload["submission_id"] = submission_id
+
+            continuation_meta = {
+                "parent_run_id": parent_run_id,
+                "root_run_id": preview["root_run_id"],
+                "original_selected_cases": preview["original_selected_cases"],
+                "preserved_completed_case_ids": list(preview["completed_case_ids"]),
+                "resumed_pending_case_ids": list(preview["pending_case_ids"]),
+                "uncertain_case_ids": list(preview["uncertain_case_ids"]),
+                "included_uncertain_case_ids": list(preview["included_uncertain_case_ids"]),
+                "excluded_uncertain_case_ids": [
+                    cid
+                    for cid in preview["uncertain_case_ids"]
+                    if cid not in preview["included_uncertain_case_ids"]
+                ],
+                "skipped_case_ids": list(preview["skipped_case_ids"]),
+                "selected_resume_case_ids": list(preview["selected_resume_case_ids"]),
+                "resume_digest": preview["resume_digest"],
+                "stateful_target_acknowledged": bool(payload.get("stateful_target_acknowledged")),
+                "uncertain_reexecution_confirmed": bool(payload.get("uncertain_reexecution_confirmed")),
+            }
+            return self.start_run(
+                start_payload,
+                _continuation_meta=continuation_meta,
+                _owns_root_lock=root_run_id,
+            )
+        finally:
+            with self._lock:
+                if self._active_resumes_by_root.get(root_run_id) == "reserving":
+                    self._active_resumes_by_root.pop(root_run_id, None)
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         if not _HEX32_RE.fullmatch(run_id):
@@ -2248,6 +3861,10 @@ class GenericRunService:
                 "evidence_summary": rec.get("evidence_summary") or {},
                 "judge_metadata": rec.get("judge_metadata"),
                 "case_run_ids": [c.get("run_id") for c in cases if isinstance(c, dict) and isinstance(c.get("run_id"), str)],
+                "continuation_of_run_id": rec.get("continuation_of_run_id"),
+                "root_run_id": rec.get("root_run_id"),
+                "child_run_ids": rec.get("child_run_ids") or [],
+                "lineage_summary": rec.get("lineage_summary"),
             })
         summaries.sort(key=lambda r: (str(r.get("started_at") or ""), str(r.get("generic_run_id") or "")), reverse=True)
         return summaries
@@ -2340,8 +3957,12 @@ def register_generic_runner_routes(app, ctx) -> None:
             status_code = 202 if payload.get("async_execution") is True and record.get("status") in {"preparing", "running"} else 201
             return jsonify(record), status_code
         except (ValidationError, ValueError, json.JSONDecodeError) as exc:
-            code = str(exc) if str(exc).startswith(("generic_", "policy_", "judge_", "dataset_", "unmapped_", "application_context_", "unverified_", "unreviewed_", "invalid_evaluation_rule_")) else "generic_run_rejected"
+            code = str(exc) if (str(exc) == "credential_unavailable" or str(exc).startswith(("generic_", "policy_", "judge_", "dataset_", "unmapped_", "application_context_", "unverified_", "unreviewed_", "invalid_evaluation_rule_"))) else "generic_run_rejected"
             status = 409 if code in {
+                "credential_unavailable",
+                "generic_session_credential_stale",
+                "generic_session_credential_authorization_required",
+                "generic_target_revision_stale",
                 "policy_review_required",
                 "policy_category_mismatch",
                 "judge_provider_unavailable",
@@ -2357,6 +3978,94 @@ def register_generic_runner_routes(app, ctx) -> None:
                 "generic_submission_record_unavailable",
             } else 400
             return fail(code, status)
+
+    @app.post("/api/testing/generic-runs/<run_id>/resume/preview")
+    def generic_run_resume_preview(run_id):
+        denied = auth()
+        if denied:
+            return denied
+        try:
+            raw_bytes = request.get_data()
+            payload = read_json(raw_bytes) if raw_bytes else {}
+            return jsonify(service.preview_resume(run_id, payload))
+        except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+            code = str(exc)
+            if code == "generic_run_not_found":
+                return fail(code, 404)
+            if code.startswith(("generic_resume_", "resume_")):
+                return fail(code, 400)
+            return fail("generic_preview_invalid", 400)
+
+    @app.post("/api/testing/generic-runs/<run_id>/resume/start")
+    def generic_run_resume_start(run_id):
+        denied = auth()
+        if denied:
+            return denied
+        try:
+            payload = read_json(request.get_data())
+            record = service.start_resume(run_id, payload)
+            status_code = 202 if payload.get("async_execution") is True and record.get("status") in {"preparing", "running"} else 201
+            return jsonify(record), status_code
+        except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+            code = str(exc)
+            if code == "generic_run_not_found":
+                return fail(code, 404)
+            known = (
+                code == "credential_unavailable"
+                or code.startswith((
+                    "generic_",
+                    "resume_",
+                    "policy_",
+                    "judge_",
+                    "dataset_",
+                    "unmapped_",
+                    "application_context_",
+                    "unverified_",
+                    "unreviewed_",
+                    "invalid_evaluation_rule_",
+                ))
+            )
+            err_code = code if known else "generic_run_rejected"
+            status = 409 if err_code in {
+                "credential_unavailable",
+                "generic_session_credential_stale",
+                "generic_session_credential_authorization_required",
+                "generic_target_revision_stale",
+                "generic_resume_not_interrupted",
+                "generic_resume_already_active",
+                "generic_resume_no_remaining_cases",
+                "generic_resume_no_cases_selected",
+                "generic_resume_uncertain_confirmation_required",
+                "generic_resume_stateful_acknowledgement_required",
+                "generic_resume_digest_stale",
+                "generic_resume_not_eligible",
+                "resume_state_incomplete",
+                "resume_dataset_not_found",
+                "resume_dataset_revision_missing",
+                "resume_dataset_mismatch",
+                "resume_target_not_found",
+                "resume_target_revision_missing",
+                "resume_target_configuration_changed",
+                "resume_judge_configuration_missing",
+                "resume_judge_configuration_changed",
+                "resume_configuration_incomplete",
+                "resume_policy_changed",
+                "resume_application_context_changed",
+                "policy_review_required",
+                "policy_category_mismatch",
+                "judge_provider_unavailable",
+                "unmapped_asi_category",
+                "application_context_stale",
+                "unverified_discovery_metadata_rejected",
+                "unreviewed_inline_rules_rejected",
+                "invalid_evaluation_rule_contract",
+                "generic_no_executable_cases",
+                "generic_submission_conflict",
+                "generic_submission_in_progress",
+                "generic_submission_init_failed",
+                "generic_submission_record_unavailable",
+            } else 400
+            return fail(err_code, status)
 
     @app.get("/api/testing/generic-runs/submission/<submission_id>")
     def generic_run_by_submission(submission_id):
@@ -2393,6 +4102,29 @@ def register_generic_runner_routes(app, ctx) -> None:
             mimetype="application/json",
             headers={
                 "Content-Disposition": f'attachment; filename="secagent-generic-run-{run_id}.json"',
+                "X-SecAgent-Export-Schema": "1.0.0",
+            },
+        )
+
+    @app.get("/api/testing/generic-runs/<run_id>/unified-report.json")
+    def generic_run_unified_export(run_id):
+        if not operator_authorized():
+            return fail("operator_authentication_required", 403)
+        try:
+            report = service.get_unified_report(run_id)
+        except ValueError as exc:
+            if str(exc) == "unified_report_integrity_failed":
+                return fail("unified_report_integrity_failed", 409)
+            return fail("generic_run_rejected", 400)
+        if report is None:
+            return fail("generic_run_not_found", 404)
+        logical_id = str(report.get("logical_scan_id") or run_id)
+        raw = (json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+        return Response(
+            raw,
+            mimetype="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="secagent-unified-scan-{logical_id}.json"',
                 "X-SecAgent-Export-Schema": "1.0.0",
             },
         )

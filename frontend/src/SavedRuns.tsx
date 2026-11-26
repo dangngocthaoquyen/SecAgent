@@ -15,6 +15,7 @@ import {
   safePercent,
   verdictBadgeClass,
 } from './scanFormatters';
+import { groupLogicalScans, resolveRootRunId, type LogicalScanGroup } from './scanLineage';
 import {
   getEphemeralOperatorSecret,
   setEphemeralOperatorSecret,
@@ -115,21 +116,24 @@ export default function SavedRuns({
     return () => controller.abort();
   }, [filters, page, retry]);
 
+  const logicalScans = useMemo(() => groupLogicalScans(genericRuns), [genericRuns]);
+
   const caseRunToGenericRunMap = useMemo(() => {
-    const map = new Map<string, GenericRunSummary>();
+    const map = new Map<string, string>();
     for (const gr of genericRuns) {
+      const logicalId = resolveRootRunId(gr);
       for (const cid of gr.case_run_ids ?? []) {
-        if (cid) map.set(cid, gr);
+        if (cid) map.set(cid, logicalId);
       }
     }
     return map;
   }, [genericRuns]);
 
-  const filteredGenericRuns = useMemo(() => {
-    return genericRuns.filter(gr => {
-      if (filters.target_id && gr.target_id !== filters.target_id) return false;
+  const filteredLogicalScans = useMemo(() => {
+    return logicalScans.filter(lg => {
+      if (filters.target_id && lg.target_id !== filters.target_id) return false;
       if (filters.asi_category) {
-        const asiSummary = deriveRunAsiSummary(gr);
+        const asiSummary = deriveRunAsiSummary(lg);
         if (filters.asi_category === 'unknown') {
           if (!asiSummary.hasUnknown && asiSummary.codes.length > 0) return false;
         } else if (!asiSummary.codes.includes(filters.asi_category)) {
@@ -137,17 +141,17 @@ export default function SavedRuns({
         }
       }
       if (filters.testcase_id) {
-        if (!Array.isArray(gr.testcase_ids) || !gr.testcase_ids.includes(filters.testcase_id)) {
+        if (!Array.isArray(lg.testcase_ids) || !lg.testcase_ids.includes(filters.testcase_id)) {
           return false;
         }
       }
-      if (filters.verdict && !(Number(gr.verdict_counts?.[filters.verdict] ?? 0) > 0)) return false;
-      const runDate = (gr.started_at || gr.completed_at || '').slice(0, 10);
+      if (filters.verdict && !(Number(lg.verdict_counts?.[filters.verdict] ?? 0) > 0)) return false;
+      const runDate = (lg.started_at || lg.completed_at || '').slice(0, 10);
       if (filters.date_from && (!runDate || runDate < filters.date_from)) return false;
       if (filters.date_to && (!runDate || runDate > filters.date_to)) return false;
       return true;
     });
-  }, [genericRuns, filters]);
+  }, [logicalScans, filters]);
 
   async function toggleExpandRun(runId: string) {
     const reqSeq = ++detailRequestSeqRef.current;
@@ -199,9 +203,17 @@ export default function SavedRuns({
     return data.items;
   }, [data, nativeScope, caseRunToGenericRunMap]);
 
-  const liveRunsCount = genericRuns.filter(r => r.mode === 'live').length;
+  const liveRunsCount = logicalScans.filter(r => r.mode === 'live').length;
   const activeExpandedDetail =
-    expandedRunDetail && expandedRunDetail.generic_run_id === expandedRunId ? expandedRunDetail : null;
+    expandedRunDetail &&
+    (expandedRunDetail.generic_run_id === expandedRunId ||
+      expandedRunDetail.unified_lineage?.root_run_id === expandedRunId)
+      ? expandedRunDetail
+      : null;
+  const expandedGroup: LogicalScanGroup | null =
+    expandedRunId ? (logicalScans.find(lg => lg.logicalScanId === expandedRunId) ?? null) : null;
+  const activeExpandedCases = activeExpandedDetail?.unified_lineage?.cases ?? activeExpandedDetail?.cases ?? [];
+  const activeExpandedSessions = activeExpandedDetail?.unified_lineage?.sessions ?? [];
 
   const activeTab: HistoryTab =
     selectedTab ??
@@ -233,14 +245,16 @@ export default function SavedRuns({
         <article className="metric">
           <div className="k">Scan Runs</div>
           <div className="v">
-            {genericAuthRequired ? 'Locked' : genericError ? 'Unavailable' : filteredGenericRuns.length}
+            {genericAuthRequired ? 'Locked' : genericError ? 'Unavailable' : filteredLogicalScans.length}
           </div>
           <div className="s">
             {genericAuthRequired
               ? 'Unlock operator secret to list scan runs'
               : genericError
                 ? 'Workflow API unavailable'
-                : `${genericRuns.length} total recorded on disk`}
+                : genericRuns.length > logicalScans.length
+                  ? `${logicalScans.length} logical scan(s) · ${genericRuns.length} sessions on disk`
+                  : `${logicalScans.length} total recorded on disk`}
           </div>
         </article>
         <article className="metric">
@@ -262,7 +276,7 @@ export default function SavedRuns({
               ? 'Unlock required'
               : genericError || !genericLoaded
                 ? 'Mode counts not loaded'
-                : `${genericRuns.length - liveRunsCount} offline stored-response runs`}
+                : `${logicalScans.length - liveRunsCount} offline stored-response runs`}
           </div>
         </article>
       </div>
@@ -390,7 +404,7 @@ export default function SavedRuns({
           className={`tab${activeTab === 'runs' ? ' active' : ''}`}
           onClick={() => setSelectedTab('runs')}
         >
-          Scan Runs ({filteredGenericRuns.length})
+          Scan Runs ({filteredLogicalScans.length})
         </button>
         <button
           type="button"
@@ -417,14 +431,14 @@ export default function SavedRuns({
       {/* TAB 1: GROUPED SCAN RUNS */}
       {activeTab === 'runs' && (
         <div className="history-tab-pane" aria-label="Grouped Generic Scan Runs" role="tabpanel">
-          {filteredGenericRuns.length > 0 ? (
+          {filteredLogicalScans.length > 0 ? (
             <>
               <div className="section-title">
                 <div>
                   <span className="eyebrow">VIEW A · SCAN RUNS</span>
-                  <h3>Grouped Scan Runs ({filteredGenericRuns.length})</h3>
+                  <h3>Grouped Scan Runs ({filteredLogicalScans.length})</h3>
                   <p>
-                    Each row represents one Scan execution. Expand a run to preview individual testcases or open its full Scan Results page.
+                    Each row represents one logical scan (grouping resumed continuation sessions under the original scan). Expand a scan to inspect deduplicated testcases or execution session history.
                   </p>
                 </div>
               </div>
@@ -433,7 +447,7 @@ export default function SavedRuns({
                 <table className="history-table">
                   <thead>
                     <tr>
-                      <th>Date / Run ID</th>
+                      <th>Date / Scan ID</th>
                       <th>Target / Dataset</th>
                       <th>ASI / Mode</th>
                       <th>Cases</th>
@@ -443,25 +457,37 @@ export default function SavedRuns({
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredGenericRuns.map(gr => {
-                      const vc = computeVerdictCounts(gr);
+                    {filteredLogicalScans.map(lg => {
+                      const vc = computeVerdictCounts({ verdict_counts: lg.verdict_counts } as GenericRunSummary);
                       const barTotal = Math.max(1, vc.PASS + vc.FAIL + vc.INCONCLUSIVE + vc.ERROR);
-                      const isExpanded = expandedRunId === gr.generic_run_id;
-                      const asiSummary = deriveRunAsiSummary(gr);
+                      const isExpanded = expandedRunId === lg.logicalScanId;
+                      const asiSummary = deriveRunAsiSummary(lg);
+                      const canExportUnified = lg.has_continuations && lg.integrity_status !== 'invalid_checkpoint';
+                      const exportHref = canExportUnified
+                        ? testingApi.genericRunUnifiedExportUrl(lg.rootRunId)
+                        : testingApi.genericRunExportUrl(lg.rootRunId);
+                      const exportFilename = canExportUnified
+                        ? `secagent-unified-scan-${lg.rootRunId}.json`
+                        : `secagent-generic-run-${lg.rootRunId}.json`;
                       return (
-                        <tr key={gr.generic_run_id} className={isExpanded ? 'selected-row' : undefined}>
+                        <tr key={lg.logicalScanId} className={isExpanded ? 'selected-row' : undefined}>
                           <td>
                             <div className="cell-stack">
-                              <span>{safeLabel(formatDateTime(gr.started_at || gr.completed_at))}</span>
-                              <code className="mono sublabel">{gr.generic_run_id.slice(0, 12)}</code>
+                              <span>{safeLabel(formatDateTime(lg.started_at || lg.completed_at))}</span>
+                              <code className="mono sublabel">{lg.rootRunId.slice(0, 12)}</code>
+                              {lg.resume_count > 0 && (
+                                <span className="sublabel">
+                                  {lg.resume_count} resume{lg.resume_count > 1 ? 's' : ''} · {lg.session_count} sessions
+                                </span>
+                              )}
                             </div>
                           </td>
                           <td>
                             <div className="cell-stack">
-                              <strong>{safeLabel(gr.target_name || gr.target_id)}</strong>
+                              <strong>{safeLabel(lg.target_name || lg.target_id)}</strong>
                               <span className="sublabel">
-                                {safeLabel(gr.dataset_name || gr.dataset_id || 'Direct cases')} ·{' '}
-                                <code className="mono">{safeLabel(gr.target_id)}</code>
+                                {safeLabel(lg.dataset_name || lg.dataset_id || 'Direct cases')} ·{' '}
+                                <code className="mono">{safeLabel(lg.target_id)}</code>
                               </span>
                             </div>
                           </td>
@@ -469,14 +495,15 @@ export default function SavedRuns({
                             <div className="cell-stack">
                               <span className="pill">{safeLabel(asiSummary.label)}</span>
                               <span className="sublabel">
-                                {gr.mode.toUpperCase()} · {gr.use_judge ? 'Hybrid' : 'Rule'}
+                                {lg.mode.toUpperCase()} · {lg.use_judge ? 'Hybrid' : 'Rule'}
                               </span>
                             </div>
                           </td>
                           <td>
-                            <strong>{gr.executed_cases}</strong>
-                            {gr.skipped_count > 0 && (
-                              <span className="sublabel"> (+{gr.skipped_count} skipped)</span>
+                            <strong>{lg.executed_cases}</strong>
+                            <span className="sublabel"> / {lg.selected_cases}</span>
+                            {lg.skipped_count > 0 && (
+                              <span className="sublabel"> (+{lg.skipped_count} skipped)</span>
                             )}
                           </td>
                           <td>
@@ -496,8 +523,8 @@ export default function SavedRuns({
                             </div>
                           </td>
                           <td>
-                            <span className={runStatusBadgeClass(gr.status)}>
-                              {formatRunStatus(gr.status)}
+                            <span className={runStatusBadgeClass(lg.logical_status)}>
+                              {formatRunStatus(lg.logical_status)}
                             </span>
                           </td>
                           <td>
@@ -505,29 +532,30 @@ export default function SavedRuns({
                               <button
                                 type="button"
                                 className="btn ghost sm"
-                                onClick={() => void toggleExpandRun(gr.generic_run_id)}
+                                onClick={() => void toggleExpandRun(lg.rootRunId)}
                               >
                                 {isExpanded ? 'Hide Cases' : 'View Cases'}
                               </button>
-                              <a className="btn ghost sm" href={`#scan/${gr.generic_run_id}`}>
+                              <a className="btn ghost sm" href={`#scan/${lg.rootRunId}`}>
                                 Open Run Results →
                               </a>
                               <a
                                 className="btn ghost sm"
-                                href={testingApi.genericRunExportUrl(gr.generic_run_id)}
-                                download={`secagent-generic-run-${gr.generic_run_id}.json`}
+                                href={exportHref}
+                                download={exportFilename}
                                 onClick={e => {
                                   if (operatorSecret) {
                                     e.preventDefault();
-                                    void testingApi
-                                      .downloadGenericRunReport(gr.generic_run_id, operatorSecret)
-                                      .catch(err => {
-                                        setError(err instanceof Error ? err.message : 'Failed to export summary JSON.');
-                                      });
+                                    const dl = canExportUnified
+                                      ? testingApi.downloadGenericRunUnifiedReport(lg.rootRunId, operatorSecret)
+                                      : testingApi.downloadGenericRunReport(lg.rootRunId, operatorSecret);
+                                    void dl.catch(err => {
+                                      setError(err instanceof Error ? err.message : 'Failed to export summary JSON.');
+                                    });
                                   }
                                 }}
                               >
-                                Export Summary JSON
+                                {canExportUnified ? 'Export Unified Report JSON' : 'Export Summary JSON'}
                               </a>
                             </div>
                           </td>
@@ -542,10 +570,18 @@ export default function SavedRuns({
                 <div className="card expanded-run-panel" aria-label={`Cases in Run ${expandedRunId}`}>
                   <div className="section-title">
                     <div>
-                      <span className="eyebrow">VIEW B · CASES IN RUN</span>
+                      <span className="eyebrow">VIEW B · CASES IN SCAN</span>
                       <h4>
-                        Run <code>{expandedRunId}</code> Case Breakdown (
-                        {activeExpandedDetail?.cases.length ?? 0} executed cases)
+                        {expandedGroup && expandedGroup.session_count > 1 ? (
+                          <>
+                            Scan <code>{expandedRunId}</code> Case Breakdown ({activeExpandedCases.length} recorded
+                            outcomes across {expandedGroup.session_count} execution sessions)
+                          </>
+                        ) : (
+                          <>
+                            Run <code>{expandedRunId}</code> Case Breakdown ({activeExpandedCases.length} executed cases)
+                          </>
+                        )}
                       </h4>
                     </div>
                     <a className="btn primary sm" href={`#scan/${expandedRunId}`}>
@@ -566,57 +602,144 @@ export default function SavedRuns({
                   )}
 
                   {activeExpandedDetail && (
-                    <div className="tablewrap">
-                      <table className="case-table">
-                        <thead>
-                          <tr>
-                            <th>Case ID</th>
-                            <th>ASI Category</th>
-                            <th>Verdict</th>
-                            <th>Judge Classification</th>
-                            <th>Evidence Level</th>
-                            <th>Case Detail</th>
-                            <th>Export Case Report</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {activeExpandedDetail.cases.map(c => {
-                            const fault = classifyJudgeFault(c, {
-                              useJudge: activeExpandedDetail.use_judge,
-                              judgeMode: activeExpandedDetail.judge_metadata?.mode ?? null,
-                            });
-                            return (
-                              <tr key={c.case_id}>
-                                <th scope="row">
-                                  <code className="mono">{safeLabel(c.case_id)}</code>
-                                </th>
-                                <td>
-                                  <span className="pill">{safeLabel(formatCaseAsiCategory(c.category))}</span>
-                                </td>
-                                <td>
-                                  <span className={verdictBadgeClass(c.verdict)}>{normalizeVerdict(c.verdict)}</span>
-                                </td>
-                                <td>
-                                  <div className="cell-stack">
-                                    <strong>{fault.primary}</strong>
-                                    {fault.secondary && <span className="sublabel mono">{fault.secondary}</span>}
-                                  </div>
-                                </td>
-                                <td>
-                                  <span className="pill">{formatEvidenceLevel(c.evidence_level)}</span>
-                                </td>
-                                <td>
-                                  <a href={`#run/${c.run_id}`}>Inspect Case Detail</a>
-                                </td>
-                                <td>
-                                  <DownloadReport kind="runs" id={c.run_id} />
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
+                    <>
+                      {(activeExpandedSessions.length > 1 || (expandedGroup && expandedGroup.sessions.length > 1)) && (
+                        <details style={{ marginBottom: '0.85rem' }}>
+                          <summary style={{ cursor: 'pointer', fontWeight: 600 }}>
+                            Execution History ({activeExpandedSessions.length || expandedGroup?.sessions.length || 0} sessions)
+                          </summary>
+                          <div className="tablewrap" style={{ marginTop: '0.5rem' }}>
+                            <table className="case-table">
+                              <thead>
+                                <tr>
+                                  <th>Session</th>
+                                  <th>Session Run ID</th>
+                                  <th>Started</th>
+                                  <th>Recorded</th>
+                                  <th>Verdicts</th>
+                                  <th>Status</th>
+                                  <th>Actions</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {(activeExpandedSessions.length > 0
+                                  ? activeExpandedSessions
+                                  : (expandedGroup?.sessions ?? []).map((s, idx) => ({
+                                      session_index: idx + 1,
+                                      generic_run_id: s.generic_run_id,
+                                      status: s.status,
+                                      started_at: s.started_at,
+                                      executed_cases: s.executed_cases,
+                                      verdict_counts: s.verdict_counts,
+                                    }))
+                                ).map(sess => {
+                                  const svc = computeVerdictCounts({ verdict_counts: sess.verdict_counts } as GenericRunSummary);
+                                  return (
+                                    <tr key={sess.generic_run_id}>
+                                      <td>
+                                        <strong>
+                                          {sess.session_index === 1 ? 'Original' : `Resume #${sess.session_index - 1}`}
+                                        </strong>
+                                      </td>
+                                      <td>
+                                        <code className="mono">{sess.generic_run_id.slice(0, 12)}</code>
+                                      </td>
+                                      <td>{safeLabel(formatDateTime(sess.started_at))}</td>
+                                      <td>{sess.executed_cases}</td>
+                                      <td>
+                                        {svc.PASS}P · {svc.FAIL}F · {svc.INCONCLUSIVE}I
+                                        {svc.ERROR > 0 ? ` · ${svc.ERROR}E` : ''}
+                                      </td>
+                                      <td>
+                                        <span className={runStatusBadgeClass(sess.status)}>
+                                          {formatRunStatus(sess.status)}
+                                        </span>
+                                      </td>
+                                      <td>
+                                        <div className="history-actions">
+                                          <a className="btn ghost sm" href={`#scan/${sess.generic_run_id}`}>
+                                            Open Session
+                                          </a>
+                                          <a
+                                            className="btn ghost sm"
+                                            href={testingApi.genericRunExportUrl(sess.generic_run_id)}
+                                            download={`secagent-generic-run-${sess.generic_run_id}.json`}
+                                            onClick={e => {
+                                              if (operatorSecret) {
+                                                e.preventDefault();
+                                                void testingApi
+                                                  .downloadGenericRunReport(sess.generic_run_id, operatorSecret)
+                                                  .catch(err => {
+                                                    setError(err instanceof Error ? err.message : 'Failed to export session JSON.');
+                                                  });
+                                              }
+                                            }}
+                                          >
+                                            Export Session JSON
+                                          </a>
+                                        </div>
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        </details>
+                      )}
+
+                      <div className="tablewrap">
+                        <table className="case-table">
+                          <thead>
+                            <tr>
+                              <th>Case ID</th>
+                              <th>ASI Category</th>
+                              <th>Verdict</th>
+                              <th>Judge Classification</th>
+                              <th>Evidence Level</th>
+                              <th>Case Detail</th>
+                              <th>Export Case Report</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {activeExpandedCases.map(c => {
+                              const fault = classifyJudgeFault(c, {
+                                useJudge: activeExpandedDetail.use_judge,
+                                judgeMode: activeExpandedDetail.judge_metadata?.mode ?? null,
+                              });
+                              return (
+                                <tr key={c.case_id}>
+                                  <th scope="row">
+                                    <code className="mono">{safeLabel(c.case_id)}</code>
+                                  </th>
+                                  <td>
+                                    <span className="pill">{safeLabel(formatCaseAsiCategory(c.category))}</span>
+                                  </td>
+                                  <td>
+                                    <span className={verdictBadgeClass(c.verdict)}>{normalizeVerdict(c.verdict)}</span>
+                                  </td>
+                                  <td>
+                                    <div className="cell-stack">
+                                      <strong>{fault.primary}</strong>
+                                      {fault.secondary && <span className="sublabel mono">{fault.secondary}</span>}
+                                    </div>
+                                  </td>
+                                  <td>
+                                    <span className="pill">{formatEvidenceLevel(c.evidence_level)}</span>
+                                  </td>
+                                  <td>
+                                    <a href={`#run/${c.run_id}`}>Inspect Case Detail</a>
+                                  </td>
+                                  <td>
+                                    <DownloadReport kind="runs" id={c.run_id} />
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
                   )}
                 </div>
               )}
@@ -684,7 +807,7 @@ export default function SavedRuns({
                   </thead>
                   <tbody>
                     {displayedItems.map(row => {
-                      const parentRun = caseRunToGenericRunMap.get(row.run_id);
+                      const parentLogicalId = caseRunToGenericRunMap.get(row.run_id);
                       return (
                         <tr key={`${row.kind}-${row.run_id}`}>
                           <td>{safeLabel(row.started_at)}</td>
@@ -703,9 +826,9 @@ export default function SavedRuns({
                             <Badge value={row.verdict} />
                           </td>
                           <td>
-                            {parentRun ? (
-                              <a href={`#scan/${parentRun.generic_run_id}`}>
-                                Scan Run <code>{parentRun.generic_run_id.slice(0, 8)}</code>
+                            {parentLogicalId ? (
+                              <a href={`#scan/${parentLogicalId}`}>
+                                Scan Run <code>{parentLogicalId.slice(0, 8)}</code>
                               </a>
                             ) : (
                               <span>

@@ -19,26 +19,44 @@ ENV_CREDENTIAL_PATTERN = re.compile(
 HEADER_CREDENTIAL_PATTERN = re.compile(
     r"^(?:(Bearer )?\{\{credential:([A-Za-z_][A-Za-z0-9_]*)\}\})$"
 )
+SESSION_HEADER_CREDENTIAL_PATTERN = re.compile(
+    r"^(?:(Bearer )?\{\{session_credential:(sess_[a-f0-9]{24})\}\})$"
+)
 
 
-def parse_header_credential_placeholder(value: str) -> tuple[str, str] | None:
-    """Parse strictly allowed header credential templates:
+def parse_header_credential_reference(value: str) -> tuple[str, str, str] | None:
+    """Parse strictly allowed header credential templates with explicit source:
 
-    - ``{{credential:ENV_NAME}}`` -> ``("", "ENV_NAME")``
-    - ``Bearer {{credential:ENV_NAME}}`` -> ``("Bearer ", "ENV_NAME")``
+    - ``{{credential:ENV_NAME}}`` -> ``("env", "", "ENV_NAME")``
+    - ``Bearer {{credential:ENV_NAME}}`` -> ``("env", "Bearer ", "ENV_NAME")``
+    - ``{{session_credential:sess_<hex>}}`` -> ``("session", "", "sess_<hex>")``
+    - ``Bearer {{session_credential:sess_<hex>}}`` -> ``("session", "Bearer ", "sess_<hex>")``
 
     Any other string containing ``{{`` or ``}}`` is rejected fail-closed so
     arbitrary template interpolation in headers is never permitted.
     """
     match = HEADER_CREDENTIAL_PATTERN.fullmatch(value)
     if match is not None:
-        return (match.group(1) or "", match.group(2))
+        return ("env", match.group(1) or "", match.group(2))
+    session_match = SESSION_HEADER_CREDENTIAL_PATTERN.fullmatch(value)
+    if session_match is not None:
+        return ("session", session_match.group(1) or "", session_match.group(2))
     if "{{" in value or "}}" in value:
         raise ValueError(
             "HTTP header contains an unsupported credential placeholder format. "
-            "Only '{{credential:ENV_NAME}}' or 'Bearer {{credential:ENV_NAME}}' is allowed."
+            "Only '{{credential:ENV_NAME}}', 'Bearer {{credential:ENV_NAME}}', "
+            "'{{session_credential:REF}}', or 'Bearer {{session_credential:REF}}' is allowed."
         )
     return None
+
+
+def parse_header_credential_placeholder(value: str) -> tuple[str, str] | None:
+    """Backward-compatible wrapper returning ``(prefix, credential_ref)`` or ``None``."""
+    parsed = parse_header_credential_reference(value)
+    if parsed is None:
+        return None
+    _, prefix, credential_ref = parsed
+    return (prefix, credential_ref)
 
 
 class TargetValidationError(Exception):

@@ -20,18 +20,36 @@ from workflow.management import (
     ReviewProfile,
     SaveProfile,
 )
-from workflow.models import ClosedModel, ConnectionCheckRequest, TargetDraft
+from workflow.models import ClosedModel, ConnectionCheckRequest, Identifier, SessionCredentialRef, TargetDraft
+from workflow.session_credentials import SessionCredentialError, canonical_bound_origin
 
 
 class LocalProbeRequest(ConnectionCheckRequest):
-    endpoint: str | None = None
-    authorization_confirmed: bool = False
+    pass
 
 
 class DiscoveryProbeRequest(ClosedModel):
     discovery_id: str = Field(pattern=r"^[a-f0-9]{32}$")
     profile: ManagedProfile
     authorization_confirmed: Literal[True]
+    sample_input: str | None = Field(default=None, min_length=1, max_length=512)
+
+
+class SetSessionCredentialRequest(ClosedModel):
+    scope_kind: Literal["target", "discovery", "draft"]
+    scope_id: Identifier
+    endpoint: str = Field(min_length=1, max_length=256)
+    auth_type: Literal["bearer", "api_key"]
+    header_name: str | None = Field(default=None, min_length=1, max_length=64)
+    secret_value: str = Field(min_length=1, max_length=4096)
+    ref_id: SessionCredentialRef | None = None
+
+
+class ClearSessionCredentialRequest(ClosedModel):
+    ref_id: SessionCredentialRef | None = None
+    target_id: Identifier | None = None
+    scope_kind: Literal["target", "discovery", "draft"] | None = None
+    scope_id: Identifier | None = None
 
 
 def register_target_routes(app, ctx) -> None:
@@ -63,9 +81,12 @@ def register_target_routes(app, ctx) -> None:
         if imported_service is not None:
             for row in rows:
                 row["connection_verification"] = imported_service.connection_state(catalog._targets[row["id"]])
+        aliases = sorted(catalog._config.credential_aliases.keys())
         return jsonify(
             workflow_schema_version="1.0.0",
             targets=rows,
+            credential_aliases=aliases,
+            credential_alias_availability={alias: catalog._available(alias) for alias in aliases},
             protocols=[
                 {"id": "openai-chat", "state": "offline_configuration_supported"},
                 {"id": "http-json", "state": "offline_configuration_supported"},
@@ -106,8 +127,19 @@ def register_target_routes(app, ctx) -> None:
         with admin_lock, dispatcher._lock if dispatcher else nullcontext():
             if dispatcher and dispatcher._active:
                 return fail("run_active", 409)
+            preset = catalog._targets.get(selection.target_id)
+            # Generic HTTP JSON POST probes can trigger target actions, so require
+            # explicit per-probe authorization and exact endpoint binding even for
+            # already-reviewed profiles (both local_single_user and authenticated modes).
+            if preset is not None and preset.protocol == "http-json":
+                if (
+                    selection.profile_revision != catalog._revisions[preset.id]
+                    or selection.policy_ref != catalog._config.policy_ref
+                ):
+                    return fail("stale_profile_or_policy", 409)
+                if selection.authorization_confirmed is not True or selection.endpoint != preset.endpoint:
+                    return fail("probe_authorization_required", 403)
             if local_single_user:
-                preset = catalog._targets.get(selection.target_id)
                 if preset is not None and not preset.reviewed:
                     if (
                         selection.authorization_confirmed is not True
@@ -212,11 +244,13 @@ def register_target_routes(app, ctx) -> None:
         if imported_service is not None:
             for row in rows:
                 row["connection_verification"] = imported_service.connection_state(catalog._targets[row["id"]])
+        aliases = sorted(catalog._config.credential_aliases.keys())
         return jsonify(
             workflow_schema_version="1.0.0",
             targets=rows,
             policy_ref=catalog._config.policy_ref,
-            credential_aliases=sorted(catalog._config.credential_aliases.keys()),
+            credential_aliases=aliases,
+            credential_alias_availability={alias: catalog._available(alias) for alias in aliases},
         )
 
     def _collect_target_artifacts(target_id: str) -> tuple[list[tuple[str, Path]], dict[str, int]]:
@@ -550,6 +584,8 @@ def register_target_routes(app, ctx) -> None:
                         imported_service._connection_proofs.pop(item.target_id, None)
                     if hasattr(imported_service, "_connections"):
                         imported_service._connections.pop(item.target_id, None)
+                if hasattr(catalog, "session_credentials") and catalog.session_credentials is not None:
+                    catalog.session_credentials.clear_for_scope("target", item.target_id)
                 if dispatcher is not None and getattr(dispatcher, "policy", None) is not None:
                     surviving_grants = [
                         g for g in dispatcher.policy.grants if getattr(g, "target_id", None) != item.target_id
@@ -670,6 +706,148 @@ def register_target_routes(app, ctx) -> None:
         except DiscoveryError as exc:
             return fail(exc.code, 404)
 
+    def _has_active_run(target_id: str | None = None) -> bool:
+        gen_svc = getattr(ctx, "generic_run_service", None)
+        mcp_act_svc = getattr(ctx, "mcp_action_service", None)
+        if dispatcher and dispatcher._active:
+            return True
+        if gen_svc is not None:
+            if target_id is not None and gen_svc.is_active_for_target(target_id):
+                return True
+            if target_id is None and bool(getattr(gen_svc, "_active_target_counts", None)):
+                return True
+        if mcp_act_svc is not None and getattr(mcp_act_svc, "_lock", None) is not None and mcp_act_svc._lock.locked():
+            return True
+        for svc in (ctx.services or {}).values():
+            active_batch = getattr(svc, "_active", None)
+            if isinstance(active_batch, dict) and (target_id is None or active_batch.get("target_id") == target_id):
+                return True
+            active_tid = getattr(svc, "active_target_id", None)
+            if active_tid is not None and (target_id is None or active_tid == target_id):
+                return True
+            orch = getattr(svc, "orchestrator", None)
+            if getattr(orch, "_active", False):
+                return True
+        return False
+
+    @app.post("/api/testing/managed-targets/session-credentials")
+    def managed_set_session_credential():
+        denied = managed_auth()
+        if denied:
+            return denied
+        try:
+            item = SetSessionCredentialRequest.model_validate(read_json(request.get_data()))
+        except (ValueError, TypeError, ValidationError):
+            return fail("invalid_session_credential", 400)
+        gen_svc = getattr(ctx, "generic_run_service", None)
+        gen_lock = getattr(gen_svc, "_lock", None)
+        with (
+            admin_lock,
+            dispatcher._lock if dispatcher else nullcontext(),
+            catalog._lock,
+            gen_lock if gen_lock is not None else nullcontext(),
+        ):
+            if _has_active_run(item.scope_id if item.scope_kind == "target" else None):
+                return fail("run_active", 409)
+            try:
+                if item.scope_kind == "target":
+                    preset = catalog._targets.get(item.scope_id)
+                    if preset is None or preset.protocol != "http-json":
+                        return fail("invalid_session_credential", 400)
+                    if canonical_bound_origin(item.endpoint) != canonical_bound_origin(preset.endpoint):
+                        return fail("session_credential_origin_mismatch", 400)
+                    expected_hdr = item.header_name or ("Authorization" if item.auth_type == "bearer" else "X-API-Key")
+                    if preset.session_auth is not None:
+                        if (
+                            item.auth_type != preset.session_auth.auth_type
+                            or expected_hdr.lower() != preset.session_auth.header_name.lower()
+                        ):
+                            return fail("session_credential_header_mismatch", 400)
+                        if item.ref_id is not None and item.ref_id != preset.session_auth.ref_id:
+                            return fail("session_credential_scope_mismatch", 400)
+                        ref_to_use = preset.session_auth.ref_id
+                    else:
+                        ref_to_use = item.ref_id
+                elif item.scope_kind == "discovery":
+                    if discovery is None:
+                        return fail("discovery_record_not_found", 404)
+                    record = discovery.load(item.scope_id)
+                    disc_endpoints = {
+                        c.get("endpoint")
+                        for c in (record.get("openapi_candidates") or [])
+                        if isinstance(c, dict) and isinstance(c.get("endpoint"), str)
+                    }
+                    if isinstance(record.get("canonical_endpoint"), str):
+                        disc_endpoints.add(record["canonical_endpoint"])
+                    if disc_endpoints and canonical_bound_origin(item.endpoint) not in {
+                        canonical_bound_origin(ep) for ep in disc_endpoints if ep
+                    }:
+                        return fail("session_credential_origin_mismatch", 400)
+                    ref_to_use = item.ref_id
+                else:
+                    if item.ref_id is not None and any(
+                        p.session_auth is not None and p.session_auth.ref_id == item.ref_id
+                        for p in catalog._targets.values()
+                    ):
+                        return fail("session_credential_scope_mismatch", 400)
+                    ref_to_use = item.ref_id
+                meta = catalog.session_credentials.set_credential(
+                    scope_kind=item.scope_kind,
+                    scope_id=item.scope_id,
+                    endpoint=item.endpoint,
+                    auth_type=item.auth_type,
+                    header_name=item.header_name,
+                    secret_value=item.secret_value,
+                    ref_id=ref_to_use,
+                )
+            except DiscoveryError as exc:
+                return fail(exc.code, 404)
+            except SessionCredentialError as exc:
+                status = 409 if exc.code == "session_credential_capacity_exceeded" else 400
+                return fail(exc.code, status)
+        return jsonify(workflow_schema_version="1.0.0", credential=meta)
+
+    @app.post("/api/testing/managed-targets/session-credentials/clear")
+    def managed_clear_session_credential():
+        denied = managed_auth()
+        if denied:
+            return denied
+        try:
+            item = ClearSessionCredentialRequest.model_validate(read_json(request.get_data()))
+        except (ValueError, TypeError, ValidationError):
+            return fail("invalid_session_credential", 400)
+        if not item.ref_id and not item.target_id and not (item.scope_kind and item.scope_id):
+            return fail("invalid_session_credential", 400)
+        gen_svc = getattr(ctx, "generic_run_service", None)
+        gen_lock = getattr(gen_svc, "_lock", None)
+        with (
+            admin_lock,
+            dispatcher._lock if dispatcher else nullcontext(),
+            catalog._lock,
+            gen_lock if gen_lock is not None else nullcontext(),
+        ):
+            if _has_active_run(item.target_id):
+                return fail("run_active", 409)
+            cleared = False
+            try:
+                if item.ref_id:
+                    cleared = catalog.session_credentials.clear_credential(
+                        item.ref_id,
+                        scope_id=item.target_id or item.scope_id,
+                        scope_kind="target" if item.target_id else item.scope_kind,
+                    )
+                if item.target_id:
+                    cleared = (catalog.session_credentials.clear_for_scope("target", item.target_id) > 0) or cleared
+                elif item.scope_kind and item.scope_id:
+                    cleared = (catalog.session_credentials.clear_for_scope(item.scope_kind, item.scope_id) > 0) or cleared
+            except SessionCredentialError as exc:
+                return fail(exc.code, 400)
+        return jsonify(
+            workflow_schema_version="1.0.0",
+            cleared=cleared,
+            credential_availability="unavailable",
+        )
+
     @app.post("/api/testing/discovery-probes")
     def probe_discovery_candidate():
         denied = managed_auth()
@@ -685,8 +863,13 @@ def register_target_routes(app, ctx) -> None:
                     item.profile.endpoint,
                     item.profile.protocol,
                     credential_alias=item.profile.credential_alias,
+                    session_auth=item.profile.session_auth,
                 )
-                result, status = catalog.probe_candidate(item.profile)
+                result, status = catalog.probe_candidate(
+                    item.profile,
+                    sample_input=item.sample_input,
+                    discovery_id=item.discovery_id,
+                )
             return jsonify(result.model_dump()), status
         except DiscoveryError as exc:
             status_code = 400 if exc.code in {"discovery_authentication_required", "unsupported_authentication_scheme"} else 409
@@ -710,8 +893,30 @@ def register_target_routes(app, ctx) -> None:
                     item.profile.endpoint,
                     item.profile.protocol,
                     credential_alias=item.profile.credential_alias,
+                    session_auth=item.profile.session_auth,
                 )
             candidate = catalog.validate_profile(item.profile, update=update)
+            if candidate.session_auth is not None:
+                if update:
+                    allowed_checks = [("target", candidate.id), ("draft", candidate.id)]
+                elif item.discovery_id:
+                    allowed_checks = [("discovery", item.discovery_id), ("draft", candidate.id)]
+                else:
+                    allowed_checks = [("draft", candidate.id)]
+                avail = "unavailable"
+                for skind, sid in allowed_checks:
+                    if catalog.session_credentials.availability(
+                        candidate.session_auth.ref_id,
+                        endpoint=candidate.endpoint,
+                        scope_id=sid,
+                        scope_kind=skind,
+                        expected_auth_type=candidate.session_auth.auth_type,
+                        expected_header_name=candidate.session_auth.header_name,
+                    ) == "available":
+                        avail = "available"
+                        break
+            else:
+                avail = catalog._available(candidate.credential_alias)
         except DiscoveryError as exc:
             status_code = 400 if exc.code in {"discovery_authentication_required", "unsupported_authentication_scheme"} else 409
             return fail(exc.code, status_code)
@@ -720,7 +925,7 @@ def register_target_routes(app, ctx) -> None:
         return jsonify(
             workflow_schema_version="1.0.0",
             configuration_status="valid",
-            credential_availability=catalog._available(candidate.credential_alias),
+            credential_availability=avail,
             target_request_count=0,
             target_execution_performed=False,
         )
@@ -733,9 +938,17 @@ def register_target_routes(app, ctx) -> None:
             item = (ReviewProfile if review else SaveProfile).model_validate(read_json(request.get_data()))
         except (ValueError, TypeError, ValidationError):
             return fail("invalid_managed_profile", 400)
+        gen_svc = getattr(ctx, "generic_run_service", None)
+        gen_lock = getattr(gen_svc, "_lock", None)
+        target_id = item.target_id if review else item.profile.id
         try:
-            with admin_lock, dispatcher._lock if dispatcher else nullcontext():
-                if dispatcher and dispatcher._active:
+            with (
+                admin_lock,
+                dispatcher._lock if dispatcher else nullcontext(),
+                catalog._lock,
+                gen_lock if gen_lock is not None else nullcontext(),
+            ):
+                if _has_active_run(target_id if (update or review) else None):
                     return fail("run_active", 409)
                 if not review and item.discovery_id:
                     discovery.validate_association(
@@ -743,15 +956,99 @@ def register_target_routes(app, ctx) -> None:
                         item.profile.endpoint,
                         item.profile.protocol,
                         credential_alias=item.profile.credential_alias,
+                        session_auth=item.profile.session_auth,
                     )
+                allowed_scopes: set[tuple[str, str]] = set()
+                if not review and item.profile.session_auth is not None:
+                    if update:
+                        allowed_scopes = {("target", item.profile.id), ("draft", item.profile.id)}
+                    elif item.discovery_id:
+                        allowed_scopes = {("discovery", item.discovery_id), ("draft", item.profile.id)}
+                    else:
+                        allowed_scopes = {("draft", item.profile.id)}
+                    # Read-only pre-validation BEFORE catalog.save_profile so a failed save
+                    # NEVER mutates or commits session credential ownership.
+                    catalog.session_credentials.validate_rebind_to_target(
+                        item.profile.session_auth.ref_id,
+                        endpoint=item.profile.endpoint,
+                        expected_auth_type=item.profile.session_auth.auth_type,
+                        expected_header_name=item.profile.session_auth.header_name,
+                        allowed_scopes=allowed_scopes,
+                    )
+                prev_preset = catalog._targets.get(item.profile.id) if (not review and update) else None
+                prev_session_ref = (
+                    prev_preset.session_auth.ref_id
+                    if (prev_preset is not None and prev_preset.session_auth is not None)
+                    else None
+                )
+                prev_state = catalog._state if not review else None
+                prev_state_bytes = (
+                    catalog.state_file.read_bytes()
+                    if (not review and catalog.state_file.exists())
+                    else None
+                )
+                new_ref_id = (
+                    item.profile.session_auth.ref_id
+                    if (not review and item.profile.session_auth is not None)
+                    else None
+                )
+                new_ref_snapshot = (
+                    catalog.session_credentials.snapshot_record(new_ref_id)
+                    if new_ref_id is not None
+                    else None
+                )
+                prev_ref_snapshot = (
+                    catalog.session_credentials.snapshot_record(prev_session_ref)
+                    if prev_session_ref is not None
+                    else None
+                )
+
                 profile = (
                     catalog.review_profile(item) if review else catalog.save_profile(item, update=update)
                 )
-                if not review and item.discovery_id:
-                    discovery.associate(item.discovery_id, profile)
+                try:
+                    if not review and item.profile.session_auth is not None:
+                        catalog.session_credentials.rebind_to_target(
+                            item.profile.session_auth.ref_id,
+                            target_id=item.profile.id,
+                            endpoint=item.profile.endpoint,
+                            expected_auth_type=item.profile.session_auth.auth_type,
+                            expected_header_name=item.profile.session_auth.header_name,
+                            allowed_scopes=allowed_scopes,
+                        )
+                    if not review and item.discovery_id:
+                        discovery.associate(item.discovery_id, profile)
+                    if (
+                        not review
+                        and update
+                        and prev_session_ref is not None
+                        and (item.profile.session_auth is None or item.profile.session_auth.ref_id != prev_session_ref)
+                    ):
+                        catalog.session_credentials.clear_credential(
+                            prev_session_ref, scope_id=item.profile.id, scope_kind="target"
+                        )
+                    if not review:
+                        # Release any other leftover draft credentials for this target ID now that save succeeded.
+                        catalog.session_credentials.clear_for_scope("draft", item.profile.id)
+                        profile = next(r for r in catalog.public_targets() if r["id"] == item.profile.id)
+                except Exception:
+                    # Roll back in-memory credential ownership and persisted catalog on post-save failure.
+                    if new_ref_id is not None:
+                        catalog.session_credentials.restore_record(new_ref_id, new_ref_snapshot)
+                    if prev_session_ref is not None:
+                        catalog.session_credentials.restore_record(prev_session_ref, prev_ref_snapshot)
+                    if prev_state is not None:
+                        if prev_state_bytes is not None:
+                            catalog.state_file.write_bytes(prev_state_bytes)
+                        elif catalog.state_file.exists():
+                            catalog.state_file.unlink()
+                        catalog._install(prev_state)
+                    raise
         except DiscoveryError as exc:
             status_code = 400 if exc.code in {"discovery_authentication_required", "unsupported_authentication_scheme"} else 409
             return fail(exc.code, status_code)
+        except SessionCredentialError as exc:
+            return fail(exc.code, 400)
         except ValueError as exc:
             if str(exc) == "Unregistered credential alias.":
                 return fail("invalid_managed_profile", 400)

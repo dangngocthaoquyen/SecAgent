@@ -170,6 +170,21 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
             "discovery_profile_mismatch": "The saved endpoint differs from the discovery candidate. Start a new discovery or save manually.",
             "discovery_record_not_found": "Discovery record unavailable in this local workspace.",
             "discovery_storage_unavailable": "Discovery metadata could not be saved in the operator data directory.",
+            "probe_authorization_required": "Explicit operator authorization and exact endpoint confirmation are required for each HTTP JSON connection probe.",
+            "invalid_session_credential": "Session credential request is invalid. Check the authentication mode, header name, target endpoint, and token value.",
+            "invalid_session_credential_header": "API key header name is invalid or disallowed.",
+            "invalid_session_credential_value": "Session credential value is empty or contains invalid characters.",
+            "invalid_session_credential_origin": "Session credential endpoint URL is invalid.",
+            "unsafe_session_credential_origin": "Session credentials may only bind to authorized local or private IP endpoints.",
+            "session_credential_origin_mismatch": "Session credential origin does not match the target endpoint.",
+            "session_credential_scope_mismatch": "Session credential belongs to a different target or discovery draft.",
+            "session_credential_header_mismatch": "Session credential type or header name does not match the target configuration.",
+            "session_credential_too_large": "Session credential value exceeds the maximum allowed size.",
+            "session_credential_capacity_exceeded": "Backend memory session credential capacity reached; clear unused credentials first.",
+            "credential_unavailable": "Configured target credential is unavailable. Supply the session credential or verify the server environment variable.",
+            "generic_session_credential_stale": "The session credential changed or was cleared after scan preview. Generate a fresh scan preview and reconfirm before starting.",
+            "generic_session_credential_authorization_required": "Live scans on session-authenticated targets require preview confirmation bound to the current session credential generation.",
+            "generic_target_revision_stale": "The target profile revision changed after scan preview. Generate a fresh scan preview and reconfirm before starting.",
             "operator_authentication_required": "Operator authentication is required for target discovery and management.",
             "asi01_target_not_found": "Target is not in the active catalog. Reload Targets and select a saved DVAA text target.",
             "asi01_target_not_reviewed": "Review this target's current profile revision before previewing the ASI01 text batch.",
@@ -258,6 +273,28 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
             "generic_submission_init_failed": "The initial submission failed before creating a Run record; verify status and preview again before retrying.",
             "generic_submission_record_unavailable": "The submission mapping exists on disk, but the Run record is temporarily unavailable. Retry GET verification without starting a duplicate scan.",
             "judge_provider_unavailable": "Hybrid LLM Judge is unavailable or missing credentials. Configure Judge credentials on the server or switch to Deterministic Rules / Evidence Only.",
+            "generic_resume_not_interrupted": "Only interrupted scans can be resumed. Completed, running, or failed runs cannot be resumed.",
+            "generic_resume_already_active": "Another continuation run for this scan lineage is already active. Wait for it to finish before resuming again.",
+            "generic_resume_no_remaining_cases": "No remaining pending or uncertain testcases exist for this scan lineage.",
+            "generic_resume_no_cases_selected": "No definitely pending testcases remain. Explicitly opt into uncertain in-flight testcase(s) and confirm re-execution to resume.",
+            "generic_resume_invalid_uncertain_selection": "Only uncertain in-flight testcases from the interrupted run may be opted into for retry.",
+            "generic_resume_uncertain_confirmation_required": "Confirm that prior target execution and state were checked before retrying uncertain in-flight testcase(s).",
+            "generic_resume_stateful_acknowledgement_required": "Acknowledge the stateful target warning before starting a live resumed scan.",
+            "generic_resume_digest_stale": "The resume preview is stale because run state, target revision, or credentials changed. Reload Resume Preview before starting.",
+            "generic_resume_not_eligible": "This scan cannot be resumed until all listed resume blockers are resolved.",
+            "resume_state_incomplete": "Persisted testcase progress for this interrupted run is incomplete; cannot safely determine remaining testcases.",
+            "resume_dataset_not_found": "The original dataset for this scan is no longer available in the local dataset repository.",
+            "resume_dataset_revision_missing": "The interrupted run is missing its recorded dataset revision SHA-256 and cannot verify dataset consistency.",
+            "resume_dataset_mismatch": "The dataset revision or testcase set has changed since the original scan started.",
+            "resume_target_not_found": "The original target profile is no longer registered in the target catalog.",
+            "resume_target_revision_missing": "The interrupted run is missing its recorded target profile revision and cannot verify target consistency.",
+            "resume_target_configuration_changed": "The target configuration or revision changed since the original scan started. Start a New Scan instead of resuming.",
+            "resume_judge_configuration_missing": "The interrupted Hybrid scan is missing its recorded Judge provider or model identifier and cannot verify Judge consistency.",
+            "resume_judge_configuration_changed": "The active LLM Judge provider or model differs from the original interrupted scan. Restore the original Judge configuration or start a New Scan.",
+            "resume_configuration_incomplete": "Required historical configuration revisions are missing from the interrupted run record; cannot verify consistency for Resume.",
+            "resume_policy_changed": "The reviewed response policy changed since the original scan started.",
+            "resume_application_context_changed": "The target Application Context changed since the original scan started.",
+            "unified_report_integrity_failed": "Unified lineage report export is blocked because persisted checkpoint state failed integrity validation. Individual session reports remain accessible.",
         }
         message = preview_messages.get(code) or ("Controlled run request rejected; inspect the local run record before retrying."
                    if request.path == "/api/testing/runs" else
@@ -287,6 +324,8 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
                   "/api/testing/managed-targets/update": "POST",
                   "/api/testing/managed-targets/review": "POST",
                   "/api/testing/managed-targets/delete": "POST",
+                  "/api/testing/managed-targets/session-credentials": "POST",
+                  "/api/testing/managed-targets/session-credentials/clear": "POST",
                   "/api/testing/discoveries": "POST",
                   "/api/testing/discovery-probes": "POST",
                   "/api/testing/application-contexts/save": "POST",
@@ -353,8 +392,10 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
             routes[request.path] = "GET"
         if re.fullmatch(r"/api/testing/response-policies/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}/review", request.path):
             routes[request.path] = "POST"
-        if re.fullmatch(r"/api/testing/generic-runs/[a-f0-9]{32}(?:/report\.json)?", request.path):
+        if re.fullmatch(r"/api/testing/generic-runs/[a-f0-9]{32}(?:/(?:report|unified-report)\.json)?", request.path):
             routes[request.path] = "GET"
+        if re.fullmatch(r"/api/testing/generic-runs/[a-f0-9]{32}/resume/(?:preview|start)", request.path):
+            routes[request.path] = "POST"
         if re.fullmatch(r"/api/testing/generic-runs/submission/[a-f0-9]{32}", request.path):
             routes[request.path] = "GET"
         if request.path not in routes:
@@ -552,6 +593,8 @@ def main(argv=None):
     parser.add_argument('--lab-dvaa-image', help='Operator-reviewed immutable DVAA image ID')
     parser.add_argument('--lab-python-image', help='Operator-reviewed Python repository digest')
     parser.add_argument('--lab-proxy-image', help='Operator-reviewed proxy repository digest')
+    parser.add_argument('--sync-credential-aliases', action='store_true',
+                        help='Explicitly merge newly added credential aliases from --catalog into an existing managed target catalog (strictly additive)')
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("Port must be between 1 and 65535.")
@@ -569,7 +612,8 @@ def main(argv=None):
             if len(secret) < 32:
                 raise ValueError('Target management requires an operator secret.')
             catalog=ManagedTargetCatalog(catalog._config,Path(args.target_data_dir),
-                                         local_single_user=local_single_user)
+                                         local_single_user=local_single_user,
+                                         allow_additive_credential_aliases=args.sync_credential_aliases)
         hybrid_config=None
         if args.enable_web_hybrid_judge:
             if not args.enable_controlled_runs or not args.web_hybrid_config:
