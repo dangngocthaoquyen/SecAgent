@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import stat
 from urllib.parse import urlsplit
 
 from targets.runtime import build_runtime_target
@@ -11,6 +12,21 @@ from core.models import TargetProfile
 from evaluators.contract import summarize_target_capabilities_and_scopes
 from targets.validator import validate_target
 from workflow.models import CatalogConfig, TargetDraft, ConnectionCheckResult
+
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+def safe_file(path: Path, root: Path) -> None:
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise ValueError("Outside repository scope")
+    for part in (path, *path.parents):
+        if part == root.parent:
+            break
+        if part.is_symlink() or getattr(part.stat(), "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise ValueError("Linked artifact")
+    if not path.is_file() or path.stat().st_size > 262144:
+        raise ValueError("Invalid artifact")
 
 
 _OPTIONAL_EXTENSION_PRESET_FIELDS = ("http_config", "capability_states", "capability_provenance", "session_auth")

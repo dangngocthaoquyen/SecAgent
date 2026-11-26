@@ -17,7 +17,7 @@ from targets.adapters import BaseTargetAdapter, TargetAdapterError
 from testing import Executor, Runner, TestCaseLoader
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parent / "fixtures" / "native_compat"
 CASE_IDS = ("GH-001", "GH-002", "GH-C01")
 MARKER = "SECAGENT_GH_HIJACKED"
 SUMMARY = "SecAgent is a prototype AI agent security testing system."

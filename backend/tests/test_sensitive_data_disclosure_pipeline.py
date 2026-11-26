@@ -17,7 +17,7 @@ from targets.adapters import BaseTargetAdapter
 from testing import Executor, Runner, TestCaseLoader
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parent / "fixtures" / "native_compat"
 CANARY = "SECAGENT_CANARY_SD_9F2A"
 REFUSAL = "I cannot disclose confidential data."
 SUMMARY = "SecAgent is an AI agent security testing framework."

@@ -22,12 +22,13 @@ from tools.http import HttpResponse
 
 
 ROOT = Path(__file__).resolve().parents[2]
+NATIVE_COMPAT_ROOT = Path(__file__).resolve().parent / "fixtures" / "native_compat"
 SUMMARY = "SecAgent is a prototype AI agent security testing system."
 MARKER = "SECAGENT_GH_HIJACKED"
 
 
 def case(case_id="GH-001", category="goal_hijacking"):
-    return TestCaseLoader().load(ROOT / "testcases" / category / f"{case_id}.yaml")
+    return TestCaseLoader().load(NATIVE_COMPAT_ROOT / "testcases" / category / f"{case_id}.yaml")
 
 
 def observation(text, **metadata):

@@ -18,15 +18,6 @@ FRONTEND = ROOT / "frontend"
 BACKEND = ROOT / "backend" / "src"
 SEED = ROOT / "configs" / "workflow" / "authorized-targets.example.json"
 RUNS = ROOT / "results" / "local-controlled-runs"
-WEB_LAB_GUARD_BASE = "nginx@sha256:e9b2d7624fd7957f4ed44ae0a272d93fb73aeb8512ba8916f8118ae6143fd115"
-
-
-def local_image_id(reference: str) -> str:
-    value = subprocess.check_output(["docker", "image", "inspect", reference,
-        "--format", "{{.Id}}"], text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
-    if not value.startswith("sha256:") or len(value) != 71:
-        raise ValueError("Reviewed local lab image is unavailable.")
-    return value
 
 
 def available_port(preferred: int, reserved: set[int]) -> int:
@@ -148,12 +139,6 @@ def main(argv=None) -> int:
                         help="Explicitly register newly added credential aliases from --catalog into an existing managed target catalog (strictly additive, atomic backup)")
     parser.add_argument("--runtime-config", help="Optional operator-owned runtime references; defaults to runtime.json in the local data directory")
     parser.add_argument("--no-browser", action="store_true", help="Print the URL without opening a browser")
-    parser.add_argument("--enable-asi01-batch", action="store_true",
-                        help="Explicitly enable reviewed DVAA SecureBot and ResearchBot ASI01 text batch dispatch")
-    parser.add_argument("--enable-web-lab-batch", action="store_true",
-                        help="Explicitly enable guarded ResearchBot GH-WEB-001 batch dispatch")
-    parser.add_argument("--enable-toolbot-lab-batch", action="store_true",
-                        help="Enable offline synthetic ToolBot Lab TM-002 batch only")
     parser.add_argument("--enable-custom-imported-batch", action="store_true",
                         help="Enable Generic Custom Imported Testcase batch (Offline Mock by default)")
     parser.add_argument("--enable-imported-live-local", action="store_true",
@@ -176,15 +161,10 @@ def main(argv=None) -> int:
     catalog_path = Path(args.catalog).absolute() if args.catalog else SEED
     if not catalog_path.is_file() or catalog_path.is_symlink():
         raise ValueError("Target catalog configuration is unavailable.")
-    legacy_batch = any((args.enable_asi01_batch, args.enable_web_lab_batch,
-                        args.enable_toolbot_lab_batch, args.enable_custom_imported_batch))
-    unified = not legacy_batch
-    if sum((args.enable_asi01_batch, args.enable_web_lab_batch,
-            args.enable_toolbot_lab_batch, args.enable_custom_imported_batch)) > 1:
-        parser.error("Batch modes require separate local sessions.")
+    unified = not args.enable_custom_imported_batch
     if args.enable_imported_live_local and not (args.enable_custom_imported_batch or unified):
         parser.error("Live Local requires --enable-custom-imported-batch.")
-    if args.judge_config and not (unified or args.enable_custom_imported_batch or args.enable_asi01_batch or args.mcp_action_catalog):
+    if args.judge_config and not (unified or args.enable_custom_imported_batch or args.mcp_action_catalog):
         parser.error("Hybrid Judge requires an enabled evaluation workflow.")
     if args.dvaa_mcp_receipt_root and not args.mcp_action_catalog:
         parser.error("DVAA receipt collection requires --mcp-action-catalog.")
@@ -296,10 +276,6 @@ def main(argv=None) -> int:
             workflow_command.append("--sync-credential-aliases")
         if unified:
             workflow_command.append('--enable-unified-runtime')
-        if args.enable_asi01_batch:
-            workflow_command.append("--enable-asi01-controlled-batch")
-        if args.enable_toolbot_lab_batch:
-            workflow_command.append("--enable-toolbot-lab-batch")
         if args.enable_custom_imported_batch:
             workflow_command.append("--enable-custom-imported-batch")
         if args.enable_imported_live_local:
@@ -314,16 +290,6 @@ def main(argv=None) -> int:
             workflow_command.extend(["--reviewed-mcp-catalog-sha256", args.reviewed_mcp_catalog_sha256])
         if args.dvaa_mcp_receipt_root:
             workflow_command.extend(["--dvaa-mcp-receipt-root", str(Path(args.dvaa_mcp_receipt_root).absolute())])
-        if args.enable_web_lab_batch:
-            if not shutil.which("docker"):
-                raise RuntimeError("Docker is required for the guarded Web Lab.")
-            local_image_id(WEB_LAB_GUARD_BASE)
-            workflow_command.extend(["--enable-researchbot-web-lab-batch",
-                "--web-lab-state-dir", str(data / "web-lab"),
-                "--web-lab-dvaa-image", local_image_id("dvaa-deepseek:local"),
-                "--web-lab-fixture-image", local_image_id("secagent-asi01-fixture:lab"),
-                "--web-lab-proxy-image", local_image_id("nginx:stable-alpine"),
-                "--web-lab-guard-base-image", WEB_LAB_GUARD_BASE])
         start(workflow_command, ROOT, workflow_env)
         start([node, str(vite)], FRONTEND, frontend_env)
         token = ""  # The workflow/bridge child environments alone retain selected credentials.
@@ -340,13 +306,13 @@ def main(argv=None) -> int:
                      lambda response: (lambda h: h.get("status") == "ok"
                          and h.get("operator_mode") == "local_single_user"
                          and h.get("mode") == "controlled_execution_enabled"
-                         and h.get("asi01_batch_enabled") is args.enable_asi01_batch
-                         and h.get("web_lab_batch_enabled") is args.enable_web_lab_batch
-                         and h.get("toolbot_lab_batch_enabled") is args.enable_toolbot_lab_batch
+                         and h.get("asi01_batch_enabled") is False
+                         and h.get("web_lab_batch_enabled") is False
+                         and h.get("toolbot_lab_batch_enabled") is False
                          and h.get("custom_imported_batch_enabled") is (args.enable_custom_imported_batch or unified)
                          and h.get("imported_live_local_enabled") is (args.enable_imported_live_local or unified)
                          and h.get("evaluation_modes") == (["rule_only", "hybrid"] if judge_path else ["rule_only"]))(json.load(response)),
-                     attempts=240 if args.enable_web_lab_batch else 60):
+                     attempts=60):
             raise RuntimeError("Workflow API did not become ready in bounded local mode.")
         url = f"http://127.0.0.1:{frontend_port}/#targets"
         if not ready(f"http://127.0.0.1:{frontend_port}/",

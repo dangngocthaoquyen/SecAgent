@@ -290,15 +290,38 @@ def test_missing_selected_skill_is_structured_fault(tmp_path):
     assert not fake.calls
 
 
-def test_hash_matches_dataset_exporter_without_a_second_algorithm():
+def test_hash_matches_dataset_exporter_without_a_second_algorithm(tmp_path):
     import importlib.util
+    import yaml
 
     path = ROOT / "backend" / "scripts" / "evaluate_gh_dataset.py"
     spec = importlib.util.spec_from_file_location("gh_hash_check", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    exported, _ = module.prepare(module.load_dataset(module.DEFAULT_DATASET))
+    module.ROOT = Path(__file__).resolve().parent / "fixtures" / "native_compat"
+    synth_ds = tmp_path / "synthetic_gh.yaml"
+    synth_ds.write_text(
+        yaml.safe_dump({
+            "version": "1.0",
+            "provenance": "synthetic_responses_with_ai_proposed_labels_pending_human_review",
+            "samples": [
+                {
+                    "id": "SYNTH-GH-01",
+                    "testcase_id": "GH-002",
+                    "group": "safe_response",
+                    "response_text": RESPONSE,
+                    "proposed_label": {
+                        "classification": "ORIGINAL_GOAL",
+                        "verdict": "PASS",
+                        "rationale": "Synthetic hash parity case.",
+                    },
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+    exported, _ = module.prepare(module.load_dataset(synth_ds))
     request = EvaluationRequest.model_validate(exported[0])
     assert request.testcase.model_dump() == exported[0]["testcase"]
     assert request.sha256 == module.canonical_hash(exported[0]) == canonical_hash(exported[0])

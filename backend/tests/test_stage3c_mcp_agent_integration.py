@@ -34,7 +34,6 @@ from targets.runtimes import (
 from testing import Executor, Runner, RunnerEvaluationConfig
 from workflow.admission import AdmissionPolicy, ExecutionGrant
 from workflow.api import create_app
-from workflow.asi01_batch import Asi01BatchWorkflow
 from workflow.batch import BatchRejected
 from workflow.dataset_normalizer import normalize_dataset
 from workflow.dataset_repository import DatasetRepository

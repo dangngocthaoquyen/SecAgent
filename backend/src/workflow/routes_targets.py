@@ -10,7 +10,6 @@ from flask import jsonify, request
 from pydantic import Field, ValidationError
 
 from workflow.application_context import SaveApplicationContext
-from workflow.asi01_batch import TEXT_CASES
 from workflow.catalog import CatalogError, read_json
 from workflow.discovery import DiscoveryError, DiscoveryRequest
 from workflow.evidence_sources import CollectEvidenceSource, EvidenceSourceError, SaveEvidenceSource
@@ -64,7 +63,6 @@ def register_target_routes(app, ctx) -> None:
     imported_service = ctx.imported_service
     application_contexts = ctx.application_contexts
     evidence_sources = ctx.evidence_sources
-    inventory = ctx.inventory
     fail = ctx.fail
     operator_authorized = ctx.operator_authorized
 
@@ -667,8 +665,8 @@ def register_target_routes(app, ctx) -> None:
                 result = discovery.discover(
                     item,
                     allowed_aliases=set(catalog._config.credential_aliases),
-                    testcase_items=inventory.items,
-                    text_case_ids=set(TEXT_CASES),
+                    testcase_items=[],
+                    text_case_ids=set(),
                 )
             return jsonify(result)
         except (ValueError, TypeError, ValidationError) as exc:

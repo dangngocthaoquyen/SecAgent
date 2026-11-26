@@ -13,20 +13,14 @@ from flask import Flask, jsonify, request
 from pydantic import ValidationError
 from werkzeug.exceptions import HTTPException
 
-from workflow.catalog import CatalogError, load_catalog, read_json
+from workflow.catalog import CatalogError, ROOT, load_catalog, read_json, safe_file
 from workflow.management import ManagedTargetCatalog
 from workflow.application_context import ApplicationContextStore
 from workflow.discovery import DiscoveryEngine
 from targets.adapters.discovery_providers import evidence_discovery_providers
 from workflow.evidence_sources import EvidenceSourceStore, load_evidence_policy
-from workflow.plans import TestcaseCatalog
-from workflow.admission import AdmissionService, AdmissionPolicy
+from workflow.admission import AdmissionPolicy
 from workflow.dispatch import ControlledDispatcher
-from workflow.offline_batch import OfflineBatchWorkflow
-from workflow.asi01_batch import Asi01BatchWorkflow
-from workflow.web_live_batch import ResearchBotWebBatchWorkflow
-from workflow.web_lab_runtime import DockerWebLabRuntime
-from workflow.toolbot_lab_batch import ToolBotLabBatchWorkflow
 from workflow.generic_imported_batch import GenericImportedBatchWorkflow
 from workflow.mcp_actions import McpActionWorkflow
 from workflow.dataset_repository import DatasetRepository
@@ -34,46 +28,15 @@ from workflow.asi03_contracts import ASI03ContractStore, ASI03TargetPolicyStore
 from workflow.asi05_policy import ASI05PolicyStore
 from testing import RunnerEvaluationConfig
 from testing.evaluation_config import LiveJudgeConfigurationError, validate_live_pi_config
-from workflow.plans import ROOT
-from workflow.lab_attachment import LabAttemptPreparer, ReviewedImages
 from workflow.mcp_agent_runtime_binding import McpAgentRuntimeBindingStore
 from workflow.mcp_tool_catalog import McpToolCatalogStore
 from workflow.routes_agent_onboarding import register_agent_onboarding_routes
 from workflow.routes_datasets_policies import register_dataset_policy_routes
-from workflow.routes_execution import (OperatorGrantRequest, RunSelectedRequest,
-    register_execution_routes)
+from workflow.routes_execution import register_execution_routes
 from workflow.response_policies import ResponsePolicyStore
 from workflow.routes_generic_runner import GenericRunService, register_generic_runner_routes
 from workflow.routes_targets import (DiscoveryProbeRequest, LocalProbeRequest,
     register_target_routes)
-
-
-class _LazyTestcaseCatalog:
-    """Defer legacy native testcase YAML scanning until a legacy planning endpoint is called."""
-
-    def __init__(self, root: Path = ROOT) -> None:
-        self._root = root
-        self._loaded: TestcaseCatalog | None = None
-
-    def _ensure(self) -> TestcaseCatalog:
-        if self._loaded is None:
-            self._loaded = TestcaseCatalog(self._root)
-        return self._loaded
-
-    @property
-    def items(self):
-        return self._ensure().items
-
-    @property
-    def paths(self):
-        return self._ensure().paths
-
-    @property
-    def invalid_records(self):
-        return self._ensure().invalid_records
-
-    def preview(self, selection, catalog, *, plan: bool = False):
-        return self._ensure().preview(selection, catalog, plan=plan)
 
 
 @dataclass(frozen=True)
@@ -87,10 +50,7 @@ class WorkflowApiContext:
     admin_lock: object
     dispatcher: object
     discovery: object
-    inventory: object
-    admission: object
     services: dict[str, object]
-    asi01_service: object
     imported_service: object
     dataset_repo: object
     asi03_contracts: object
@@ -101,15 +61,14 @@ class WorkflowApiContext:
     mcp_tool_catalogs: object
     mcp_agent_bindings: object
     mcp_action_service: object
-    lab_preparer: object
     fail: object
     operator_authorized: object
     generic_run_service: object | None = None
 
 
-def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=None,
-               dispatcher=None, lab_preparer=None, operator_secret=None,
-               local_single_user=False, batch_service: OfflineBatchWorkflow | Asi01BatchWorkflow | ResearchBotWebBatchWorkflow | ToolBotLabBatchWorkflow | GenericImportedBatchWorkflow | None = None,
+def create_app(catalog, *, port=8092, admission_policy=None,
+               dispatcher=None, operator_secret=None,
+               local_single_user=False, batch_service: GenericImportedBatchWorkflow | None = None,
                batch_services: dict[str, object] | None = None,
                discovery_transport=None, dataset_repository: DatasetRepository | None = None,
                evidence_policy=None, evidence_transport=None,
@@ -117,8 +76,7 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
                response_policy_dir: Path | None = None,
                generic_runs_dir: Path | None = None,
                generic_run_service: GenericRunService | None = None):
-    if lab_preparer is not None and dispatcher is None and (not isinstance(operator_secret,str) or len(operator_secret)<32):
-        raise ValueError('Lab preparation requires a separate operator secret.')
+    del admission_policy
     managed = isinstance(catalog, ManagedTargetCatalog)
     if local_single_user and (not managed or not catalog.local_single_user):
         raise ValueError('Local single-user mode requires the managed catalog.')
@@ -131,26 +89,18 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
         raise ValueError('Use one batch registration interface.')
     services = dict(batch_services or {})
     if batch_service is not None:
-        service_name = ('imported' if isinstance(batch_service, GenericImportedBatchWorkflow) else
-                        'asi01' if isinstance(batch_service, Asi01BatchWorkflow) else
-                        'web_lab' if isinstance(batch_service, ResearchBotWebBatchWorkflow) else
-                        'toolbot_lab' if isinstance(batch_service, ToolBotLabBatchWorkflow) else 'offline')
-        services[service_name] = batch_service
-    if any(name not in {'imported', 'asi01', 'web_lab', 'toolbot_lab', 'offline'} or
-           service.dispatcher is not dispatcher or dispatcher is None or
-           (isinstance(service, (Asi01BatchWorkflow, ResearchBotWebBatchWorkflow,
-                                 ToolBotLabBatchWorkflow, GenericImportedBatchWorkflow)) and
-            (not managed or not local_single_user)) for name, service in services.items()):
+        services['imported'] = batch_service
+    if any(name != 'imported' or not isinstance(service, GenericImportedBatchWorkflow)
+           or service.dispatcher is not dispatcher or dispatcher is None
+           or not managed or not local_single_user for name, service in services.items()):
         raise ValueError('Batch must use the reviewed controlled dispatcher and catalog.')
     imported_service = next((s for s in services.values() if isinstance(s, GenericImportedBatchWorkflow)), None)
-    asi01_service = next((s for s in services.values() if isinstance(s, Asi01BatchWorkflow)), None)
     if managed and dispatcher is None and (not isinstance(operator_secret, str) or len(operator_secret) < 32):
         raise ValueError('Target management requires a separate operator secret.')
     app = Flask(__name__, static_folder=None)
     app.config.update(MAX_CONTENT_LENGTH=5 * 1024 * 1024, DEBUG=False, PROPAGATE_EXCEPTIONS=False)
     nonce = secrets.token_urlsafe(32)
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
-    inventory = testcase_catalog if testcase_catalog is not None else _LazyTestcaseCatalog()
     if imported_service is not None:
         # Discovery and connection checks in this offline session also stay in-process.
         discovery_transport = imported_service.dispatcher.transport or imported_service.mock_live_transport
@@ -158,7 +108,6 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
     discovery = (DiscoveryEngine(catalog.data_dir, transport=discovery_transport,
                  evidence_providers=evidence_discovery_providers())
                  if managed else None)
-    admission = AdmissionService(catalog, admission_policy)
     from threading import RLock
     admin_lock = RLock()
     dataset_repo = dataset_repository if dataset_repository is not None else (
@@ -357,17 +306,8 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
                   "/api/testing/discoveries": "POST",
                   "/api/testing/discovery-probes": "POST",
                   "/api/testing/application-contexts/save": "POST",
-                  "/api/testing/execution-grants": "POST",
-                  "/api/testing/run-selected": "POST",
                   "/api/testing/batches/preview": "POST",
                   "/api/testing/batches": "POST",
-                  "/api/testing/categories": "GET", "/api/testing/testcases": "GET",
-                  "/api/testing/compatibility/preview": "POST", "/api/testing/plans/preview": "POST",
-                  "/api/testing/readiness/preview": "POST", "/api/testing/admissions": "POST",
-                  "/api/testing/runs": "POST",
-                  "/api/testing/lab-attempts/preview": "POST",
-                  "/api/testing/lab-attempts/prepare": "POST",
-                  "/api/testing/lab-attempts/preflight": "POST",
                   "/api/testing/datasets": "GET",
                   "/api/testing/datasets/validate": "POST",
                   "/api/testing/datasets/import": "POST"}
@@ -511,7 +451,7 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
             setup_reason = 'judge_configuration_missing'
         return jsonify(workflow_schema_version="1.0.0", status="ok",
                        mode="controlled_execution_enabled" if controlled else "offline_configuration_only",
-                       target_network_access=controlled and 'toolbot_lab' not in services
+                       target_network_access=controlled
                            and (not custom_imported or (imported_service.execution_mode != "offline_mock"
                                and imported_service.mock_live_transport is None)),
                        evaluation_modes=['rule_only','hybrid'] if hybrid_available else ['rule_only'],
@@ -519,12 +459,12 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
                        judge_setup_reason=setup_reason,
                        judge_status=j_stat,
                        mcp_action_setup_reason='configured' if mcp_action_service else 'catalog_missing',
-                       lab_preparation_enabled=lab_preparer is not None,
-                       offline_batch_enabled='offline' in services,
-                       asi01_batch_enabled=asi01_service is not None,
-                       asi01_text_targets=asi01_service.public_target_contracts() if asi01_service else [],
-                       web_lab_batch_enabled='web_lab' in services,
-                       toolbot_lab_batch_enabled='toolbot_lab' in services,
+                       lab_preparation_enabled=False,
+                       offline_batch_enabled=False,
+                       asi01_batch_enabled=False,
+                       asi01_text_targets=[],
+                       web_lab_batch_enabled=False,
+                       toolbot_lab_batch_enabled=False,
                        custom_imported_batch_enabled=custom_imported,
                        imported_live_local_enabled=custom_imported and imported_service.execution_mode in {"live_local_http", "both"},
                        imported_live_local_mocked=custom_imported and imported_service.mock_live_transport is not None,
@@ -551,10 +491,7 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
         admin_lock=admin_lock,
         dispatcher=dispatcher,
         discovery=discovery,
-        inventory=inventory,
-        admission=admission,
         services=services,
-        asi01_service=asi01_service,
         imported_service=imported_service,
         dataset_repo=dataset_repo,
         asi03_contracts=asi03_contracts,
@@ -565,7 +502,6 @@ def create_app(catalog, *, port=8092, testcase_catalog=None, admission_policy=No
         mcp_tool_catalogs=mcp_tool_catalogs,
         mcp_agent_bindings=mcp_agent_bindings,
         mcp_action_service=mcp_action_service,
-        lab_preparer=lab_preparer,
         fail=fail,
         operator_authorized=operator_authorized,
         generic_run_service=generic_run_service,
@@ -587,17 +523,11 @@ def main(argv=None):
     parser.add_argument("--port", type=int, default=8092)
     parser.add_argument('--admission-policy', help='Operator-owned execution grant JSON; default denies all')
     parser.add_argument('--enable-controlled-runs', action='store_true',
-                        help='Explicitly enable the bounded GH-C01 Runner slice')
-    parser.add_argument('--enable-asi01-controlled-batch', action='store_true',
-                        help='Opt into reviewed ResearchBot ASI01 text batch with baseline gate')
-    parser.add_argument('--enable-researchbot-web-lab-batch', action='store_true',
-                        help='Opt into one reviewed GH-WEB-001 assessment in the guarded Docker lab')
-    parser.add_argument('--enable-toolbot-lab-batch', action='store_true',
-                        help='Opt into offline synthetic ToolBot Lab TM-002 only; never contacts DVAA')
+                        help='Explicitly enable controlled runtime services and run-output storage')
     parser.add_argument('--enable-custom-imported-batch', action='store_true',
                         help='Opt into Generic Custom Imported Testcase batch (Offline Mock by default)')
     parser.add_argument('--enable-unified-runtime', action='store_true',
-                        help='Register reviewed ASI01 and imported chat workflows together; per-run gates remain mandatory')
+                        help='Register unified Generic Scan and imported/MCP-agent workflows; per-run gates remain mandatory')
     parser.add_argument('--enable-imported-live-local', action='store_true',
                         help='Allow explicit Live Local execution of imported prompts against reviewed loopback chat targets')
     parser.add_argument('--mcp-action-catalog',
@@ -606,21 +536,10 @@ def main(argv=None):
                         help='Exact operator-approved catalog hash required when a case claims reviewed action policy')
     parser.add_argument('--dvaa-mcp-receipt-root',
                         help='Optional instrumented DVAA lab receipt directory; never an independent effect')
-    parser.add_argument('--web-lab-state-dir', help='Operator-owned Web Lab state directory outside the repository')
-    parser.add_argument('--web-lab-dvaa-image', help='Reviewed immutable DVAA image ID')
-    parser.add_argument('--web-lab-fixture-image', help='Reviewed immutable fixture image ID')
-    parser.add_argument('--web-lab-proxy-image', help='Reviewed immutable proxy image ID')
-    parser.add_argument('--web-lab-guard-base-image', help='Reviewed guard base repository digest')
     parser.add_argument('--run-output-dir', help='Fresh results directory for controlled runs')
     parser.add_argument('--enable-web-hybrid-judge', action='store_true',
                         help='Explicitly enable server-owned hybrid evaluation for controlled runs')
     parser.add_argument('--web-hybrid-config', help='Operator-owned RunnerEvaluationConfig JSON for Pi Judge')
-    parser.add_argument('--enable-lab-preparation', action='store_true',
-                        help='Prepare fresh GH-WEB-001 fixtures only; never enables live web dispatch')
-    parser.add_argument('--lab-attempt-dir', help='Isolated results child for prepared lab attempts')
-    parser.add_argument('--lab-dvaa-image', help='Operator-reviewed immutable DVAA image ID')
-    parser.add_argument('--lab-python-image', help='Operator-reviewed Python repository digest')
-    parser.add_argument('--lab-proxy-image', help='Operator-reviewed proxy repository digest')
     parser.add_argument('--sync-credential-aliases', action='store_true',
                         help='Explicitly merge newly added credential aliases from --catalog into an existing managed target catalog (strictly additive)')
     args = parser.parse_args(argv)
@@ -629,7 +548,6 @@ def main(argv=None):
     try:
         policy=None
         if args.admission_policy:
-            from workflow.plans import safe_file
             path=Path(args.admission_policy).absolute()
             safe_file(path,path.parent)
             policy=AdmissionPolicy.model_validate(read_json(path.read_bytes()))
@@ -647,16 +565,13 @@ def main(argv=None):
             if not args.enable_controlled_runs or not args.web_hybrid_config:
                 raise ValueError('Web hybrid Judge requires controlled runs and explicit configuration.')
             path=Path(args.web_hybrid_config).absolute()
-            from workflow.plans import safe_file
             safe_file(path,path.parent)
             hybrid_config=RunnerEvaluationConfig.model_validate(read_json(path.read_bytes()))
             validate_live_pi_config(hybrid_config)
         elif args.web_hybrid_config:
             raise ValueError('Web hybrid configuration requires explicit opt-in.')
         dispatcher=None
-        if args.enable_unified_runtime and any((args.enable_asi01_controlled_batch,
-                args.enable_researchbot_web_lab_batch, args.enable_toolbot_lab_batch,
-                args.enable_custom_imported_batch)):
+        if args.enable_unified_runtime and args.enable_custom_imported_batch:
             raise ValueError('Unified runtime selects its own workflow registry.')
         if args.enable_imported_live_local and not (args.enable_custom_imported_batch or args.enable_unified_runtime):
             raise ValueError('Live Local requires the custom imported batch opt-in.')
@@ -668,9 +583,6 @@ def main(argv=None):
             if args.enable_custom_imported_batch and not args.enable_imported_live_local:
                 from workflow.generic_imported_batch import offline_chat_transport
                 mock_transport = offline_chat_transport()
-            elif args.enable_toolbot_lab_batch:
-                import httpx
-                mock_transport = httpx.MockTransport(lambda _: httpx.Response(403))
             else:
                 mock_transport = None
             dispatcher=ControlledDispatcher(catalog,policy,Path(args.run_output_dir),
@@ -679,16 +591,11 @@ def main(argv=None):
             raise ValueError('Output directory requires controlled-run opt-in.')
         batch_service=None
         batch_services=None
-        if sum((args.enable_asi01_controlled_batch, args.enable_researchbot_web_lab_batch,
-                args.enable_toolbot_lab_batch, args.enable_custom_imported_batch)) > 1:
-            raise ValueError('Batch modes are separate opt-ins.')
         if args.enable_unified_runtime:
             if (not args.enable_controlled_runs or dispatcher is None or not local_single_user
                     or not isinstance(catalog, ManagedTargetCatalog)):
                 raise ValueError('Unified runtime requires local managed controlled-run startup.')
             dataset_repo = DatasetRepository(catalog.data_dir)
-            # G12 Phase 1: unified production runtime registers dataset/imported workflows
-            # without eagerly loading legacy native ASI01 YAML testcases or payloads.
             batch_services = {
                 'imported': GenericImportedBatchWorkflow(dispatcher, dataset_repo,
                     execution_mode='both')}
@@ -700,42 +607,6 @@ def main(argv=None):
             dataset_repo = DatasetRepository(dataset_dir)
             batch_service = GenericImportedBatchWorkflow(dispatcher, dataset_repo,
                 execution_mode="both" if args.enable_imported_live_local else "offline_mock")
-        if args.enable_toolbot_lab_batch:
-            if (not args.enable_controlled_runs or dispatcher is None or not local_single_user
-                    or not isinstance(catalog, ManagedTargetCatalog)):
-                raise ValueError('ToolBot Lab requires local managed controlled-run startup.')
-            batch_service = ToolBotLabBatchWorkflow(dispatcher)
-        if args.enable_asi01_controlled_batch:
-            if (not args.enable_controlled_runs or dispatcher is None or not local_single_user
-                    or not isinstance(catalog, ManagedTargetCatalog)):
-                raise ValueError('ASI01 batch requires local managed controlled-run startup.')
-            batch_service=Asi01BatchWorkflow(dispatcher)
-        if args.enable_researchbot_web_lab_batch:
-            if (not args.enable_controlled_runs or dispatcher is None or not local_single_user
-                    or not isinstance(catalog, ManagedTargetCatalog)
-                    or not all((args.web_lab_state_dir, args.web_lab_dvaa_image,
-                                args.web_lab_fixture_image, args.web_lab_proxy_image,
-                                args.web_lab_guard_base_image))):
-                raise ValueError('Web Lab batch requires explicit local managed startup and reviewed images.')
-            web_runtime = DockerWebLabRuntime(Path(args.web_lab_state_dir),
-                dvaa_image=args.web_lab_dvaa_image,
-                fixture_image=args.web_lab_fixture_image,
-                proxy_image=args.web_lab_proxy_image,
-                guard_base_image=args.web_lab_guard_base_image)
-            web_runtime.verify_startup()  # No chat request; verifies the actual guarded lab.
-            batch_service=ResearchBotWebBatchWorkflow(dispatcher, web_runtime)
-        elif any((args.web_lab_state_dir, args.web_lab_dvaa_image,
-                  args.web_lab_fixture_image, args.web_lab_proxy_image,
-                  args.web_lab_guard_base_image)):
-            raise ValueError('Web Lab image and state options require explicit opt-in.')
-        lab_preparer=None
-        if args.enable_lab_preparation:
-            if not args.admission_policy or policy is None or not args.lab_attempt_dir or len(secret)<32:
-                raise ValueError('Lab preparation requires policy, output directory and operator secret.')
-            images=ReviewedImages(args.lab_dvaa_image or '',args.lab_python_image or '',args.lab_proxy_image or '')
-            lab_preparer=LabAttemptPreparer(catalog,policy,Path(args.lab_attempt_dir),reviewed_images=images)
-        elif any((args.lab_attempt_dir,args.lab_dvaa_image,args.lab_python_image,args.lab_proxy_image)):
-            raise ValueError('Lab preparation options require explicit opt-in.')
         evidence_policy = load_evidence_policy(Path(args.evidence_policy)) if args.evidence_policy else None
         mcp_action_service = None
         if args.mcp_action_catalog:
@@ -753,9 +624,9 @@ def main(argv=None):
             raise ValueError('Reviewed catalog pin requires an MCP action catalog.')
         if evidence_policy and not isinstance(catalog, ManagedTargetCatalog):
             raise ValueError('Evidence sources require managed target storage.')
-        app = create_app(catalog, port=args.port,admission_policy=policy,
-                         dispatcher=dispatcher,lab_preparer=lab_preparer,operator_secret=secret,
-                         local_single_user=local_single_user,batch_service=batch_service,
+        app = create_app(catalog, port=args.port, admission_policy=policy,
+                         dispatcher=dispatcher, operator_secret=secret,
+                         local_single_user=local_single_user, batch_service=batch_service,
                          batch_services=batch_services,
                          evidence_policy=evidence_policy,
                          mcp_action_service=mcp_action_service,

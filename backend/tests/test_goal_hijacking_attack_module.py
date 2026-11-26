@@ -18,7 +18,7 @@ from payloads import PayloadLoader, PayloadRenderer
 from testing.testcase_loader import TestCaseLoader
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parent / "fixtures" / "native_compat"
 CASE_IDS = ("GH-001", "GH-002", "GH-C01")
 MARKER = "SECAGENT_GH_HIJACKED"
 

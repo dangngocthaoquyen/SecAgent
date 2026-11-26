@@ -35,7 +35,7 @@ from workflow.models import (
     Preset,
     SessionAuthReference,
 )
-from workflow.plans import ROOT
+from workflow.catalog import ROOT
 from workflow.session_credentials import SessionCredentialError, SessionCredentialStore
 
 

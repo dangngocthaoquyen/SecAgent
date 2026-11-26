@@ -1,5 +1,7 @@
 """Runtime profiles through official payloads and production Runner, no network."""
+import importlib.util
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -7,9 +9,36 @@ import pytest
 from targets.runtime import RuntimeTargetError, build_runtime_target
 from targets.adapters import HttpTargetAdapter
 from testing import Executor, Runner, RunnerEvaluationConfig
+from testing.report_builder import build_test_input, run_native_report
 from tools.http import HttpClient, HttpClientError, HttpResponse
-from test_official_asi01_runner import native, path_for, TARGET, SUMMARY
 from test_runner_judge_integration import FakeJudge
+
+ROOT = Path(__file__).resolve().parents[2]
+NATIVE_COMPAT_ROOT = Path(__file__).resolve().parent / "fixtures" / "native_compat"
+TARGET = ROOT / "configs" / "targets" / "dvaa-securebot.yaml"
+SUMMARY = "SecAgent is a prototype AI agent security testing system."
+
+import testing.report_builder as _rep_builder
+
+_smoke_spec = importlib.util.spec_from_file_location(
+    "run_native_smoke_compat", ROOT / "backend" / "scripts" / "run_native_smoke.py"
+)
+native = importlib.util.module_from_spec(_smoke_spec)
+_smoke_spec.loader.exec_module(native)
+
+
+def _compat_build_test_input(testcase, target, *, repository_root=NATIVE_COMPAT_ROOT, **kwargs):
+    return build_test_input(testcase, target, repository_root=repository_root, **kwargs)
+
+
+def path_for(case_id: str) -> Path:
+    return NATIVE_COMPAT_ROOT / "testcases" / "goal_hijacking" / f"{case_id}.yaml"
+
+
+@pytest.fixture(autouse=True)
+def compat_native_root(monkeypatch):
+    monkeypatch.setattr(native, "REPOSITORY_ROOT", NATIVE_COMPAT_ROOT)
+    monkeypatch.setattr(native, "build_test_input", _compat_build_test_input)
 
 
 @pytest.fixture(autouse=True)
@@ -221,3 +250,21 @@ def test_missing_standard_response_path_is_execution_failure():
     result = HttpTargetAdapter(Transport()).execute(profile(), native.TestInput(id="x", prompt="public"))
     assert not result.success
     assert result.output_text is None
+
+
+def test_report_builder_global_state_is_not_mutated_and_order_independent(monkeypatch):
+    # Importing test_runtime_targets must not mutate testing.report_builder module globals.
+    assert not hasattr(_rep_builder, "ROOT")
+    assert _rep_builder.REPOSITORY_ROOT == ROOT
+
+    # Even if an unrelated test temporarily mutates report_builder attributes via monkeypatch,
+    # native_compat resolution remains order-independent and report_builder state is restored.
+    monkeypatch.setattr(_rep_builder, "ROOT", Path("/nonexistent-order-check"), raising=False)
+    assert getattr(_rep_builder, "ROOT") == Path("/nonexistent-order-check")
+    case = native.TestCaseLoader().load(path_for("GH-001"))
+    rendered = native.build_test_input(case, profile())
+    assert "SECAGENT_GH_HIJACKED" in rendered.prompt
+
+    monkeypatch.undo()
+    assert not hasattr(_rep_builder, "ROOT")
+    assert _rep_builder.REPOSITORY_ROOT == ROOT

@@ -18,6 +18,7 @@ from tools.http import HttpResponse
 
 
 ROOT = Path(__file__).resolve().parents[2]
+NATIVE_COMPAT_ROOT = Path(__file__).resolve().parent / "fixtures" / "native_compat"
 
 
 class RecordingToolFixture:
@@ -58,8 +59,8 @@ class RecordingToolFixture:
 def execute(tmp_path, *, write_effect=True, claim_success=True, mismatch=False,
             fail_action=False):
     execution_id = uuid4().hex
-    testcase = TestCaseLoader().load(ROOT / "testcases/tool_misuse/TM-002.yaml")
-    payload = PayloadLoader().load_repository(ROOT / "payload/tool_misuse.yaml")[
+    testcase = TestCaseLoader().load(NATIVE_COMPAT_ROOT / "testcases/tool_misuse/TM-002.yaml")
+    payload = PayloadLoader().load_repository(NATIVE_COMPAT_ROOT / "payload/tool_misuse.yaml")[
         testcase.payload_refs[0]]
     command = PayloadRenderer().render(payload, testcase.variables)
     target = load_target(ROOT / "configs/targets/dvaa-toolbot.yaml")
@@ -133,7 +134,7 @@ def test_missing_effect_cannot_be_verified(tmp_path):
 
 
 def test_native_tm001_requires_an_agent_run_scope_for_pass_or_verified_call_for_fail():
-    testcase = TestCaseLoader().load(ROOT / "testcases/tool_misuse/TM-001.yaml")
+    testcase = TestCaseLoader().load(NATIVE_COMPAT_ROOT / "testcases/tool_misuse/TM-001.yaml")
     response = "Confirmation is required."
     def evaluate(evidence):
         return ResponseEvaluator().evaluate(testcase, Observation(response_text=response,
@@ -155,7 +156,7 @@ def test_native_tm001_requires_an_agent_run_scope_for_pass_or_verified_call_for_
 
 def test_synthetic_tm002_native_report_keeps_claim_and_verified_effect_distinct(tmp_path):
     verdict, runner_report, _, _ = execute(tmp_path)
-    testcase = TestCaseLoader().load(ROOT / "testcases/tool_misuse/TM-002.yaml")
+    testcase = TestCaseLoader().load(NATIVE_COMPAT_ROOT / "testcases/tool_misuse/TM-002.yaml")
     target = load_target(ROOT / "configs/targets/dvaa-toolbot.yaml")
     summary = build_summary(testcase, target, verdict, None, datetime.now(timezone.utc))
     summary["evaluation"] = runner_report

@@ -23,6 +23,7 @@ from workflow.response_policies import ResponsePolicyStore
 
 
 ROOT = Path(__file__).resolve().parents[2]
+NATIVE_COMPAT_ROOT = Path(__file__).resolve().parent / "fixtures" / "native_compat"
 
 
 # ---------------------------------------------------------------------------
@@ -258,8 +259,9 @@ def test_live_cli_gh001_sends_rendered_gh_p001_payload_not_objective(tmp_path: P
 
     rc = generic_runner_main([
         "--mode", "live",
-        "--testcase", str(ROOT / "testcases" / "goal_hijacking" / "GH-001.yaml"),
+        "--testcase", str(NATIVE_COMPAT_ROOT / "testcases" / "goal_hijacking" / "GH-001.yaml"),
         "--target", str(ROOT / "configs" / "targets" / "dvaa-securebot.yaml"),
+        "--repository-root", str(NATIVE_COMPAT_ROOT),
         "--output-dir", str(tmp_path / "out-gh"),
     ])
     assert rc == 0
@@ -306,8 +308,9 @@ def test_live_cli_direct_mcp_builds_structured_tool_call_and_hashes_it(tmp_path:
     )
     rc = generic_runner_main([
         "--mode", "live",
-        "--testcase", str(ROOT / "testcases" / "tool_misuse" / "TM-002.yaml"),
+        "--testcase", str(NATIVE_COMPAT_ROOT / "testcases" / "tool_misuse" / "TM-002.yaml"),
         "--target", str(mcp_target),
+        "--repository-root", str(NATIVE_COMPAT_ROOT),
         "--output-dir", str(tmp_path / "out-mcp"),
     ])
     assert rc == 0
@@ -330,8 +333,9 @@ def test_live_cli_asi03_and_asi05_missing_environment_fails_preflight_before_tar
     with pytest.raises(ValueError, match="authorization baseline"):
         generic_runner_main([
             "--mode", "live",
-            "--testcase", str(ROOT / "testcases" / "identity_privilege_abuse" / "IPA-001.yaml"),
+            "--testcase", str(NATIVE_COMPAT_ROOT / "testcases" / "identity_privilege_abuse" / "IPA-001.yaml"),
             "--target", str(ROOT / "configs" / "targets" / "dvaa-securebot.yaml"),
+            "--repository-root", str(NATIVE_COMPAT_ROOT),
             "--output-dir", str(tmp_path / "out-ipa-blocked"),
         ])
 
@@ -339,8 +343,9 @@ def test_live_cli_asi03_and_asi05_missing_environment_fails_preflight_before_tar
     with pytest.raises(ValueError, match="Verified sandbox"):
         generic_runner_main([
             "--mode", "live",
-            "--testcase", str(ROOT / "testcases" / "unexpected_code_execution" / "UCE-001.yaml"),
+            "--testcase", str(NATIVE_COMPAT_ROOT / "testcases" / "unexpected_code_execution" / "UCE-001.yaml"),
             "--target", str(ROOT / "configs" / "targets" / "dvaa-securebot.yaml"),
+            "--repository-root", str(NATIVE_COMPAT_ROOT),
             "--output-dir", str(tmp_path / "out-uce-blocked"),
         ])
 
@@ -398,8 +403,9 @@ def test_live_cli_response_only_and_asi05_env_context_work_as_expected(tmp_path:
 
     rc_resp = generic_runner_main([
         "--mode", "live",
-        "--testcase", str(ROOT / "testcases" / "unexpected_code_execution" / "UCE-001.yaml"),
+        "--testcase", str(NATIVE_COMPAT_ROOT / "testcases" / "unexpected_code_execution" / "UCE-001.yaml"),
         "--target", str(ROOT / "configs" / "targets" / "dvaa-securebot.yaml"),
+        "--repository-root", str(NATIVE_COMPAT_ROOT),
         "--policy-dir", str(pdir),
         "--policy-id", pol.policy_id,
         "--output-dir", str(tmp_path / "out-resp-only"),
@@ -416,7 +422,7 @@ def test_live_cli_response_only_and_asi05_env_context_work_as_expected(tmp_path:
         "sandbox_reference": "local-isolated-sb",
         "canary_command_allowlist": ["echo SECAGENT_UCE_CANARY"],
     }), encoding="utf-8")
-    tc = TestCaseLoader().load(ROOT / "testcases" / "unexpected_code_execution" / "UCE-001.yaml")
+    tc = TestCaseLoader().load(NATIVE_COMPAT_ROOT / "testcases" / "unexpected_code_execution" / "UCE-001.yaml")
     target = TargetProfile.model_validate({
         "id": "sb-target",
         "name": "SB Target",
@@ -427,7 +433,7 @@ def test_live_cli_response_only_and_asi05_env_context_work_as_expected(tmp_path:
         tc,
         target,
         environment=json.loads(env_file.read_text()),
-        repository_root=ROOT,
+        repository_root=NATIVE_COMPAT_ROOT,
     )
     assert built_ti.environment["sandbox_id"] == "sb-demo-1"
     assert built_ti.payload_ref == "UCE-P001"

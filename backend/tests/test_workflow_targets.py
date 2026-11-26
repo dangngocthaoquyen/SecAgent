@@ -208,7 +208,8 @@ def test_post_nonce_origin_json_and_unsupported_routes():
     assert post(c,d,{'Origin':h['Origin']}).status_code==403
     assert post(c,d,{**h,'X-SecAgent-Validation':'x'*43}).status_code==403
     assert c.post('/api/testing/target-drafts/validate',base_url=h['Origin'],data='{}',headers=h).status_code==415
-    assert c.post('/api/testing/runs',base_url=h['Origin'],json={},headers=h).status_code==403
+    assert c.post('/api/testing/runs',base_url=h['Origin'],json={},headers=h).status_code==404
+    assert c.post('/api/testing/batches/preview',base_url=h['Origin'],json={},headers=h).status_code==403
     assert c.post('/api/testing/private',base_url=h['Origin'],json={},headers=h).status_code==404
     r=c.get('/api/testing/targets',base_url=h['Origin'])
     assert 'Access-Control-Allow-Origin' not in r.headers

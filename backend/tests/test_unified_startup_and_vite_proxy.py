@@ -128,10 +128,13 @@ def test_launcher_unified_defaults_credential_missing_and_legacy_compat(tmp_path
     # 2. Explicit CLI --judge-config without key fails closed instead of starting degraded.
     assert launcher.main(["--no-browser", "--judge-config", str(judge_cfg)]) == 2
 
-    # 3. Legacy flag compatibility disables unified flag and passes legacy flag cleanly.
-    leg_cmd, _ = capture(["--no-browser", "--enable-asi01-batch"])
-    assert "--enable-asi01-controlled-batch" in leg_cmd
+    # 3. Custom imported batch flag disables unified flag and passes custom imported flag cleanly.
+    leg_cmd, _ = capture(["--no-browser", "--enable-custom-imported-batch"])
+    assert "--enable-custom-imported-batch" in leg_cmd
     assert "--enable-unified-runtime" not in leg_cmd
+    with pytest.raises(SystemExit) as retired_exc:
+        launcher.main(["--no-browser", "--enable-asi01-batch"])
+    assert retired_exc.value.code == 2
 
 
 def test_launcher_agent_bridge_is_optional_and_credential_isolated(tmp_path, monkeypatch):
@@ -283,7 +286,6 @@ def test_unified_app_switches_http_and_mcp_without_restart(tmp_path, monkeypatch
     )
     repo = DatasetRepository(tmp_path / "operator")
     from workflow.dataset_normalizer import normalize_dataset
-    from workflow.asi01_batch import Asi01BatchWorkflow
     from workflow.generic_imported_batch import GenericImportedBatchWorkflow
 
     env = normalize_dataset(json.dumps([{"id": "U-1", "prompt": "List files"}]).encode(), "u.json")
@@ -295,19 +297,18 @@ def test_unified_app_switches_http_and_mcp_without_restart(tmp_path, monkeypatch
         })))
     app = create_app(
         catalog, dispatcher=dispatcher, operator_secret="s" * 32, local_single_user=True,
-        batch_services={"asi01": Asi01BatchWorkflow(dispatcher),
-                        "imported": GenericImportedBatchWorkflow(dispatcher, repo, execution_mode="both")},
+        batch_services={"imported": GenericImportedBatchWorkflow(dispatcher, repo, execution_mode="both")},
         dataset_repository=repo, mcp_action_service=mcp_svc,
     )
     client = app.test_client()
     base = "http://127.0.0.1:8092"
     health = client.get("/api/testing/health", base_url=base).get_json()
-    assert health["registered_workflows"] == ["asi01", "imported", "mcp_actions"]
+    assert health["registered_workflows"] == ["imported", "mcp_actions"]
     assert health["evaluation_modes"] == ["rule_only"]
     assert health["judge_setup_reason"] == "credential_missing"
     headers = {"Origin": base, "X-SecAgent-Validation": health["validation_nonce"], "X-SecAgent-Operator": "s" * 32}
 
-    # Same session previews imported chat -> blocked for MCP target -> OK for ASI01 -> lists MCP actions.
+    # Same session previews imported chat -> blocked for MCP target -> lists MCP actions.
     http_draft = {k: http_row[k] for k in ("profile_revision", "policy_ref", "endpoint", "protocol",
         "method", "request_mapping", "response_parser", "credential_alias")} | {"target_id": http_row["id"], "model": "researchbot", "timeout_seconds": 5}
     mcp_draft = {k: mcp_row[k] for k in ("profile_revision", "policy_ref", "endpoint", "protocol",
@@ -327,12 +328,7 @@ def test_unified_app_switches_http_and_mcp_without_restart(tmp_path, monkeypatch
     assert r2.status_code == 200 and r2.get_json()["ready_count"] == 0
     assert r2.get_json()["items"][0]["reason"] == "imported_target_protocol_mismatch"
 
-    # Switch to ASI01 and MCP without restart.
-    r3 = client.post("/api/testing/batches/preview", base_url=base, headers=headers, json={
-        "workflow_id": "asi01", "target": http_draft, "testcase_ids": ["GH-C01"],
-        "total_request_budget": 1, "evaluation_mode": "rule_only",
-    })
-    assert r3.status_code == 200 and r3.get_json()["ready_count"] == 1
+    # Switch to MCP actions without restart.
     r4 = client.get("/api/testing/mcp-actions", base_url=base, headers=headers)
     assert r4.status_code == 200 and r4.get_json()["cases"][0]["testcase_id"] == "ASI05-DVAA-LAB-READ-001"
 

@@ -18,7 +18,7 @@ from observers import ResponseObserver
 from testing.testcase_loader import TestCaseLoader
 
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+REPOSITORY_ROOT = Path(__file__).resolve().parent / "fixtures" / "native_compat"
 CASE_IDS = ("SD-001", "SD-002", "SD-C01")
 CANARY = "SECAGENT_CANARY_SD_9F2A"
 REFUSAL = "I cannot disclose confidential data."

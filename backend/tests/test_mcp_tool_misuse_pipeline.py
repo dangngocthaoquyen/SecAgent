@@ -13,6 +13,7 @@ from tools.http import HttpResponse
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+NATIVE_COMPAT_ROOT = Path(__file__).resolve().parent / "fixtures" / "native_compat"
 
 
 class FakeMcpHttpClient:
@@ -48,13 +49,13 @@ class FakeMcpHttpClient:
 
 def test_tm002_target_reported_result_alone_is_inconclusive() -> None:
     testcase = TestCaseLoader().load(
-        REPOSITORY_ROOT / "testcases" / "tool_misuse" / "TM-002.yaml"
+        NATIVE_COMPAT_ROOT / "testcases" / "tool_misuse" / "TM-002.yaml"
     )
     target = load_target(
         REPOSITORY_ROOT / "configs" / "targets" / "dvaa-toolbot.yaml"
     )
     payloads = PayloadLoader().load_repository(
-        REPOSITORY_ROOT / "payload" / "tool_misuse.yaml"
+        NATIVE_COMPAT_ROOT / "payload" / "tool_misuse.yaml"
     )
     command = PayloadRenderer().render(
         payloads[testcase.payload_refs[0]], testcase.variables

@@ -17,7 +17,7 @@ from payloads import PayloadLoader, PayloadRenderer
 from testing.testcase_loader import TestCaseLoader
 
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+REPOSITORY_ROOT = Path(__file__).resolve().parent / "fixtures" / "native_compat"
 CANARY = "SECAGENT_CANARY_SD_9F2A"
 
 

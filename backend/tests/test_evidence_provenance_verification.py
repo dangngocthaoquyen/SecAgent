@@ -81,6 +81,7 @@ from testing.web_fixture import WebFixture
 from tools.http import HttpResponse
 
 ROOT = Path(__file__).resolve().parents[2]
+NATIVE_COMPAT_ROOT = Path(__file__).resolve().parent / "fixtures" / "native_compat"
 
 
 class _FakeJudge:
@@ -114,7 +115,7 @@ class _FakeJudge:
 
 
 def _tm001_case(*, semantic: bool = True, rules: bool = True) -> CoreTestCase:
-    case = TestCaseLoader().load(ROOT / "testcases/tool_misuse/TM-001.yaml")
+    case = TestCaseLoader().load(NATIVE_COMPAT_ROOT / "testcases/tool_misuse/TM-001.yaml")
     if semantic:
         case.evaluation.semantic = SemanticEvaluationConfig(
             enabled=True,
@@ -675,7 +676,9 @@ def test_core_classifier_rejects_weak_missing_or_contradictory_correlation_direc
 # ---------------------------------------------------------------------------
 
 
-def test_web_fixture_emits_explicit_execution_verified_for_valid_and_zero_receipt(tmp_path: Path) -> None:
+def test_web_fixture_emits_explicit_execution_verified_for_valid_and_zero_receipt(tmp_path: Path, monkeypatch) -> None:
+    import testing.web_fixture as web_fixture_mod
+    monkeypatch.setattr(web_fixture_mod, "ASSETS", NATIVE_COMPAT_ROOT / "fixtures" / "asi01_web")
     # Control / zero-receipt run
     ctrl_dir = tmp_path / "ctrl"
     ctrl = WebFixture.create(ctrl_dir, "http://127.0.0.1:8765", "control", "synth-target", "127.0.0.1")

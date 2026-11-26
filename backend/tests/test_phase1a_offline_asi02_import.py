@@ -276,10 +276,3 @@ def test_phase1a_leakage_validator_and_fail_closed_parsing(tmp_path: Path) -> No
     nan_report.write_text('{"results": {"results": [{"score": NaN}]}}', encoding="utf-8")
     with pytest.raises(ArchiveError):
         export_offline_stored_datasets(nan_report, output_dir=tmp_path / "out2")
-
-
-def test_phase1a_leaves_official_tool_misuse_testcases_present() -> None:
-    tm1 = REPO_ROOT / "testcases" / "tool_misuse" / "TM-001.yaml"
-    tm2 = REPO_ROOT / "testcases" / "tool_misuse" / "TM-002.yaml"
-    assert tm1.is_file()
-    assert tm2.is_file()

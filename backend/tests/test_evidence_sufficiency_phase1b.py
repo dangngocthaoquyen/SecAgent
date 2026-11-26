@@ -17,6 +17,7 @@ from testing import TestCaseLoader
 
 
 ROOT = Path(__file__).resolve().parents[2]
+NATIVE_COMPAT_ROOT = Path(__file__).resolve().parent / "fixtures" / "native_compat"
 
 
 class FakeJudge:
@@ -38,7 +39,7 @@ class FakeJudge:
 
 
 def tool_case(*, semantic=False, rules=True):
-    case = TestCaseLoader().load(ROOT / "testcases/tool_misuse/TM-001.yaml")
+    case = TestCaseLoader().load(NATIVE_COMPAT_ROOT / "testcases/tool_misuse/TM-001.yaml")
     if semantic:
         case.evaluation.semantic = SemanticEvaluationConfig(enabled=True, skill="tool_misuse",
             trusted_context={"required_trace_scope": "agent_run",
@@ -81,7 +82,7 @@ def test_b_target_reported_success_is_not_verified_action():
 
 
 def test_c_verified_synthetic_handler_is_only_a_direct_handler_effect():
-    case = TestCaseLoader().load(ROOT / "testcases/tool_misuse/TM-002.yaml")
+    case = TestCaseLoader().load(NATIVE_COMPAT_ROOT / "testcases/tool_misuse/TM-002.yaml")
     correlation = "sha256:" + "1" * 64
     arguments_hash = "2" * 64
     request = Evidence(kind="tool_request", source="mcp_jsonrpc_adapter", name="execute",
@@ -101,7 +102,7 @@ def test_c_verified_synthetic_handler_is_only_a_direct_handler_effect():
 
 
 def test_c_wrong_direct_request_correlation_cannot_create_deterministic_fail():
-    case = TestCaseLoader().load(ROOT / "testcases/tool_misuse/TM-002.yaml")
+    case = TestCaseLoader().load(NATIVE_COMPAT_ROOT / "testcases/tool_misuse/TM-002.yaml")
     request = Evidence(kind="tool_request", source="mcp_jsonrpc_adapter", name="execute",
         data={"provenance": "secagent_request", "correlation_reference": "sha256:" + "1" * 64,
               "arguments_sha256": "2" * 64})
@@ -187,7 +188,7 @@ def test_verified_action_with_matching_runtime_citation_can_support_semantic_fai
 
 
 def web_case():
-    return TestCaseLoader().load(ROOT / "testcases/goal_hijacking/GH-WEB-C01.yaml")
+    return TestCaseLoader().load(NATIVE_COMPAT_ROOT / "testcases/goal_hijacking/GH-WEB-C01.yaml")
 
 
 def web_evidence(*, provenance="independent_observer", verified=True,

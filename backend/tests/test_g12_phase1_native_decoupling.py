@@ -48,12 +48,11 @@ BASE = "http://127.0.0.1:8092"
 SECRET = "g12-phase1-decoupling-secret-" + "x" * 32
 
 
-def test_create_app_does_not_eagerly_scan_native_testcase_catalog(tmp_path, monkeypatch):
-    """Startup must not instantiate TestcaseCatalog or read testcases/payload YAML directories."""
-    def fail_if_called(*_args, **_kwargs):
-        raise AssertionError("TestcaseCatalog must not be eagerly loaded during create_app() startup.")
-
-    monkeypatch.setattr(workflow_api, "TestcaseCatalog", fail_if_called)
+def test_create_app_does_not_eagerly_scan_native_testcase_catalog(tmp_path):
+    """Startup has no TestcaseCatalog and does not require testcases/payload YAML directories."""
+    assert not hasattr(workflow_api, "TestcaseCatalog")
+    assert not (ROOT / "testcases").exists()
+    assert not (ROOT / "payload").exists()
 
     catalog = ManagedTargetCatalog(
         CatalogConfig(catalog_schema_version="1.0.0", policy_ref="g12-p1", targets=[]),
@@ -80,23 +79,10 @@ def test_unified_runtime_cli_starts_without_native_testcases_or_payloads(tmp_pat
     empty_repo.mkdir()
     assert not (empty_repo / "testcases").exists()
     assert not (empty_repo / "payload").exists()
-
-    import workflow.plans as plans_mod
-    import workflow.asi01_batch as asi01_mod
+    assert not hasattr(workflow_api, "TestcaseCatalog")
+    assert not hasattr(workflow_api, "Asi01BatchWorkflow")
 
     monkeypatch.setattr(workflow_api, "ROOT", empty_repo)
-    monkeypatch.setattr(plans_mod, "ROOT", empty_repo)
-    monkeypatch.setattr(asi01_mod, "ROOT", empty_repo)
-    monkeypatch.setattr(
-        workflow_api,
-        "TestcaseCatalog",
-        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("Native catalog scanned during unified startup")),
-    )
-    class _ForbiddenAsi01BatchWorkflow:
-        def __init__(self, *_a, **_k):
-            raise AssertionError("Legacy ASI01 batch constructed during unified startup")
-
-    monkeypatch.setattr(workflow_api, "Asi01BatchWorkflow", _ForbiddenAsi01BatchWorkflow)
 
     catalog_file = tmp_path / "catalog.json"
     catalog_file.write_text(
@@ -219,11 +205,7 @@ def test_generic_scan_import_and_execute_without_rules_or_native_assets(tmp_path
     empty_repo = tmp_path / "empty-native-root"
     empty_repo.mkdir()
     monkeypatch.setattr(workflow_api, "ROOT", empty_repo)
-    monkeypatch.setattr(
-        workflow_api,
-        "TestcaseCatalog",
-        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("Native catalog must not load during Generic Scan")),
-    )
+    assert not hasattr(workflow_api, "TestcaseCatalog")
 
     catalog = ManagedTargetCatalog(
         CatalogConfig(catalog_schema_version="1.0.0", policy_ref="g12-p1-e2e", targets=[]),
@@ -623,11 +605,7 @@ def test_generic_live_http_scan_executes_via_mock_transport_without_native_asset
     assert not (empty_repo / "payload").exists()
 
     monkeypatch.setattr(workflow_api, "ROOT", empty_repo)
-    monkeypatch.setattr(
-        workflow_api,
-        "TestcaseCatalog",
-        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("Native TestcaseCatalog must not load during Live Generic Scan")),
-    )
+    assert not hasattr(workflow_api, "TestcaseCatalog")
     monkeypatch.setattr(
         tc_loader.TestCaseLoader,
         "load",

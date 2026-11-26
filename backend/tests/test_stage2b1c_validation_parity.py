@@ -9,9 +9,8 @@ import httpx
 from pydantic import ValidationError
 import pytest
 
-from workflow.admission import AdmissionPolicy, AdmissionRequest
+from workflow.admission import AdmissionPolicy
 from workflow.api import create_app
-from workflow.asi01_batch import Asi01BatchSelection, Asi01BatchStart
 from workflow.dataset_normalizer import normalize_dataset
 from workflow.dataset_repository import DatasetRepository
 from workflow.dispatch import ControlledDispatcher
@@ -22,8 +21,6 @@ from workflow.generic_imported_batch import (
 )
 from workflow.management import ManagedProfile, ManagedTargetCatalog, ReviewProfile, SaveProfile
 from workflow.models import CatalogConfig
-from workflow.offline_batch import OfflineBatchSelection, OfflineBatchStart
-from workflow.plans import PlanSelection
 
 
 def _valid_target_draft() -> dict:
@@ -64,10 +61,6 @@ def _start_payload(**overrides) -> dict:
 
 
 BATCH_MODELS = [
-    ("OfflineBatchSelection", OfflineBatchSelection, _selection_payload, frozenset({"rule_only"}), "Invalid offline batch selection."),
-    ("OfflineBatchStart", OfflineBatchStart, _start_payload, frozenset({"rule_only"}), "Invalid offline batch selection."),
-    ("Asi01BatchSelection", Asi01BatchSelection, _selection_payload, frozenset({"rule_only", "hybrid"}), "Invalid ASI01 batch selection."),
-    ("Asi01BatchStart", Asi01BatchStart, _start_payload, frozenset({"rule_only", "hybrid"}), "Invalid ASI01 batch selection."),
     ("ImportedBatchSelection", ImportedBatchSelection, _selection_payload, frozenset({"rule_only", "hybrid"}), "Invalid imported batch selection."),
     ("ImportedBatchStart", ImportedBatchStart, _start_payload, frozenset({"rule_only", "hybrid"}), "Invalid imported batch selection."),
 ]
@@ -178,7 +171,7 @@ def test_start_models_confirmation_and_validator_order(
     assert "Explicit execution confirmation required." not in both.value.errors()[0]["msg"]
 
 
-def test_imported_models_preserve_asi_category_and_plan_selection_differs() -> None:
+def test_imported_models_preserve_asi_category() -> None:
     for cat in ("unclassified", "ASI03", "ASI05"):
         sel = ImportedBatchSelection.model_validate(_selection_payload(asi_category=cat))
         start = ImportedBatchStart.model_validate(_start_payload(asi_category=cat))
@@ -187,22 +180,6 @@ def test_imported_models_preserve_asi_category_and_plan_selection_differs() -> N
 
     with pytest.raises(ValidationError):
         ImportedBatchSelection.model_validate(_selection_payload(asi_category="ASI01"))
-
-    # Offline/Asi01 selection must NOT accept asi_category.
-    with pytest.raises(ValidationError):
-        OfflineBatchSelection.model_validate(_selection_payload(asi_category="ASI03"))
-    with pytest.raises(ValidationError):
-        Asi01BatchSelection.model_validate(_selection_payload(asi_category="ASI03"))
-
-    # PlanSelection and AdmissionRequest remain intentionally specialized (empty testcase_ids permitted).
-    plan_sel = PlanSelection.model_validate(
-        {"target": _valid_target_draft(), "asi_categories": ["ASI01"], "testcase_ids": []}
-    )
-    assert plan_sel.testcase_ids == []
-    adm_req = AdmissionRequest.model_validate(
-        {"target": _valid_target_draft(), "asi_categories": ["ASI01"], "testcase_ids": [], "evaluation_mode": "hybrid"}
-    )
-    assert adm_req.evaluation_mode == "hybrid"
 
 
 def test_workflow_source_has_no_duplicate_dict_keys_and_runtime_snapshot_model_intact(

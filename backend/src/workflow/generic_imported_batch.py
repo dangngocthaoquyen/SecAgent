@@ -19,16 +19,14 @@ from pydantic import Field, model_validator
 from testing.report_builder import RecordingExecutor, build_summary
 from attack_modules.registry import AttackModuleRegistry
 from attack_modules.direct_chat import DirectChatDelivery
-from attack_modules.goal_hijacking import GoalHijackingAttackModule
 from core.models import EvaluationConfig, TargetProfile, TestCase, TestInput
 from observers import McpAgentExecutionObserver
 from targets.adapters import HttpTargetAdapter, McpAgentRuntimeTargetAdapter
 from targets.runtimes import HttpLlmChatClient, HttpMcpToolClient, McpAgentRuntime
 from testing import Executor, Runner, RunnerEvaluationConfig
 from workflow.admission import ExecutionGrant
-from workflow.asi01_batch import TEXT_CASES, load_text_binding
 from workflow.batch import BatchCase, BatchOrchestrator, BatchPlan, BatchRejected, CaseResult, launch_batch_worker, persist_batch_case_report, write_exclusive_json
-from workflow.catalog import make_profile
+from workflow.catalog import ROOT, make_profile
 from workflow.dataset_models import DatasetEnvelope, ImportedTestcase
 from workflow.dataset_repository import DatasetRepository
 from workflow.asi03_contracts import ASI03ContractStore, ASI03TargetPolicyStore
@@ -40,10 +38,12 @@ from workflow.mcp_agent_runtime_binding import (
     McpAgentRuntimeBindingStore,
     WorkflowAgentExecutionGuard,
 )
-from workflow.models import TargetDraft
-from workflow.offline_batch import OfflineBatchSelection, OfflineBatchStart, _digest
-from workflow.plans import ROOT
+from workflow.models import ClosedModel, Identifier, TargetDraft
 from tools.http import HttpClientError
+
+
+def _digest(value) -> str:
+    return sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
 
 def offline_chat_transport() -> httpx.MockTransport:
@@ -61,31 +61,38 @@ def _validate_imported_execution_path(item) -> None:
         raise ValueError("MCP Agent execution path requires a reviewed MCP target.")
 
 
-class ImportedBatchSelection(OfflineBatchSelection):
+class ImportedBatchSelection(ClosedModel):
     _allowed_evaluation_modes: ClassVar[frozenset[str]] = frozenset({"rule_only", "hybrid"})
     _selection_error_message: ClassVar[str] = "Invalid imported batch selection."
+
+    target: TargetDraft
+    testcase_ids: list[Identifier] = Field(min_length=1, max_length=100)
+    total_request_budget: int = Field(ge=0, le=700)
+    evaluation_mode: str = "rule_only"
+    dataset_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
+    transport_mode: Literal["offline_mock", "live_local_http"] | None = None
     asi_category: Literal["unclassified", "ASI03", "ASI05"] = "unclassified"
     execution_path: Literal["direct_chat", "mcp_agent_runtime"] = "direct_chat"
     mcp_target: TargetDraft | None = None
-    total_request_budget: int = Field(ge=0, le=700)
 
     @model_validator(mode="after")
-    def check_execution_path(self):
+    def unique_and_valid(self):
+        if (len(set(self.testcase_ids)) != len(self.testcase_ids)
+                or self.evaluation_mode not in self._allowed_evaluation_modes):
+            raise ValueError(self._selection_error_message)
         _validate_imported_execution_path(self)
         return self
 
 
-class ImportedBatchStart(OfflineBatchStart):
-    _allowed_evaluation_modes: ClassVar[frozenset[str]] = frozenset({"rule_only", "hybrid"})
-    _selection_error_message: ClassVar[str] = "Invalid imported batch selection."
-    asi_category: Literal["unclassified", "ASI03", "ASI05"] = "unclassified"
-    execution_path: Literal["direct_chat", "mcp_agent_runtime"] = "direct_chat"
-    mcp_target: TargetDraft | None = None
-    total_request_budget: int = Field(ge=0, le=700)
+class ImportedBatchStart(ImportedBatchSelection):
+    expected_plan_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    submission_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    authorization_confirmed: bool
 
     @model_validator(mode="after")
-    def check_execution_path(self):
-        _validate_imported_execution_path(self)
+    def confirmed(self):
+        if self.authorization_confirmed is not True:
+            raise ValueError("Explicit execution confirmation required.")
         return self
 
 
@@ -198,7 +205,7 @@ class GenericImportedBatchWorkflow:
                  mock_live_transport: httpx.MockTransport | None = None,
                  mock_mcp_transport: httpx.MockTransport | None = None,
                  mcp_agent_receipt_collector_factory=None):
-        if (not isinstance(dispatcher, ControlledDispatcher) or dispatcher.fixture_runtime is not None
+        if (not isinstance(dispatcher, ControlledDispatcher)
                 or execution_mode not in {"offline_mock", "live_local_http", "both"}
                 or (execution_mode == "offline_mock" and type(dispatcher.transport) is not httpx.MockTransport)
                 or (execution_mode in {"live_local_http", "both"} and dispatcher.transport is not None)
@@ -272,11 +279,6 @@ class GenericImportedBatchWorkflow:
 
         self._expected_binding = self._binding_contract()
         self._expected_agent_binding = self._binding_contract("GENERIC-MCP-AGENT")
-        # Only byte-identical rendered inputs from pinned native ASI01 assets
-        # inherit their reviewed goals and rule contracts. Uploaded assertions
-        # and taxonomy fields never select an evaluator.
-        self._native_inputs = {binding.test_input.prompt: binding
-            for binding in (load_text_binding(identity, self.repository_root) for identity in TEXT_CASES)}
         with self.dispatcher._lock:
             self._prune_grants()
 
@@ -420,7 +422,7 @@ class GenericImportedBatchWorkflow:
             "grants": [g for g in self.dispatcher.policy.grants if g.authorization_id not in retired]})
         self._owned_grants.difference_update(retired)
 
-    def _grant(self, selection: OfflineBatchSelection, case_id: str, asset: str) -> ExecutionGrant | None:
+    def _grant(self, selection: ImportedBatchSelection, case_id: str, asset: str) -> ExecutionGrant | None:
         now = datetime.now(timezone.utc)
         for grant in self.dispatcher.policy.grants:
             if (grant.authorization_id in self._owned_grants and grant.target_id == selection.target.target_id
@@ -443,21 +445,10 @@ class GenericImportedBatchWorkflow:
             raise BatchRejected("testcase_not_in_library")
         return ds, case
 
-    def _native_match(self, case: ImportedTestcase):
-        binding = self._native_inputs.get(case.prompt)
-        if binding is None:
-            return None
-        fresh = load_text_binding(binding.testcase.id, self.repository_root)
-        if (fresh.asset_sha256 != binding.asset_sha256 or
-                fresh.input_sha256 != binding.input_sha256 or
-                fresh.test_input.prompt != case.prompt):
-            return None
-        return fresh
-
-    def _transport_mode(self, selection: OfflineBatchSelection) -> str:
+    def _transport_mode(self, selection: ImportedBatchSelection) -> str:
         return selection.transport_mode or ("live_local_http" if self.execution_mode == "live_local_http" else "offline_mock")
 
-    def _target_error(self, selection: OfflineBatchSelection, *, active_batch: bool = False) -> str | None:
+    def _target_error(self, selection: ImportedBatchSelection, *, active_batch: bool = False) -> str | None:
         is_agent = self._is_agent_path(selection)
         if selection.evaluation_mode == "hybrid" and self.dispatcher.hybrid_config is None:
             if not (is_agent and getattr(selection, "asi_category", "unclassified") == "ASI05"):
@@ -547,7 +538,7 @@ class GenericImportedBatchWorkflow:
                 return agent_err
         return None
 
-    def preview(self, selection: OfflineBatchSelection) -> dict:
+    def preview(self, selection: ImportedBatchSelection) -> dict:
         if not selection.dataset_id or self.dataset_repository.get_dataset(selection.dataset_id) is None:
             raise BatchRejected("imported_dataset_invalid")
         is_agent = self._is_agent_path(selection)
@@ -570,15 +561,6 @@ class GenericImportedBatchWorkflow:
             target_error = "imported_request_budget_invalid"
         mode = self._transport_mode(selection)
         items = []
-        selected_native = []
-        for selected_id in selection.testcase_ids:
-            try:
-                _, selected_case = self._find_dataset_and_case(selected_id, selection.dataset_id)
-                matched = (self._native_match(selected_case)
-                           if not is_agent and selection.asi_category == "unclassified" else None)
-                selected_native.append(matched.testcase.id if matched else None)
-            except BatchRejected:
-                selected_native.append(None)
         for case_id in selection.testcase_ids:
             try:
                 ds, case = self._find_dataset_and_case(case_id, selection.dataset_id)
@@ -634,8 +616,6 @@ class GenericImportedBatchWorkflow:
                 })
                 continue
 
-            native = self._native_match(case) if selection.asi_category == "unclassified" else None
-            native_id = native.testcase.id if native else None
             policy = (self.asi03_policies.for_target(selection.target.target_id)
                       if selection.asi_category == "ASI03" else None)
             policy_ready = bool(policy and policy["response_policy_ready"])
@@ -644,14 +624,11 @@ class GenericImportedBatchWorkflow:
             asi05_ready = bool(asi05_policy and asi05_policy["response_policy_ready"])
             asi03 = (self.asi03_contracts.for_case(ds.dataset_id, case.internal_id,
                                                    selection.target.target_id)
-                     if native is None and selection.asi_category == "unclassified" else None)
+                     if selection.asi_category == "unclassified" else None)
             asi03_ready = bool(asi03 and asi03["response_contract_ready"])
-            dependency_missing = (native_id in {"GH-001", "GH-002"} and
-                                  "GH-C01" not in selected_native[:len(items)])
-            hybrid_unreviewed = (selection.evaluation_mode == "hybrid" and native is None
+            hybrid_unreviewed = (selection.evaluation_mode == "hybrid"
                                  and not asi03_ready and selection.asi_category == "unclassified")
-            reason = ("clean_baseline_required_in_same_batch" if dependency_missing else
-                      (policy["readiness_blockers"][0] if policy and policy["readiness_blockers"]
+            reason = ((policy["readiness_blockers"][0] if policy and policy["readiness_blockers"]
                        else "asi03_policy_not_reviewed") if selection.asi_category == "ASI03" and not policy_ready else
                       "asi03_hybrid_mode_required" if selection.asi_category == "ASI03" and selection.evaluation_mode != "hybrid" else
                       (asi05_policy["readiness_blockers"][0] if asi05_policy and asi05_policy["readiness_blockers"]
@@ -659,7 +636,7 @@ class GenericImportedBatchWorkflow:
                       "asi05_hybrid_mode_required" if selection.asi_category == "ASI05" and selection.evaluation_mode != "hybrid" else
                       asi03["readiness_blockers"][0] if hybrid_unreviewed and asi03 and asi03["readiness_blockers"]
                       else "imported_hybrid_requires_reviewed_native_input" if hybrid_unreviewed else target_error)
-            if dependency_missing or hybrid_unreviewed or (selection.asi_category == "ASI03"
+            if hybrid_unreviewed or (selection.asi_category == "ASI03"
                     and (not policy_ready or selection.evaluation_mode != "hybrid")):
                 status = "blocked"
             if selection.asi_category == "ASI05" and (not asi05_ready or selection.evaluation_mode != "hybrid"):
@@ -668,13 +645,12 @@ class GenericImportedBatchWorkflow:
                 "testcase_id": case.internal_id,
                 "source_testcase_id": case.testcase_id,
                 "name": f"{case.testcase_id}: {case.plugin_id or 'Custom Prompt'}"[:160],
-                "asi_category": "ASI01" if native else "ASI03" if asi03_ready or selection.asi_category == "ASI03" else "ASI05" if selection.asi_category == "ASI05" else "UNCLASSIFIED",
+                "asi_category": "ASI03" if asi03_ready or selection.asi_category == "ASI03" else "ASI05" if selection.asi_category == "ASI05" else "UNCLASSIFIED",
                 "status": status,
                 "reason": reason,
                 "asset_sha256": asset_hash,
                 "input_sha256": case.prompt_sha256,
-                "evaluation_readiness": ("reviewed_native_rules" if native else
-                                         "reviewed_asi03_response_semantic" if (asi03_ready or policy_ready) and selection.evaluation_mode == "hybrid"
+                "evaluation_readiness": ("reviewed_asi03_response_semantic" if (asi03_ready or policy_ready) and selection.evaluation_mode == "hybrid"
                                          else "reviewed_asi05_response_semantic" if asi05_ready and selection.evaluation_mode == "hybrid"
                                          else "reviewed_contract_requires_hybrid" if asi03_ready
                                          else "unavailable"),
@@ -690,9 +666,9 @@ class GenericImportedBatchWorkflow:
                 "asi03_evaluation_blockers": ((["asi03_hybrid_mode_required"] if asi03_ready and selection.evaluation_mode != "hybrid"
                     else [] if asi03_ready
                     else asi03["readiness_blockers"]) if asi03 else []),
-                "binding_id": native_id or "GENERIC-DIRECT-CHAT",
-                "native_testcase_sha256": native.testcase_sha256 if native else None,
-                "evaluation_sha256": native.evaluation_sha256 if native else None,
+                "binding_id": "GENERIC-DIRECT-CHAT",
+                "native_testcase_sha256": None,
+                "evaluation_sha256": None,
             })
 
         plan_material = {
@@ -743,7 +719,7 @@ class GenericImportedBatchWorkflow:
             })
         return response
 
-    def start(self, item: OfflineBatchStart) -> dict:
+    def start(self, item: ImportedBatchStart) -> dict:
         selection = ImportedBatchSelection.model_validate(item.model_dump(exclude={
             "expected_plan_id", "submission_id", "authorization_confirmed"}))
         is_agent = self._is_agent_path(selection)
@@ -825,12 +801,7 @@ class GenericImportedBatchWorkflow:
                 self._submission_id, self._batch_id, self._plan_id = item.submission_id, identity, preview["plan_id"]
                 self.dispatcher._active = True
 
-            baseline_pass = False
-
             def admit(case: BatchCase) -> str:
-                native_id = rows[case.testcase_id]["binding_id"]
-                if native_id in {"GH-001", "GH-002"} and not baseline_pass:
-                    return "blocked", "clean_baseline_not_confirmed"
                 if self._target_error(selection, active_batch=True) or datetime.now(timezone.utc) >= self._authorization_expires_at:
                     return "blocked"
                 initial = rows[case.testcase_id]["status"]
@@ -859,14 +830,9 @@ class GenericImportedBatchWorkflow:
                 return "ready"
 
             def execute_case(case, exec_id, stage_sink):
-                nonlocal baseline_pass
                 target_binding_id = "GENERIC-MCP-AGENT" if is_agent else "GENERIC-DIRECT-CHAT"
-                result = self.registry.execute_binding(
+                return self.registry.execute_binding(
                     target_binding_id, selection, case, exec_id, stage_sink)
-                if not is_agent and rows[case.testcase_id]["binding_id"] == "GH-C01":
-                    # Set only after _run_case persisted the native report.
-                    baseline_pass = result.verdict == "PASS" and result.report_run_id is not None
-                return result
 
             def cleanup_worker():
                 self._active_grant_id = None
@@ -885,7 +851,7 @@ class GenericImportedBatchWorkflow:
                 on_cleanup=cleanup_worker,
             )
 
-    def _run_case(self, selection: OfflineBatchSelection, case: BatchCase,
+    def _run_case(self, selection: ImportedBatchSelection, case: BatchCase,
                   execution_id: str, stage) -> CaseResult:
         grant = self._grant(selection, case.testcase_id, case.asset_sha256)
         if grant is None:
@@ -975,8 +941,6 @@ class GenericImportedBatchWorkflow:
                 },
             )
 
-            native_binding = (self._native_match(imported_case)
-                              if selection.asi_category == "unclassified" else None)
             asi03_policy = (self.asi03_policies.for_target(selection.target.target_id)
                             if selection.asi_category == "ASI03" else None)
             if selection.asi_category == "ASI03" and (asi03_policy is None
@@ -993,7 +957,7 @@ class GenericImportedBatchWorkflow:
                         self._authorized_asi05_policy["revision_sha256"])):
                 raise BatchRejected("asi05_authorized_policy_changed")
             asi03_contract = (self.asi03_contracts.for_case(ds.dataset_id, imported_case.internal_id,
-                selection.target.target_id) if native_binding is None and selection.asi_category == "unclassified" else None)
+                selection.target.target_id) if selection.asi_category == "unclassified" else None)
             if ((asi03_contract["contract_id"], asi03_contract["revision_sha256"])
                     if asi03_contract and asi03_contract["response_contract_ready"] else (None, None)) != self._authorized_contracts.get(case.testcase_id):
                 raise BatchRejected("asi03_authorized_contract_changed")
@@ -1002,10 +966,7 @@ class GenericImportedBatchWorkflow:
                  or (asi03_policy and asi03_policy["response_policy_ready"])))
             asi05_semantic = bool(selection.evaluation_mode == "hybrid" and
                 asi05_policy and asi05_policy["response_policy_ready"])
-            if native_binding is not None:
-                native_testcase = native_binding.testcase.model_copy(deep=True)
-                test_input = native_binding.test_input.model_copy(deep=True)
-            elif asi03_semantic:
+            if asi03_semantic:
                 native_testcase = _build_asi03_semantic_testcase(
                     case, ds, imported_case, asi03_policy, asi03_contract)
             elif asi05_semantic:
@@ -1014,17 +975,15 @@ class GenericImportedBatchWorkflow:
 
             runner = Runner(
                 executor=executor,
-                reviewed_judge_input_sha256=(sha256(native_binding.test_input.prompt.encode("utf-8")).hexdigest()
-                    if native_binding is not None else None),
+                reviewed_judge_input_sha256=None,
                 attack_module_registry=AttackModuleRegistry({
-                    "direct_chat": DirectChatDelivery(),
-                    "goal_hijacking": GoalHijackingAttackModule()}),
+                    "direct_chat": DirectChatDelivery()}),
                 evaluation_config=(self.dispatcher.hybrid_config.model_copy(update={
                     "require_complete_response_for_semantic": True})
-                    if selection.evaluation_mode == "hybrid" and (native_binding is not None or asi03_semantic or asi05_semantic)
+                    if selection.evaluation_mode == "hybrid" and (asi03_semantic or asi05_semantic)
                     else RunnerEvaluationConfig()),
                 judge_provider=(self.dispatcher.judge_provider if selection.evaluation_mode == "hybrid"
-                                and (native_binding is not None or asi03_semantic or asi05_semantic) else None),
+                                and (asi03_semantic or asi05_semantic) else None),
                 progress_sink=stage,
                 require_complete_response_for_pass=True,
                 require_complete_response_for_fail=True,
@@ -1069,10 +1028,10 @@ class GenericImportedBatchWorkflow:
                 "target_request_count": client.used,
                 "report_contract": "imported-v1",
                 "transport_mode": self._transport_mode(selection),
-                "native_testcase_sha256": native_binding.testcase_sha256 if native_binding else None,
-                "native_payload_sha256": native_binding.payload_sha256 if native_binding else None,
-                "evaluation_sha256": native_binding.evaluation_sha256 if native_binding else None,
-                "native_testcase_id": native_binding.testcase.id if native_binding else None,
+                "native_testcase_sha256": None,
+                "native_payload_sha256": None,
+                "evaluation_sha256": None,
+                "native_testcase_id": None,
                 "asi03_contract_id": asi03_contract["contract_id"] if asi03_contract and asi03_semantic else None,
                 "asi03_contract_revision_sha256": asi03_contract["revision_sha256"] if asi03_contract and asi03_semantic else None,
                 "asi03_policy_id": asi03_policy["policy_id"] if asi03_policy and asi03_semantic else None,
@@ -1101,13 +1060,12 @@ class GenericImportedBatchWorkflow:
                 "source_plugin_id": imported_case.plugin_id,
                 "target_profile_id": profile.id,
                 "target_profile_revision_sha256": selection.target.profile_revision,
-                "binding_id": native_binding.testcase.id if native_binding else "GENERIC-DIRECT-CHAT",
+                "binding_id": "GENERIC-DIRECT-CHAT",
                 "adapter": "generic_http", "delivery_surface": "direct_chat",
-                "evaluation_readiness": ("reviewed_native_rules" if native_binding else
-                                         "reviewed_asi03_response_semantic" if asi03_semantic else
+                "evaluation_readiness": ("reviewed_asi03_response_semantic" if asi03_semantic else
                                          "reviewed_asi05_response_semantic" if asi05_semantic else "unavailable"),
                 "evaluation_mode": selection.evaluation_mode,
-                "evidence_contract": "complete_response_text" if native_binding or asi03_semantic or asi05_semantic else "response_only_inconclusive",
+                "evidence_contract": "complete_response_text" if asi03_semantic or asi05_semantic else "response_only_inconclusive",
                 "evaluation_scope": "identity_claim_response" if asi03_semantic else "response_command_artifact" if asi05_semantic else None,
                 "asi03_contract_id": asi03_contract["contract_id"] if asi03_contract and asi03_semantic else None,
                 "asi03_contract_revision_sha256": asi03_contract["revision_sha256"] if asi03_contract and asi03_semantic else None,
@@ -1115,8 +1073,8 @@ class GenericImportedBatchWorkflow:
                 "asi03_policy_revision_sha256": asi03_policy["revision_sha256"] if asi03_policy and asi03_semantic else None,
                 "asi05_policy_id": asi05_policy["policy_id"] if asi05_semantic else None,
                 "asi05_policy_revision_sha256": asi05_policy["revision_sha256"] if asi05_semantic else None,
-                "native_testcase_sha256": native_binding.testcase_sha256 if native_binding else None,
-                "evaluation_sha256": native_binding.evaluation_sha256 if native_binding else None,
+                "native_testcase_sha256": None,
+                "evaluation_sha256": None,
                 "submission_id": self._submission_id, "plan_id": self._plan_id,
                 "batch_run_id": self._batch_id, "batch_execution_id": execution_id,
                 "authorization_id": grant.authorization_id,

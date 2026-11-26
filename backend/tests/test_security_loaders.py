@@ -11,7 +11,7 @@ from core.models import TestInput as CoreTestInput
 from testing import TestCaseLoader
 
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+REPOSITORY_ROOT = Path(__file__).resolve().parent / "fixtures" / "native_compat"
 
 
 @pytest.mark.parametrize(

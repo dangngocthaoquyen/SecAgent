@@ -1,229 +1,28 @@
-"""Execution, batch orchestration, grant, MCP action, and lab-attempt routes."""
+"""Batch orchestration (Hosted MCP Agent / Imported) and structured MCP action routes."""
 
-from datetime import datetime, timedelta, timezone
-import json
-import os
 import secrets
-from typing import Literal
-from uuid import uuid4
 
 from flask import jsonify, request
-from pydantic import Field, ValidationError
+from pydantic import ValidationError
 
-from workflow.admission import AdmissionRequest, ExecutionGrant
-from workflow.asi01_batch import Asi01BatchSelection, Asi01BatchStart, Asi01BatchWorkflow, TextTargetRejected
 from workflow.batch import BatchRejected
 from workflow.catalog import read_json
-from workflow.dispatch import DispatchRejected
 from workflow.generic_imported_batch import (
     GenericImportedBatchWorkflow,
     ImportedBatchSelection,
     ImportedBatchStart,
 )
-from workflow.lab_attachment import LabAttemptReference, LabPreparationError
 from workflow.mcp_actions import McpActionRejected, McpActionRunRequest
-from workflow.offline_batch import OfflineBatchSelection, OfflineBatchStart
-from workflow.plans import ASI, PlanSelection
-from workflow.toolbot_lab_batch import ToolBotLabBatchWorkflow
-from workflow.web_live_batch import WebLabPreviewRejected
-
-
-class OperatorGrantRequest(AdmissionRequest):
-    authorization_confirmed: Literal[True]
-
-
-class RunSelectedRequest(AdmissionRequest):
-    authorization_confirmed: Literal[True]
-    submission_id: str = Field(pattern=r"^[a-f0-9]{32}$")
 
 
 def register_execution_routes(app, ctx) -> None:
-    """Register planning, dispatch, batch, grant, MCP action, and lab routes."""
+    """Register imported/MCP-agent batch orchestration and structured MCP action routes."""
 
-    catalog = ctx.catalog
-    managed = ctx.managed
-    local_single_user = ctx.local_single_user
     nonce = ctx.nonce
-    admin_lock = ctx.admin_lock
-    dispatcher = ctx.dispatcher
-    inventory = ctx.inventory
-    admission = ctx.admission
     services = ctx.services
     mcp_action_service = ctx.mcp_action_service
-    lab_preparer = ctx.lab_preparer
     fail = ctx.fail
     operator_authorized = ctx.operator_authorized
-
-    @app.get("/api/testing/categories")
-    def categories():
-        return jsonify(workflow_schema_version="1.0.0", items=[{"id": v[0], "name": v[1]} for v in ASI.values()])
-
-    @app.get("/api/testing/testcases")
-    def testcases():
-        return jsonify(
-            workflow_schema_version="1.0.0",
-            items=inventory.items,
-            invalid_records=inventory.invalid_records,
-        )
-
-    @app.post("/api/testing/compatibility/preview")
-    @app.post("/api/testing/plans/preview")
-    def preview():
-        try:
-            selection = PlanSelection.model_validate(read_json(request.get_data()))
-            result = inventory.preview(selection, catalog, plan=request.path.endswith("/plans/preview"))
-        except (ValueError, TypeError):
-            return fail("invalid_or_stale_plan_selection", 400)
-        return jsonify(result)
-
-    @app.post("/api/testing/readiness/preview")
-    @app.post("/api/testing/admissions")
-    def readiness():
-        try:
-            selection = AdmissionRequest.model_validate(read_json(request.get_data()))
-            result = (
-                dispatcher.readiness(selection, admit=request.path.endswith("/admissions"))
-                if dispatcher
-                else admission.assess(selection, admit=request.path.endswith("/admissions"))
-            )
-            if lab_preparer is not None and selection.testcase_ids == ["GH-WEB-001"]:
-                result["lab_preflight_status"] = "not_checked"
-                result["dispatch_available"] = False
-        except (ValueError, TypeError):
-            return fail("invalid_admission_request", 400)
-        return jsonify(result)
-
-    @app.post("/api/testing/runs")
-    def run():
-        if dispatcher is None:
-            return fail("execution_disabled", 403)
-        if not dispatcher.authorized(request.headers.get("X-SecAgent-Operator", "")):
-            return fail("operator_authentication_required", 403)
-        try:
-            selection = AdmissionRequest.model_validate(read_json(request.get_data()))
-            result = dispatcher.run(selection)
-        except (ValueError, TypeError, DispatchRejected):
-            return fail("run_rejected", 409)
-        return jsonify(result)
-
-    def issue_scoped_grant(selection, preview_result):
-        expires = datetime.now(timezone.utc) + timedelta(minutes=10)
-        grant = ExecutionGrant(
-            authorization_id=uuid4().hex,
-            target_id=selection.target.target_id,
-            profile_revision=selection.target.profile_revision,
-            policy_ref=selection.target.policy_ref,
-            testcase_id="GH-C01",
-            asset_sha256=preview_result["asset_sha256"]["GH-C01"],
-            scope="security_test_execution",
-            expires_at=expires,
-        )
-        record = {
-            "grant_id": grant.authorization_id,
-            "target_id": grant.target_id,
-            "profile_revision": grant.profile_revision,
-            "policy_ref": grant.policy_ref,
-            "testcase_id": grant.testcase_id,
-            "asset_sha256": grant.asset_sha256,
-            "scope": grant.scope,
-            "expires_at": expires.isoformat(),
-            "target_request_budget": 1,
-            "issued_at": datetime.now(timezone.utc).isoformat(),
-        }
-        with (dispatcher.output_root / ("operator-grant-" + grant.authorization_id + ".json")).open(
-            "x", encoding="utf-8"
-        ) as stream:
-            json.dump(record, stream, sort_keys=True)
-            stream.flush()
-            os.fsync(stream.fileno())
-        dispatcher.policy = dispatcher.policy.model_copy(update={"grants": [*dispatcher.policy.grants, grant]})
-        return grant, expires
-
-    @app.post("/api/testing/run-selected")
-    def run_selected():
-        if not local_single_user or not managed or dispatcher is None:
-            return fail("local_controlled_execution_disabled", 403)
-        if not operator_authorized():
-            return fail("operator_authentication_required", 403)
-        try:
-            item = RunSelectedRequest.model_validate(read_json(request.get_data()))
-            if (
-                item.testcase_ids != ["GH-C01"]
-                or item.asi_categories != ["ASI01"]
-                or item.target_request_budget != 1
-                or item.expected_plan_id is None
-            ):
-                return fail("unsupported_execution_scope", 409)
-            selection = AdmissionRequest.model_validate(item.model_dump(exclude={"authorization_confirmed", "submission_id"}))
-        except (ValueError, TypeError, ValidationError):
-            return fail("invalid_run_selection", 400)
-        if not admin_lock.acquire(blocking=False):
-            return fail("run_active", 409)
-        try:
-            if not dispatcher._lock.acquire(blocking=False):
-                return fail("run_active", 409)
-            try:
-                if dispatcher._active:
-                    return fail("run_active", 409)
-                submission_path = dispatcher.output_root / ("submission-" + item.submission_id + ".json")
-                if submission_path.exists():
-                    return fail("duplicate_submission", 409)
-                preview_result = dispatcher._admission(selection).assess(selection)
-                blockers = set(preview_result["blockers"]) | {
-                    code for row in preview_result["items"] for code in row["blockers"]
-                }
-                if preview_result["plan_id"] != item.expected_plan_id:
-                    return (
-                        jsonify(
-                            workflow_schema_version="1.0.0",
-                            execution_status="blocked",
-                            blockers=["stale_plan_identity"],
-                            target_request_count=0,
-                        ),
-                        409,
-                    )
-                if blockers - {"execution_authorization_missing_or_expired"}:
-                    return (
-                        jsonify(
-                            workflow_schema_version="1.0.0",
-                            execution_status="blocked",
-                            blockers=sorted(blockers),
-                            target_request_count=0,
-                        ),
-                        409,
-                    )
-                admitted = dispatcher.readiness(selection, admit=True)
-                if not admitted["dispatch_available"] and len(dispatcher.policy.grants) >= 20:
-                    return fail("grant_budget_exhausted", 409)
-                record = {
-                    "submission_id": item.submission_id,
-                    "target_id": selection.target.target_id,
-                    "profile_revision": selection.target.profile_revision,
-                    "policy_ref": selection.target.policy_ref,
-                    "testcase_id": "GH-C01",
-                    "plan_id": item.expected_plan_id,
-                    "evaluation_mode": selection.evaluation_mode,
-                    "target_request_budget": 1,
-                    "authorization_confirmed": True,
-                    "submitted_at": datetime.now(timezone.utc).isoformat(),
-                }
-                with submission_path.open("x", encoding="utf-8") as stream:
-                    json.dump(record, stream, sort_keys=True)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                if not admitted["dispatch_available"]:
-                    issue_scoped_grant(selection, preview_result)
-                    admitted = dispatcher.readiness(selection, admit=True)
-                if not admitted["dispatch_available"]:
-                    return fail("admission_rejected", 409)
-                result = dispatcher.run(selection)
-                return jsonify(result)
-            finally:
-                dispatcher._lock.release()
-        except (ValueError, TypeError, ValidationError, OSError, KeyError, DispatchRejected):
-            return fail("run_rejected", 409)
-        finally:
-            admin_lock.release()
 
     def batch_auth():
         if not services:
@@ -261,23 +60,11 @@ def register_execution_routes(app, ctx) -> None:
         service = None
         try:
             service, raw = selected_batch_service(read_json(request.get_data()))
-            selection = (
-                ImportedBatchSelection
-                if isinstance(service, GenericImportedBatchWorkflow)
-                else Asi01BatchSelection if isinstance(service, Asi01BatchWorkflow) else OfflineBatchSelection
-            ).model_validate(raw)
-            if selection.transport_mode is not None and not isinstance(service, GenericImportedBatchWorkflow):
-                return fail("invalid_batch_selection", 400)
+            selection = ImportedBatchSelection.model_validate(raw)
             return jsonify(service.preview(selection))
-        except TextTargetRejected as exc:
-            return fail(exc.code, 409)
-        except WebLabPreviewRejected as exc:
-            return fail(exc.code, 409)
         except BatchRejected as exc:
             if str(exc) == "workflow_selection_required":
                 return fail("workflow_selection_required", 400)
-            if isinstance(service, ToolBotLabBatchWorkflow) and str(exc).startswith("toolbot_lab_"):
-                return fail(str(exc), 409)
             if isinstance(service, GenericImportedBatchWorkflow):
                 return fail(str(exc), 409)
             return fail("batch_preview_rejected", 409)
@@ -294,21 +81,13 @@ def register_execution_routes(app, ctx) -> None:
         service = None
         try:
             service, raw = selected_batch_service(read_json(request.get_data()))
-            item = (
-                ImportedBatchStart
-                if isinstance(service, GenericImportedBatchWorkflow)
-                else Asi01BatchStart if isinstance(service, Asi01BatchWorkflow) else OfflineBatchStart
-            ).model_validate(raw)
-            if item.transport_mode is not None and not isinstance(service, GenericImportedBatchWorkflow):
-                return fail("invalid_batch_selection", 400)
+            item = ImportedBatchStart.model_validate(raw)
             if any(
                 other is not service and getattr(other, "_worker", None) is not None and other._worker.is_alive()
                 for other in services.values()
             ):
                 return fail("another_workflow_active", 409)
             return jsonify(service.start(item)), 202
-        except TextTargetRejected as exc:
-            return fail(exc.code, 409)
         except (ValueError, TypeError, ValidationError, BatchRejected, OSError) as exc:
             if isinstance(exc, BatchRejected) and str(exc) == "workflow_selection_required":
                 return fail("workflow_selection_required", 400)
@@ -404,49 +183,6 @@ def register_execution_routes(app, ctx) -> None:
             active_request_cancelled=False,
         )
 
-    @app.post("/api/testing/execution-grants")
-    def execution_grant():
-        if not managed or dispatcher is None:
-            return fail("controlled_execution_not_enabled", 403)
-        if not operator_authorized():
-            return fail("operator_authentication_required", 403)
-        try:
-            item = OperatorGrantRequest.model_validate(read_json(request.get_data()))
-            if (
-                item.testcase_ids != ["GH-C01"]
-                or item.asi_categories != ["ASI01"]
-                or item.target_request_budget != 1
-                or item.expected_plan_id is None
-            ):
-                return fail("grant_scope_rejected", 409)
-            selection = AdmissionRequest.model_validate(item.model_dump(exclude={"authorization_confirmed"}))
-            with admin_lock, dispatcher._lock:
-                if dispatcher._active:
-                    return fail("run_active", 409)
-                # A grant can satisfy only the missing authorization blocker.
-                # All profile, asset, binding and policy checks run first.
-                preview_result = dispatcher._admission(selection).assess(selection)
-                blockers = set(preview_result["blockers"]) | {
-                    code for row in preview_result["items"] for code in row["blockers"]
-                }
-                if (
-                    preview_result["plan_id"] != item.expected_plan_id
-                    or blockers != {"execution_authorization_missing_or_expired"}
-                    or len(dispatcher.policy.grants) >= 20
-                ):
-                    return fail("grant_prerequisites_unmet", 409)
-                grant, expires = issue_scoped_grant(selection, preview_result)
-        except (ValueError, TypeError, ValidationError, OSError, KeyError):
-            return fail("grant_rejected", 409)
-        return jsonify(
-            workflow_schema_version="1.0.0",
-            grant_id=grant.authorization_id,
-            expires_at=expires.isoformat(),
-            testcase_id="GH-C01",
-            target_request_budget=1,
-            plan_id=preview_result["plan_id"],
-        )
-
     @app.get("/api/testing/mcp-actions")
     def mcp_actions():
         if mcp_action_service is None:
@@ -481,37 +217,3 @@ def register_execution_routes(app, ctx) -> None:
             code = str(exc) if isinstance(exc, McpActionRejected) else "mcp_action_request_invalid"
             return fail(code, 409)
         return jsonify(workflow_schema_version="1.0.0", result=result)
-
-    @app.post("/api/testing/lab-attempts/preview")
-    def lab_preview():
-        if lab_preparer is None:
-            return fail("lab_preparation_disabled", 403)
-        try:
-            selection = AdmissionRequest.model_validate(read_json(request.get_data()))
-            return jsonify(lab_preparer.preview(selection))
-        except (ValueError, TypeError, LabPreparationError):
-            return fail("lab_preparation_rejected", 400)
-
-    @app.post("/api/testing/lab-attempts/prepare")
-    def lab_prepare():
-        if lab_preparer is None:
-            return fail("lab_preparation_disabled", 403)
-        if not operator_authorized():
-            return fail("operator_authentication_required", 403)
-        try:
-            selection = AdmissionRequest.model_validate(read_json(request.get_data()))
-            return jsonify(lab_preparer.prepare(selection))
-        except (ValueError, TypeError, LabPreparationError, OSError):
-            return fail("lab_preparation_rejected", 409)
-
-    @app.post("/api/testing/lab-attempts/preflight")
-    def lab_preflight():
-        if lab_preparer is None:
-            return fail("lab_preparation_disabled", 403)
-        if not operator_authorized():
-            return fail("operator_authentication_required", 403)
-        try:
-            reference = LabAttemptReference.model_validate(read_json(request.get_data()))
-            return jsonify(lab_preparer.preflight(reference.attempt_id))
-        except (ValueError, TypeError, LabPreparationError, OSError):
-            return fail("lab_preflight_rejected", 409)

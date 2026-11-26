@@ -14,7 +14,6 @@ SECRET = "stage1b2-operator-secret-" + "x" * 32
 BASE = "http://127.0.0.1:8092"
 
 EXPECTED_URL_MAP = (
-    ("/api/testing/admissions", ("OPTIONS", "POST"), "readiness"),
     ("/api/testing/agent-bindings", ("GET", "HEAD", "OPTIONS"), "agent_binding_list"),
     ("/api/testing/agent-bindings/<binding_id>", ("GET", "HEAD", "OPTIONS"), "agent_binding_read"),
     ("/api/testing/agent-bindings/<binding_id>/review", ("OPTIONS", "POST"), "agent_binding_review"),
@@ -39,8 +38,6 @@ EXPECTED_URL_MAP = (
     ("/api/testing/batches/<batch_run_id>/events", ("GET", "HEAD", "OPTIONS"), "batch_events"),
     ("/api/testing/batches/<batch_run_id>/results", ("GET", "HEAD", "OPTIONS"), "batch_results"),
     ("/api/testing/batches/preview", ("OPTIONS", "POST"), "batch_preview"),
-    ("/api/testing/categories", ("GET", "HEAD", "OPTIONS"), "categories"),
-    ("/api/testing/compatibility/preview", ("OPTIONS", "POST"), "preview"),
     ("/api/testing/connection-checks", ("OPTIONS", "POST"), "connection_check"),
     ("/api/testing/datasets", ("GET", "HEAD", "OPTIONS"), "list_datasets"),
     ("/api/testing/datasets/<dataset_id>", ("GET", "HEAD", "OPTIONS"), "get_dataset"),
@@ -54,21 +51,22 @@ EXPECTED_URL_MAP = (
     ("/api/testing/evidence-sources/collect", ("OPTIONS", "POST"), "evidence_collect"),
     ("/api/testing/evidence-sources/save", ("OPTIONS", "POST"), "evidence_save"),
     ("/api/testing/evidence-sources/target/<target_id>", ("GET", "HEAD", "OPTIONS"), "evidence_list"),
-    ("/api/testing/execution-grants", ("OPTIONS", "POST"), "execution_grant"),
     ("/api/testing/generic-runs", ("GET", "HEAD", "OPTIONS"), "generic_run_list"),
     ("/api/testing/generic-runs/<run_id>", ("GET", "HEAD", "OPTIONS"), "generic_run_read"),
     ("/api/testing/generic-runs/<run_id>/report.json", ("GET", "HEAD", "OPTIONS"), "generic_run_export"),
+    ("/api/testing/generic-runs/<run_id>/resume/preview", ("OPTIONS", "POST"), "generic_run_resume_preview"),
+    ("/api/testing/generic-runs/<run_id>/resume/start", ("OPTIONS", "POST"), "generic_run_resume_start"),
+    ("/api/testing/generic-runs/<run_id>/unified-report.json", ("GET", "HEAD", "OPTIONS"), "generic_run_unified_export"),
     ("/api/testing/generic-runs/preview", ("OPTIONS", "POST"), "generic_run_preview"),
     ("/api/testing/generic-runs/start", ("OPTIONS", "POST"), "generic_run_start"),
     ("/api/testing/generic-runs/submission/<submission_id>", ("GET", "HEAD", "OPTIONS"), "generic_run_by_submission"),
     ("/api/testing/health", ("GET", "HEAD", "OPTIONS"), "health"),
-    ("/api/testing/lab-attempts/preflight", ("OPTIONS", "POST"), "lab_preflight"),
-    ("/api/testing/lab-attempts/prepare", ("OPTIONS", "POST"), "lab_prepare"),
-    ("/api/testing/lab-attempts/preview", ("OPTIONS", "POST"), "lab_preview"),
     ("/api/testing/managed-targets", ("GET", "HEAD", "OPTIONS"), "managed_targets"),
     ("/api/testing/managed-targets/create", ("OPTIONS", "POST"), "managed_create"),
     ("/api/testing/managed-targets/delete", ("OPTIONS", "POST"), "managed_delete_target"),
     ("/api/testing/managed-targets/review", ("OPTIONS", "POST"), "managed_review"),
+    ("/api/testing/managed-targets/session-credentials", ("OPTIONS", "POST"), "managed_set_session_credential"),
+    ("/api/testing/managed-targets/session-credentials/clear", ("OPTIONS", "POST"), "managed_clear_session_credential"),
     ("/api/testing/managed-targets/update", ("OPTIONS", "POST"), "managed_update"),
     ("/api/testing/managed-targets/validate", ("OPTIONS", "POST"), "managed_validate"),
     ("/api/testing/mcp-actions", ("GET", "HEAD", "OPTIONS"), "mcp_actions"),
@@ -78,16 +76,11 @@ EXPECTED_URL_MAP = (
     ("/api/testing/mcp-catalogs/<catalog_id>/review", ("OPTIONS", "POST"), "mcp_catalog_review"),
     ("/api/testing/mcp-catalogs/drafts", ("OPTIONS", "POST"), "mcp_catalog_draft"),
     ("/api/testing/mcp-catalogs/target/<target_id>", ("GET", "HEAD", "OPTIONS"), "mcp_catalog_for_target"),
-    ("/api/testing/plans/preview", ("OPTIONS", "POST"), "preview"),
-    ("/api/testing/readiness/preview", ("OPTIONS", "POST"), "readiness"),
     ("/api/testing/response-policies/<policy_id>/review", ("OPTIONS", "POST"), "generic_policy_review"),
     ("/api/testing/response-policies/drafts", ("OPTIONS", "POST"), "generic_policy_draft"),
     ("/api/testing/response-policies/target/<target_id>", ("GET", "HEAD", "OPTIONS"), "generic_policy_list"),
-    ("/api/testing/run-selected", ("OPTIONS", "POST"), "run_selected"),
-    ("/api/testing/runs", ("OPTIONS", "POST"), "run"),
     ("/api/testing/target-drafts/validate", ("OPTIONS", "POST"), "validate"),
     ("/api/testing/targets", ("GET", "HEAD", "OPTIONS"), "targets"),
-    ("/api/testing/testcases", ("GET", "HEAD", "OPTIONS"), "testcases"),
 )
 
 
@@ -113,8 +106,8 @@ def test_url_map_and_endpoints_match_frozen_contract(tmp_path):
         if rule.endpoint != "static"
     ))
     assert actual == EXPECTED_URL_MAP
-    assert len(actual) == 74
-    assert len({ep for _, _, ep in actual}) == 72
+    assert len(actual) == 67
+    assert len({ep for _, _, ep in actual}) == 67
 
 
 def test_security_boundary_hooks_and_error_shapes_preserved(tmp_path):
@@ -210,21 +203,21 @@ def test_route_group_auth_and_error_contracts_preserved(tmp_path):
     assert client.get("/api/testing/asi05-policies/" + ("d" * 32), base_url=BASE, headers=auth).status_code == 404
     assert client.get("/api/testing/asi03-contracts/" + ("e" * 32), base_url=BASE, headers=auth).status_code == 404
 
-    # Execution, grants, batches, mcp-actions, lab routes
-    assert client.get("/api/testing/categories", base_url=BASE).status_code == 200
-    assert client.get("/api/testing/testcases", base_url=BASE).status_code == 200
+    # Active execution/batch/mcp-actions routes & retired native-only routes return 404
+    assert client.get("/api/testing/categories", base_url=BASE).status_code == 404
+    assert client.get("/api/testing/testcases", base_url=BASE).status_code == 404
     assert client.post("/api/testing/batches/preview", base_url=BASE, headers=auth, data=json.dumps({})).get_json()["error"]["code"] == "offline_batch_disabled"
-    assert client.post("/api/testing/runs", base_url=BASE, headers=auth, data=json.dumps({})).get_json()["error"]["code"] == "execution_disabled"
-    assert client.post("/api/testing/execution-grants", base_url=BASE, headers=auth, data=json.dumps({})).get_json()["error"]["code"] == "controlled_execution_not_enabled"
+    assert client.post("/api/testing/runs", base_url=BASE, headers=auth, data=json.dumps({})).status_code == 404
+    assert client.post("/api/testing/execution-grants", base_url=BASE, headers=auth, data=json.dumps({})).status_code == 404
     assert client.get("/api/testing/mcp-actions", base_url=BASE, headers={"X-SecAgent-Operator": SECRET}).get_json()["error"]["code"] == "mcp_action_workflow_disabled"
-    assert client.post("/api/testing/lab-attempts/preview", base_url=BASE, headers=auth, data=json.dumps({})).get_json()["error"]["code"] == "lab_preparation_disabled"
+    assert client.post("/api/testing/lab-attempts/preview", base_url=BASE, headers=auth, data=json.dumps({})).status_code == 404
 
     # Error handler 500 parity
     def boom():
         raise RuntimeError("synthetic boom")
 
-    app.view_functions["categories"] = boom
-    internal = client.get("/api/testing/categories", base_url=BASE)
+    app.view_functions["targets"] = boom
+    internal = client.get("/api/testing/targets", base_url=BASE)
     assert internal.status_code == 500
     assert internal.get_json()["error"]["code"] == "internal_error"
 

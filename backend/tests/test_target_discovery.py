@@ -144,9 +144,8 @@ def test_real_api_auth_revision_association_and_no_execution(tmp_path):
     assert result.status_code == 200
     row = result.json
     assert row["request_count"] == 3
-    assert len(row["recommendations"]) == len(client.get(
-        "/api/testing/testcases", base_url=BASE).json["items"])
-    assert all(item["status"] != "SUPPORTED" for item in row["recommendations"])
+    assert row["recommendations"] == []
+    assert client.get("/api/testing/testcases", base_url=BASE).status_code == 404
     assert client.get(route + "/" + row["discovery_id"], base_url=BASE).status_code == 403
     assert client.get(route + "/" + row["discovery_id"], base_url=BASE,
                       headers={"X-SecAgent-Operator": SECRET}).status_code == 200

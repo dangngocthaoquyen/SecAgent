@@ -15,6 +15,7 @@ from testing import Executor, Runner, TestCaseLoader
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+NATIVE_COMPAT_ROOT = Path(__file__).resolve().parent / "fixtures" / "native_compat"
 
 
 class StubTargetAdapter(BaseTargetAdapter):
@@ -37,11 +38,11 @@ class StubTargetAdapter(BaseTargetAdapter):
 
 def test_runner_executes_native_prompt_injection_pipeline() -> None:
     testcase = TestCaseLoader().load(
-        REPOSITORY_ROOT / "testcases" / "prompt_injection" / "PI-001.yaml"
+        NATIVE_COMPAT_ROOT / "testcases" / "prompt_injection" / "PI-001.yaml"
     )
 
     payloads = PayloadLoader().load_repository(
-        REPOSITORY_ROOT / "payload" / "prompt_injection.yaml"
+        NATIVE_COMPAT_ROOT / "payload" / "prompt_injection.yaml"
     )
 
     payload = payloads[testcase.payload_refs[0]]

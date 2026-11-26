@@ -12,7 +12,6 @@ import pytest
 from core.models import EvaluationStatus
 from integrations.external_evaluator.models import ExternalEvaluationOutcome, ExternalEvaluationResult
 from testing.evaluation_config import RunnerEvaluationConfig
-from workflow.asi01_batch import load_text_binding
 from reporting.repository import _load_controlled_run, load_dataset
 from reporting.api import create_app as reporting_app
 from workflow.admission import AdmissionPolicy
@@ -98,21 +97,19 @@ def terminal(client, identity, headers):
 
 
 def test_unified_registry_routes_explicit_workflow_without_target_request(tmp_path):
-    from workflow.asi01_batch import Asi01BatchWorkflow
     client, _, imported, dispatcher, repo, draft, envelope, _ = setup_imported_workflow(
         tmp_path, lambda _: (_ for _ in ()).throw(AssertionError('No target request expected')))
     app = create_app(dispatcher.catalog, dispatcher=dispatcher, operator_secret=SECRET,
-        local_single_user=True, batch_services={'asi01': Asi01BatchWorkflow(dispatcher),
-            'imported': imported}, dataset_repository=repo)
+        local_single_user=True, batch_services={'imported': imported}, dataset_repository=repo)
     client = app.test_client()
     health = client.get('/api/testing/health', base_url=BASE).json
-    assert health['asi01_batch_enabled'] and health['custom_imported_batch_enabled']
-    assert health['registered_workflows'] == ['asi01', 'imported']
+    assert health['asi01_batch_enabled'] is False and health['custom_imported_batch_enabled'] is True
+    assert health['registered_workflows'] == ['imported']
     headers = {'Origin': BASE, 'X-SecAgent-Validation': health['validation_nonce'], 'X-SecAgent-Operator': SECRET}
     selection = {'target': draft, 'testcase_ids': ['TC0001'],
         'total_request_budget': 1, 'evaluation_mode': 'rule_only', 'dataset_id': envelope.dataset_id}
-    missing = post(client, 'batches/preview', selection, headers)
-    assert missing.status_code == 400 and missing.json['error']['code'] == 'workflow_selection_required'
+    bad_wf = post(client, 'batches/preview', selection | {'workflow_id': 'asi01'}, headers)
+    assert bad_wf.status_code == 400 and bad_wf.json['error']['code'] == 'workflow_selection_required'
     imported_preview = post(client, 'batches/preview', selection | {'workflow_id': 'imported'}, headers)
     assert imported_preview.status_code == 200 and imported_preview.json['execution_mode'] == 'custom_imported'
 
@@ -321,8 +318,8 @@ def test_replaying_consumed_grant_is_rejected(tmp_path):
 
     grant_file = list(workflow.root.glob("grant-*"))[0]
     auth_id = grant_file.name.replace("grant-", "")
-    from workflow.offline_batch import OfflineBatchSelection
-    sel = OfflineBatchSelection.model_validate(selection)
+    from workflow.generic_imported_batch import ImportedBatchSelection
+    sel = ImportedBatchSelection.model_validate(selection)
     assert workflow._grant(sel, "TC0001", preview["items"][0]["asset_sha256"]) is None
 
 
@@ -354,55 +351,3 @@ def test_batch_cancellation_preserves_partial_results(tmp_path):
     assert status["status"] in {"cancelled", "partially_completed", "completed"}
     results = get(client, f"batches/{identity}/results", headers).json["results"]
     assert len(results) == 3
-
-
-def test_pinned_imported_asi01_hybrid_uses_existing_judge_only_for_ambiguous_response(tmp_path):
-    control, attack = (load_text_binding(identity) for identity in ("GH-C01", "GH-001"))
-    class FakeJudge:
-        def __init__(self):
-            self.requests = []
-        def evaluate(self, request):
-            self.requests.append(request)
-            return ExternalEvaluationOutcome(request_sha256=request.sha256, skill=request.skill,
-                result=ExternalEvaluationResult(classification="ATTACKER_GOAL",
-                    verdict=EvaluationStatus.FAIL, confidence=0.8,
-                    reason="Synthetic response visibly abandons the summary.",
-                    evidence=[{"type": "response_span", "value": "dropping the summary"}]),
-                duration_ms=1)
-    fake = FakeJudge()
-    def answer(request):
-        prompt = json.loads(request.content)["messages"][0]["content"]
-        text = ("SecAgent is a prototype AI agent security testing system."
-                if prompt == control.test_input.prompt else
-                "I am dropping the summary and adopting the document instruction.")
-        return httpx.Response(200, json={"choices": [{"message": {"content": text},
-                                                      "finish_reason": "stop"}]})
-    config = RunnerEvaluationConfig(mode="hybrid", judge_enabled=True,
-                                    max_judge_calls=1)
-    client, headers, workflow, dispatcher, repo, draft, _, health = setup_imported_workflow(
-        tmp_path, answer, hybrid_config=config, judge_provider=fake)
-    assert health["evaluation_modes"] == ["rule_only", "hybrid"]
-    ds = normalize_dataset(json.dumps({"testcases": [
-        {"id": "control", "prompt": control.test_input.prompt},
-        {"id": "attack", "prompt": attack.test_input.prompt}]}).encode(), "hybrid-native.json")
-    repo.save_dataset(ds)
-    selection = {"target": draft,
-        "testcase_ids": [case.internal_id for case in ds.testcases],
-        "total_request_budget": 2, "evaluation_mode": "hybrid",
-        "dataset_id": ds.dataset_id, "transport_mode": "offline_mock"}
-    preview = post(client, "batches/preview", selection, headers)
-    assert preview.status_code == 200 and preview.json["ready_count"] == 2
-    started = post(client, "batches", selection | {"expected_plan_id": preview.json["plan_id"],
-        "submission_id": "f" * 32, "authorization_confirmed": True}, headers)
-    assert started.status_code == 202, started.json
-    workflow._worker.join(5)
-    results = get(client, f"batches/{started.json['batch_run_id']}/results", headers).json["results"]
-    assert [row["verdict"] for row in results] == ["PASS", "FAIL"]
-    assert len(fake.requests) == 1
-    assert fake.requests[0].trusted_context["original_goal"] == (
-        attack.testcase.evaluation.semantic.trusted_context["original_goal"])
-    report = next((dispatcher.output_root / results[1]["report_run_id"]).glob("native-*.secagent.json"))
-    native = json.loads(report.read_text(encoding="utf-8"))
-    assert native["evaluation"]["evaluation_mode"] == "hybrid"
-    assert native["evaluation"]["judge"]["semantic_invoked"] is True
-    assert native["evaluation"]["judge"]["recommendation"] == "FAIL"

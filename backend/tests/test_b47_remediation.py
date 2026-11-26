@@ -354,7 +354,7 @@ def test_insufficient_budget_and_failed_transport_retire_only_owned_grants(tmp_p
 
 
 def test_consumed_grant_cannot_be_replayed_even_if_reinserted(tmp_path):
-    from workflow.offline_batch import OfflineBatchSelection
+    from workflow.generic_imported_batch import ImportedBatchSelection
     from workflow.batch import BatchCase, BatchRejected
     ctx = setup_imported_workflow(tmp_path, lambda req: response())
     selected = selection(ctx)
@@ -368,7 +368,7 @@ def test_consumed_grant_cannot_be_replayed_even_if_reinserted(tmp_path):
     ctx[3].policy = ctx[3].policy.model_copy(update={'grants': [grant]})
     ctx[2]._owned_grants.add(auth_id)
     with pytest.raises(BatchRejected):
-        ctx[2]._run_case(OfflineBatchSelection.model_validate(selected), case, uuid4().hex, lambda _: None)
+        ctx[2]._run_case(ImportedBatchSelection.model_validate(selected), case, uuid4().hex, lambda _: None)
 
 
 def test_linked_dataset_listing_is_rejected(tmp_path):

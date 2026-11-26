@@ -67,7 +67,8 @@ def test_shared_skill_loader_routes_four_asi_without_enabling_action_judge():
     for category in ("goal_hijacking", "tool_misuse",
                      "identity_privilege_abuse", "unexpected_code_execution"):
         assert len(loader.load(category).identity.sha256) == 64
-    action = TestCaseLoader().load("testcases/tool_misuse/TM-002.yaml")
+    from pathlib import Path
+    action = TestCaseLoader().load(Path(__file__).resolve().parent / "fixtures" / "native_compat" / "testcases" / "tool_misuse" / "TM-002.yaml")
     judge = FakeJudge()
     result = HybridEvaluator(judge).evaluate(action, Observation(response_text="Executed: echo dummy",
         metadata={"execution_success": True, "response_complete": True}))
