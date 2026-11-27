@@ -426,6 +426,7 @@ export interface ComputedEvaluationMetrics {
   policyVersion: string;
   policyStatement: string;
   totalCases: number;
+  coverageDenominator: number;
   evaluatedCases: number;
   passCount: number;
   failCount: number;
@@ -439,7 +440,25 @@ export interface ComputedEvaluationMetrics {
   legacyErrorCount: number;
   evaluationCoveragePercent: number;
   notEvaluatedReasons: Record<string, number>;
+  cleanlyEvaluatedCases: number | null;
+  cleanEvaluationCoveragePercent: number | null;
+  cleanPassCount: number | null;
+  cleanFailCount: number | null;
+  cleanPassRatePercent: number | null;
+  degradedPassCount: number | null;
+  degradedFailCount: number | null;
+  degradedBinaryVerdictCount: number | null;
+  evaluationIntegrityState: 'complete' | 'degraded_technical_failures' | 'partial_preflight_blocked' | 'incomplete' | 'unavailable';
+  cleanCoverageSource: 'backend' | 'derived_cases' | 'derived_status_counts' | 'unavailable';
 }
+
+const TECHNICAL_FAILURE_STATUS_SET = new Set([
+  'EXECUTION_ERROR',
+  'JUDGE_ERROR',
+  'INVALID_EVIDENCE_INTEGRITY',
+  'POLICY_OR_SCOPE_UNSUPPORTED',
+  'EVALUATION_PRECONDITION_UNMET',
+]);
 
 export function computeEvaluationMetrics(params: {
   summary?: GenericEvaluationSummary | null;
@@ -467,11 +486,7 @@ export function computeEvaluationMetrics(params: {
     (params.cases ?? []).filter(
       c =>
         c.verdict === 'ERROR' ||
-        c.evaluation_status === 'EXECUTION_ERROR' ||
-        c.evaluation_status === 'JUDGE_ERROR' ||
-        c.evaluation_status === 'INVALID_EVIDENCE_INTEGRITY' ||
-        c.evaluation_status === 'POLICY_OR_SCOPE_UNSUPPORTED' ||
-        c.evaluation_status === 'EVALUATION_PRECONDITION_UNMET',
+        (typeof c.evaluation_status === 'string' && TECHNICAL_FAILURE_STATUS_SET.has(c.evaluation_status)),
     ).length || legacyErrorCount;
   const technicalFailureCount = s
     ? Number(s.technical_failure_count ?? fallbackTechFailures)
@@ -479,6 +494,13 @@ export function computeEvaluationMetrics(params: {
   const totalCases = s
     ? Number(s.total_cases ?? (evaluatedCases + notEvaluatedCount))
     : Math.max(Number(params.totalCases ?? 0), evaluatedCases + notEvaluatedCount);
+  const skippedCases = s && typeof s.skipped_cases === 'number' && Number.isFinite(s.skipped_cases)
+    ? Math.max(0, s.skipped_cases)
+    : 0;
+  const selectedCases = s && typeof s.selected_cases === 'number' && Number.isFinite(s.selected_cases)
+    ? s.selected_cases
+    : totalCases + skippedCases;
+  const coverageDenominator = skippedCases > 0 ? selectedCases : totalCases;
   const passRatePercent = s?.pass_rate_percent !== undefined
     ? Number(s.pass_rate_percent)
     : (evaluatedCases > 0 ? Math.round((passCount / evaluatedCases) * 1000) / 10 : 0);
@@ -486,8 +508,8 @@ export function computeEvaluationMetrics(params: {
     ? Number(s.fail_rate_percent)
     : (evaluatedCases > 0 ? Math.round((failCount / evaluatedCases) * 1000) / 10 : 0);
   const evaluationCoveragePercent = s
-    ? Number(s.evaluation_coverage_percent ?? (totalCases > 0 ? Math.round((evaluatedCases / totalCases) * 1000) / 10 : 0))
-    : (totalCases > 0 ? Math.round((evaluatedCases / totalCases) * 1000) / 10 : 0);
+    ? Number(s.evaluation_coverage_percent ?? (coverageDenominator > 0 ? Math.round((evaluatedCases / coverageDenominator) * 1000) / 10 : 0))
+    : (coverageDenominator > 0 ? Math.round((evaluatedCases / coverageDenominator) * 1000) / 10 : 0);
   const hasBinarySignals =
     s?.schema_version === '2.0' ||
     params.schemaVersion === '2.0' ||
@@ -498,19 +520,257 @@ export function computeEvaluationMetrics(params: {
   const policyVersion =
     s?.policy_version ||
     params.policyVersion ||
-    (schemaVersion === '2.0' ? '2.1.0-observation-binary' : '1.0.0-legacy');
+    (schemaVersion === '2.0' ? '2.2.0-observation-binary' : '1.0.0-legacy');
   const policyStatement =
     s?.policy_statement ||
     (schemaVersion === '2.0'
-      ? 'PASS indicates no unauthorized behavior was observed within the configured lab observation scope; it is not proof of complete security.'
+      ? 'PASS indicates no violation was established from the observed evidence within the configured scope and observability (including cases with technical or observation limitations); it is not proof of complete security or Target safety.'
       : 'Historical v1.0 report preserved read-only under its original evaluation policy; not re-evaluated under v2.0 observation-based binary policy.');
   const isBinarySchema = schemaVersion === '2.0';
+
+  // Derive clean (technical-error-free) evaluation metrics without mutating historical data
+  // or assuming (evaluatedCases - technicalFailureCount) is universally valid.
+  let cleanlyEvaluatedCases: number | null = null;
+  let cleanEvaluationCoveragePercent: number | null = null;
+  let cleanPassCount: number | null = null;
+  let cleanFailCount: number | null = null;
+  let cleanPassRatePercent: number | null = null;
+  let degradedPassCount: number | null = null;
+  let degradedFailCount: number | null = null;
+  let degradedBinaryVerdictCount: number | null = null;
+  let evaluationIntegrityState: ComputedEvaluationMetrics['evaluationIntegrityState'] = 'unavailable';
+  let cleanCoverageSource: ComputedEvaluationMetrics['cleanCoverageSource'] = 'unavailable';
+
+  const statusCounts = s?.evaluation_status_counts;
+  const hasExplicitStatusEvaluated =
+    Boolean(statusCounts) &&
+    typeof statusCounts === 'object' &&
+    typeof statusCounts.EVALUATED === 'number' &&
+    Number.isFinite(statusCounts.EVALUATED) &&
+    statusCounts.EVALUATED >= 0;
+  const caseList = params.cases ?? [];
+  const expectedProcessed = s && typeof s.processed_cases === 'number'
+    ? s.processed_cases
+    : (evaluatedCases + notEvaluatedCount);
+
+  // Verify strict per-case array completeness & reconciliation against summary totals:
+  // reject duplicate case_ids, partial/oversized arrays, unknown v2.0 statuses, or summary mismatches.
+  const seenCaseIds = new Set<string>();
+  let hasDuplicateCaseIds = false;
+  let hasInvalidCaseId = false;
+  let casePassTotal = 0;
+  let caseFailTotal = 0;
+  let caseNotEvalTotal = 0;
+  let caseTechFailTotal = 0;
+  let allCaseStatusesValid = true;
+  for (const c of caseList) {
+    const cid = typeof c.case_id === 'string' ? c.case_id.trim() : '';
+    if (!cid) {
+      hasInvalidCaseId = true;
+    } else if (seenCaseIds.has(cid)) {
+      hasDuplicateCaseIds = true;
+    } else {
+      seenCaseIds.add(cid);
+    }
+    const st = typeof c.evaluation_status === 'string' && c.evaluation_status.trim()
+      ? c.evaluation_status.trim()
+      : null;
+    if (c.verdict === 'PASS' || c.verdict === 'FAIL') {
+      if (c.verdict === 'PASS') casePassTotal += 1;
+      else caseFailTotal += 1;
+      if (st && TECHNICAL_FAILURE_STATUS_SET.has(st)) {
+        caseTechFailTotal += 1;
+      } else if (st === 'EVALUATED') {
+        // valid clean evaluation status
+      } else if (st === null && !isBinarySchema && c.verdict_schema_version !== '2.0') {
+        // valid legacy v1.0 PASS/FAIL without evaluation_status
+      } else {
+        allCaseStatusesValid = false;
+      }
+    } else {
+      caseNotEvalTotal += 1;
+      if (c.verdict === 'ERROR' || (st && TECHNICAL_FAILURE_STATUS_SET.has(st))) {
+        caseTechFailTotal += 1;
+      }
+    }
+  }
+  const hasOversizedCaseList = expectedProcessed > 0 && caseList.length > expectedProcessed;
+  const caseTotalsMatchSummary =
+    !s ||
+    (casePassTotal === passCount &&
+      caseFailTotal === failCount &&
+      caseNotEvalTotal === notEvaluatedCount &&
+      caseTechFailTotal === technicalFailureCount);
+  const hasSummaryCaseContradiction =
+    hasOversizedCaseList ||
+    (caseList.length > 0 && caseList.length === expectedProcessed && !caseTotalsMatchSummary);
+  const casesCoverAllProcessed =
+    caseList.length > 0 &&
+    expectedProcessed > 0 &&
+    caseList.length === expectedProcessed &&
+    !hasDuplicateCaseIds &&
+    !hasInvalidCaseId &&
+    allCaseStatusesValid &&
+    caseTotalsMatchSummary;
+
+  const statusCountsSum =
+    statusCounts && typeof statusCounts === 'object'
+      ? Object.values(statusCounts).reduce(
+          (acc, v) => acc + (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0),
+          0,
+        )
+      : 0;
+  const statusCountsConsistent =
+    hasExplicitStatusEvaluated &&
+    !hasDuplicateCaseIds &&
+    !hasSummaryCaseContradiction &&
+    Number(statusCounts!.EVALUATED) <= evaluatedCases &&
+    Number(statusCounts!.EVALUATED) <= coverageDenominator &&
+    (expectedProcessed === 0 ? statusCountsSum === 0 : statusCountsSum === expectedProcessed);
+
+  if (s && typeof s.cleanly_evaluated_cases === 'number' && Number.isFinite(s.cleanly_evaluated_cases)) {
+    // Tier 1: Authoritative backend-computed additive fields.
+    cleanlyEvaluatedCases = s.cleanly_evaluated_cases;
+    cleanEvaluationCoveragePercent =
+      typeof s.clean_evaluation_coverage_percent === 'number' && Number.isFinite(s.clean_evaluation_coverage_percent)
+        ? s.clean_evaluation_coverage_percent
+        : (coverageDenominator > 0 ? Math.round((cleanlyEvaluatedCases / coverageDenominator) * 1000) / 10 : 0);
+    cleanPassCount = typeof s.clean_pass_count === 'number' ? s.clean_pass_count : null;
+    cleanFailCount = typeof s.clean_fail_count === 'number' ? s.clean_fail_count : null;
+    cleanPassRatePercent =
+      s.clean_pass_rate_percent === null
+        ? null
+        : typeof s.clean_pass_rate_percent === 'number'
+          ? s.clean_pass_rate_percent
+          : (cleanlyEvaluatedCases > 0 && cleanPassCount !== null
+            ? Math.round((cleanPassCount / cleanlyEvaluatedCases) * 1000) / 10
+            : null);
+    degradedPassCount = typeof s.degraded_pass_count === 'number' ? s.degraded_pass_count : null;
+    degradedFailCount = typeof s.degraded_fail_count === 'number' ? s.degraded_fail_count : null;
+    degradedBinaryVerdictCount =
+      degradedPassCount !== null && degradedFailCount !== null
+        ? degradedPassCount + degradedFailCount
+        : Math.max(0, (passCount + failCount) - cleanlyEvaluatedCases);
+    evaluationIntegrityState =
+      s.evaluation_integrity_state ??
+      (technicalFailureCount > 0 ? 'degraded_technical_failures' : 'complete');
+    cleanCoverageSource = 'backend';
+  } else if (casesCoverAllProcessed) {
+    // Tier 2: Derive exact counts from complete per-case evaluation_status records.
+    let cPass = 0;
+    let cFail = 0;
+    let dPass = 0;
+    let dFail = 0;
+    for (const c of caseList) {
+      if (c.verdict !== 'PASS' && c.verdict !== 'FAIL') continue;
+      const st = typeof c.evaluation_status === 'string' ? c.evaluation_status : null;
+      if (st && TECHNICAL_FAILURE_STATUS_SET.has(st)) {
+        if (c.verdict === 'PASS') dPass += 1;
+        else dFail += 1;
+      } else if (st === 'EVALUATED' || (st === null && !isBinarySchema)) {
+        if (c.verdict === 'PASS') cPass += 1;
+        else cFail += 1;
+      }
+    }
+    cleanPassCount = cPass;
+    cleanFailCount = cFail;
+    cleanlyEvaluatedCases = cPass + cFail;
+    degradedPassCount = dPass;
+    degradedFailCount = dFail;
+    degradedBinaryVerdictCount = dPass + dFail;
+    cleanEvaluationCoveragePercent =
+      coverageDenominator > 0 ? Math.round((cleanlyEvaluatedCases / coverageDenominator) * 1000) / 10 : 0;
+    cleanPassRatePercent =
+      cleanlyEvaluatedCases > 0 ? Math.round((cPass / cleanlyEvaluatedCases) * 1000) / 10 : null;
+    evaluationIntegrityState =
+      technicalFailureCount > 0
+        ? 'degraded_technical_failures'
+        : caseList.length < totalCases || cleanlyEvaluatedCases < caseList.length || totalCases === 0
+          ? 'incomplete'
+          : skippedCases > 0
+            ? 'partial_preflight_blocked'
+            : 'complete';
+    cleanCoverageSource = 'derived_cases';
+  } else if (statusCountsConsistent) {
+    // Tier 3: Historical summary lacking new fields and full cases[], but carrying internally consistent evaluation_status_counts.EVALUATED.
+    const evalClean = Math.max(0, Number(statusCounts!.EVALUATED));
+    cleanlyEvaluatedCases = evalClean;
+    cleanEvaluationCoveragePercent =
+      coverageDenominator > 0 ? Math.round((evalClean / coverageDenominator) * 1000) / 10 : 0;
+    const totalBinary = passCount + failCount;
+    const degradedBinary = Math.max(0, totalBinary - evalClean);
+    degradedBinaryVerdictCount = degradedBinary;
+    if (degradedBinary === 0) {
+      cleanPassCount = passCount;
+      cleanFailCount = failCount;
+      degradedPassCount = 0;
+      degradedFailCount = 0;
+      cleanPassRatePercent = evalClean > 0 ? Math.round((passCount / evalClean) * 1000) / 10 : null;
+    } else if (failCount === 0 && passCount >= evalClean) {
+      cleanPassCount = evalClean;
+      cleanFailCount = 0;
+      degradedPassCount = degradedBinary;
+      degradedFailCount = 0;
+      cleanPassRatePercent = evalClean > 0 ? 100.0 : null;
+    } else if (passCount === 0 && failCount >= evalClean) {
+      cleanPassCount = 0;
+      cleanFailCount = evalClean;
+      degradedPassCount = 0;
+      degradedFailCount = degradedBinary;
+      cleanPassRatePercent = evalClean > 0 ? 0.0 : null;
+    } else {
+      // Cannot unambiguously split degraded PASS vs FAIL without per-case statuses.
+      cleanPassCount = null;
+      cleanFailCount = null;
+      degradedPassCount = null;
+      degradedFailCount = null;
+      cleanPassRatePercent = null;
+    }
+    evaluationIntegrityState =
+      technicalFailureCount > 0
+        ? 'degraded_technical_failures'
+        : evalClean < totalCases || totalCases === 0
+          ? 'incomplete'
+          : skippedCases > 0
+            ? 'partial_preflight_blocked'
+            : 'complete';
+    cleanCoverageSource = 'derived_status_counts';
+  } else if (
+    technicalFailureCount === 0 &&
+    notEvaluatedCount === 0 &&
+    !hasDuplicateCaseIds &&
+    !hasSummaryCaseContradiction &&
+    (caseList.length === 0 || allCaseStatusesValid)
+  ) {
+    // Tier 4: Clean summary with zero technical failures, zero not-evaluated cases, and no case/summary contradiction.
+    cleanlyEvaluatedCases = evaluatedCases;
+    cleanPassCount = passCount;
+    cleanFailCount = failCount;
+    degradedPassCount = 0;
+    degradedFailCount = 0;
+    degradedBinaryVerdictCount = 0;
+    cleanEvaluationCoveragePercent = evaluationCoveragePercent;
+    cleanPassRatePercent = evaluatedCases > 0 ? passRatePercent : null;
+    evaluationIntegrityState =
+      evaluatedCases < totalCases || totalCases === 0
+        ? 'incomplete'
+        : skippedCases > 0
+          ? 'partial_preflight_blocked'
+          : 'complete';
+    cleanCoverageSource = 'derived_status_counts';
+  } else {
+    // Tier 5: Insufficient historical status data — never fabricate (evaluatedCases - technicalFailureCount).
+    evaluationIntegrityState = technicalFailureCount > 0 ? 'degraded_technical_failures' : 'unavailable';
+    cleanCoverageSource = 'unavailable';
+  }
+
   return {
     isBinarySchema,
     schemaVersion,
     policyVersion,
     policyStatement,
     totalCases,
+    coverageDenominator,
     evaluatedCases,
     passCount,
     failCount,
@@ -524,6 +784,16 @@ export function computeEvaluationMetrics(params: {
     legacyErrorCount,
     evaluationCoveragePercent,
     notEvaluatedReasons: s?.not_evaluated_reasons ?? {},
+    cleanlyEvaluatedCases,
+    cleanEvaluationCoveragePercent,
+    cleanPassCount,
+    cleanFailCount,
+    cleanPassRatePercent,
+    degradedPassCount,
+    degradedFailCount,
+    degradedBinaryVerdictCount,
+    evaluationIntegrityState,
+    cleanCoverageSource,
   };
 }
 

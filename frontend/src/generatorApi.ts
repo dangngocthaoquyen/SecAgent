@@ -710,6 +710,16 @@ export type GenerateAndRunSnapshot = {
     technical_failure_reasons?: Record<string, number>;
     not_evaluated_count?: number;
     not_evaluated_reasons?: Record<string, number>;
+    evaluation_status_counts?: Record<string, number>;
+    cleanly_evaluated_cases?: number;
+    clean_evaluation_coverage?: number;
+    clean_evaluation_coverage_percent?: number;
+    clean_pass_count?: number;
+    clean_fail_count?: number;
+    clean_pass_rate_percent?: number | null;
+    degraded_pass_count?: number;
+    degraded_fail_count?: number;
+    evaluation_integrity_state?: 'complete' | 'degraded_technical_failures' | 'partial_preflight_blocked' | 'incomplete';
   } | null;
   evidence_summary: Record<string, unknown>;
   judge_metadata: Record<string, unknown> | null;

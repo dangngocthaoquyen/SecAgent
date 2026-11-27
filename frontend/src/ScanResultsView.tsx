@@ -474,6 +474,76 @@ export default function ScanResultsView({
 
       <TechnicalDiagnosticsNotice record={runRecord} />
 
+      {evalMetrics.technicalFailureCount > 0 && (
+        <div
+          className="notice warn"
+          role="alert"
+          data-testid="degraded-evaluation-alert"
+        >
+          <strong>
+            Evaluation Degraded by Technical Failures ({evalMetrics.technicalFailureCount} case
+            {evalMetrics.technicalFailureCount === 1 ? '' : 's'}):
+          </strong>{' '}
+          <span>
+            {evalMetrics.cleanlyEvaluatedCases !== null && evalMetrics.cleanEvaluationCoveragePercent !== null ? (
+              <>
+                Clean evaluation coverage (without technical failures):{' '}
+                <strong>
+                  {evalMetrics.cleanlyEvaluatedCases} / {evalMetrics.coverageDenominator} (
+                  {evalMetrics.cleanEvaluationCoveragePercent.toFixed(1)}%)
+                </strong>
+                {' · '}Binary verdict coverage: {evalMetrics.evaluatedCases} / {evalMetrics.coverageDenominator} (
+                {evalMetrics.evaluationCoveragePercent.toFixed(1)}%).
+              </>
+            ) : (
+              <>
+                Clean evaluation coverage: <strong>Unavailable</strong> (historical report lacks sufficient per-case
+                evaluation status breakdown; binary verdict coverage is{' '}
+                {evalMetrics.evaluationCoveragePercent.toFixed(1)}%).
+              </>
+            )}
+          </span>{' '}
+          <span>
+            {evalMetrics.degradedPassCount !== null && evalMetrics.degradedFailCount !== null ? (
+              evalMetrics.degradedPassCount > 0 || evalMetrics.degradedFailCount > 0 ? (
+                <>
+                  Verdicts affected by technical failures:{' '}
+                  <strong>
+                    {evalMetrics.degradedPassCount} PASS
+                    {evalMetrics.degradedFailCount > 0 ? `, ${evalMetrics.degradedFailCount} FAIL` : ''}
+                  </strong>
+                  .
+                </>
+              ) : (
+                <>
+                  {evalMetrics.technicalFailureCount} case{evalMetrics.technicalFailureCount === 1 ? '' : 's'}{' '}
+                  recorded technical failures without a binary PASS/FAIL verdict.
+                </>
+              )
+            ) : evalMetrics.degradedBinaryVerdictCount !== null && evalMetrics.degradedBinaryVerdictCount > 0 ? (
+              <>
+                Binary verdicts affected by technical failures:{' '}
+                <strong>{evalMetrics.degradedBinaryVerdictCount}</strong> (exact PASS/FAIL split unavailable from
+                summary-only historical data).
+              </>
+            ) : null}
+          </span>{' '}
+          {Object.entries(evalMetrics.technicalFailureReasons).length > 0 && (
+            <span>
+              Reasons:{' '}
+              {Object.entries(evalMetrics.technicalFailureReasons)
+                .map(([r, cnt]) => `${formatEvaluationReasonCode(r)}: ${cnt}`)
+                .join(' · ')}
+              .{' '}
+            </span>
+          )}
+          <span>
+            Technical-error-degraded PASS verdicts indicate no violation was established under observation-binary policy
+            and do not demonstrate target security.
+          </span>
+        </div>
+      )}
+
       {/* Distinct Binary PASS/FAIL & Technical Failure KPI Cards */}
       {evalMetrics.isBinarySchema && evalMetrics.legacyInconclusiveCount === 0 ? (
         <div className="cards verdict-kpis" role="region" aria-label="Verdict summary metrics">
@@ -504,7 +574,16 @@ export default function ScanResultsView({
               {evalMetrics.evaluatedCases} / {evalMetrics.totalCases}
             </div>
             <div className="s">
-              {evalMetrics.evaluationCoveragePercent.toFixed(1)}% binary · Policy {evalMetrics.policyVersion}
+              {evalMetrics.evaluationCoveragePercent.toFixed(1)}% binary
+              {evalMetrics.technicalFailureCount > 0 && (
+                <>
+                  {' · '}
+                  {evalMetrics.cleanlyEvaluatedCases !== null && evalMetrics.cleanEvaluationCoveragePercent !== null
+                    ? `${evalMetrics.cleanlyEvaluatedCases}/${evalMetrics.coverageDenominator} (${evalMetrics.cleanEvaluationCoveragePercent.toFixed(1)}%) clean`
+                    : 'Clean coverage unavailable'}
+                </>
+              )}
+              {' · '}Policy {evalMetrics.policyVersion}
             </div>
           </article>
         </div>

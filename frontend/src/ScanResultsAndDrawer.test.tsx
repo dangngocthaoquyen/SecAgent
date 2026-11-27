@@ -2,6 +2,7 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import SavedRuns from './SavedRuns';
 import ScanResultsView from './ScanResultsView';
+import { computeEvaluationMetrics } from './scanFormatters';
 import type { GenericRunCaseResult, GenericRunRecord } from './testingApi';
 
 function build30CaseRunRecord(overrides?: Partial<GenericRunRecord>): GenericRunRecord {
@@ -510,5 +511,373 @@ describe('ScanResultsView and TestcaseDetailDrawer UI Contracts', () => {
       .getAllByRole('option')
       .map(o => o.textContent);
     expect(optionLabels).toEqual(['All verdicts', 'PASS', 'FAIL']);
+    expect(screen.queryByTestId('degraded-evaluation-alert')).not.toBeInTheDocument();
+  });
+
+  it('G16-R2 P0A: displays prominent accessible alert on Run 81b73474 degraded fixture while keeping binary PASS/FAIL cards', () => {
+    const evaluatedIds = new Set(['G11-ASI05-001', 'G11-ASI05-002', 'G11-ASI05-003', 'G11-ASI05-004', 'G11-ASI05-009']);
+    const cases: GenericRunCaseResult[] = Array.from({ length: 20 }, (_, i) => {
+      const cid = `G11-ASI05-${String(i + 1).padStart(3, '0')}`;
+      const isClean = evaluatedIds.has(cid);
+      return {
+        case_id: cid,
+        run_id: String(i + 1).repeat(32).slice(0, 32),
+        category: 'unexpected_code_execution',
+        prompt: `Prompt ${cid}`,
+        response_text: 'Sandbox response',
+        response_complete: true,
+        verdict: 'PASS',
+        evaluation_status: isClean ? 'EVALUATED' : 'JUDGE_ERROR',
+        evaluation_reason_code: isClean ? null : 'JUDGE_ERROR',
+        verdict_schema_version: '2.0',
+        evidence_limitations: isClean
+          ? ['target_reported_unverified_execution']
+          : ['target_reported_unverified_execution', 'judge_error_no_violation_observed'],
+        reason: isClean ? 'No violation observed.' : 'Judge exited nonzero.',
+        judge_reason: isClean ? 'Boundary preserved.' : null,
+        judge_classification: isClean ? 'RESPONSE_BOUNDARY_PRESERVED' : null,
+        semantic_invoked: true,
+        evidence_level: 'target_reported_claim',
+        provenance_tiers: ['target_reported'],
+        execution_status: 'executed',
+        collector_diagnostics: [],
+        evidence: [],
+        report_path: `results/${cid}.secagent.json`,
+      };
+    });
+
+    const record = build30CaseRunRecord({
+      generic_run_id: '81b73474825c4b278ace956da7e4545a',
+      verdict_schema_version: '2.0',
+      verdict_policy_version: '2.2.0-observation-binary',
+      selected_cases: 20,
+      ready_count: 20,
+      executed_cases: 20,
+      total_cases: 20,
+      verdict_counts: { PASS: 20 },
+      error_code: 'technical_evaluation_failure',
+      evaluation_summary: {
+        schema_version: '2.0',
+        policy_version: '2.2.0-observation-binary',
+        policy_statement:
+          'PASS indicates no violation was established from the observed evidence within the configured scope and observability (including cases with technical or observation limitations); it is not proof of complete security or Target safety.',
+        total_cases: 20,
+        selected_cases: 20,
+        processed_cases: 20,
+        skipped_cases: 0,
+        evaluated_cases: 20,
+        pass_count: 20,
+        fail_count: 0,
+        pass_rate: 1.0,
+        pass_rate_percent: 100.0,
+        fail_rate: 0.0,
+        fail_rate_percent: 0.0,
+        technical_failure_count: 15,
+        technical_failure_reasons: { JUDGE_ERROR: 15 },
+        evidence_limitation_counts: { judge_error_no_violation_observed: 15, target_reported_unverified_execution: 20 },
+        not_evaluated_count: 0,
+        evaluation_coverage: 1.0,
+        evaluation_coverage_percent: 100.0,
+        not_evaluated_reasons: { JUDGE_ERROR: 15 },
+        evaluation_status_counts: { EVALUATED: 5, JUDGE_ERROR: 15 },
+        cleanly_evaluated_cases: 5,
+        clean_evaluation_coverage: 0.25,
+        clean_evaluation_coverage_percent: 25.0,
+        clean_pass_count: 5,
+        clean_fail_count: 0,
+        clean_pass_rate_percent: 100.0,
+        degraded_pass_count: 15,
+        degraded_fail_count: 0,
+        evaluation_integrity_state: 'degraded_technical_failures',
+      },
+      cases,
+    });
+
+    render(
+      <ScanResultsView
+        runRecord={record}
+        localSingleUser={true}
+        secret=""
+        onNewScan={() => {}}
+      />,
+    );
+
+    // Prominent accessible role="alert" degradation warning
+    const alert = screen.getByTestId('degraded-evaluation-alert');
+    expect(alert).toHaveAttribute('role', 'alert');
+    expect(alert).toHaveTextContent(/15 cases/i);
+    expect(alert).toHaveTextContent(/5 \/ 20 \(25\.0%\)/);
+    expect(alert).toHaveTextContent(/Binary verdict coverage: 20 \/ 20 \(100\.0%\)/);
+    expect(alert).toHaveTextContent(/15 PASS/);
+    expect(alert).toHaveTextContent(/Judge error: 15/i);
+    expect(alert).toHaveTextContent(/do not demonstrate target security/i);
+
+    // Existing PASS/FAIL & EVALUATED CASES KPI cards retained for backward compatibility
+    const kpiRegion = screen.getByRole('region', { name: 'Verdict summary metrics' });
+    expect(within(kpiRegion).getByText('PASS')).toBeInTheDocument();
+    expect(within(kpiRegion).getByText('FAIL')).toBeInTheDocument();
+    expect(within(kpiRegion).getByText('20 / 20')).toBeInTheDocument();
+    expect(within(kpiRegion).getByText(/5\/20 \(25\.0%\) clean/)).toBeInTheDocument();
+  });
+
+  it('G16-R2 P0A: historical fallback uses evaluation_status_counts, avoids evaluatedCases - technicalFailureCount bug, and reports Unavailable when data is insufficient', () => {
+    // 1) Historical Run 81b73474 summary WITHOUT new backend fields and WITHOUT cases[] -> derives from evaluation_status_counts
+    const derivedFromStatus = computeEvaluationMetrics({
+      summary: {
+        schema_version: '2.0',
+        policy_version: '2.2.0-observation-binary',
+        total_cases: 20,
+        evaluated_cases: 20,
+        pass_count: 20,
+        fail_count: 0,
+        pass_rate_percent: 100.0,
+        fail_rate_percent: 0.0,
+        technical_failure_count: 15,
+        technical_failure_reasons: { JUDGE_ERROR: 15 },
+        not_evaluated_count: 0,
+        evaluation_coverage: 1.0,
+        evaluation_coverage_percent: 100.0,
+        not_evaluated_reasons: { JUDGE_ERROR: 15 },
+        evaluation_status_counts: { EVALUATED: 5, JUDGE_ERROR: 15 },
+      },
+      verdictCounts: { PASS: 20 },
+      cases: [],
+      totalCases: 20,
+    });
+    expect(derivedFromStatus.cleanCoverageSource).toBe('derived_status_counts');
+    expect(derivedFromStatus.cleanlyEvaluatedCases).toBe(5);
+    expect(derivedFromStatus.cleanEvaluationCoveragePercent).toBe(25.0);
+    expect(derivedFromStatus.degradedPassCount).toBe(15);
+    expect(derivedFromStatus.degradedFailCount).toBe(0);
+
+    // 2) Historical v2.1.0 summary where JUDGE_ERROR had verdict=null -> evaluatedCases=2 already excludes it!
+    // Must yield cleanlyEvaluatedCases=2 (66.7%), NEVER evaluatedCases - technicalFailureCount = 1!
+    const v210Historical = computeEvaluationMetrics({
+      summary: {
+        schema_version: '2.0',
+        policy_version: '2.1.0-observation-binary',
+        total_cases: 3,
+        evaluated_cases: 2,
+        pass_count: 1,
+        fail_count: 1,
+        pass_rate_percent: 50.0,
+        fail_rate_percent: 50.0,
+        technical_failure_count: 1,
+        technical_failure_reasons: { JUDGE_ERROR: 1 },
+        not_evaluated_count: 1,
+        evaluation_coverage: 0.6667,
+        evaluation_coverage_percent: 66.7,
+        not_evaluated_reasons: { JUDGE_ERROR: 1 },
+        evaluation_status_counts: { EVALUATED: 2, JUDGE_ERROR: 1 },
+      },
+      verdictCounts: { PASS: 1, FAIL: 1 },
+      cases: [],
+      totalCases: 3,
+    });
+    expect(v210Historical.cleanCoverageSource).toBe('derived_status_counts');
+    expect(v210Historical.cleanlyEvaluatedCases).toBe(2);
+    expect(v210Historical.cleanEvaluationCoveragePercent).toBe(66.7);
+    expect(v210Historical.degradedPassCount).toBe(0);
+    expect(v210Historical.degradedFailCount).toBe(0);
+
+    // 3) Insufficient historical data (no new fields, no evaluation_status_counts.EVALUATED, no cases[])
+    // Must return unavailable instead of inventing (15 - 5 = 10)
+    const insufficient = computeEvaluationMetrics({
+      summary: {
+        schema_version: '2.0',
+        policy_version: '2.2.0-observation-binary',
+        total_cases: 15,
+        evaluated_cases: 15,
+        pass_count: 12,
+        fail_count: 3,
+        pass_rate_percent: 80.0,
+        fail_rate_percent: 20.0,
+        technical_failure_count: 5,
+        technical_failure_reasons: { JUDGE_ERROR: 5 },
+        not_evaluated_count: 0,
+        evaluation_coverage: 1.0,
+        evaluation_coverage_percent: 100.0,
+        not_evaluated_reasons: { JUDGE_ERROR: 5 },
+        evaluation_status_counts: {},
+      },
+      verdictCounts: { PASS: 12, FAIL: 3 },
+      cases: [],
+      totalCases: 15,
+    });
+    expect(insufficient.cleanCoverageSource).toBe('unavailable');
+    expect(insufficient.cleanlyEvaluatedCases).toBeNull();
+    expect(insufficient.cleanEvaluationCoveragePercent).toBeNull();
+    expect(insufficient.degradedPassCount).toBeNull();
+    expect(insufficient.degradedFailCount).toBeNull();
+
+    // Render insufficient historical data in ScanResultsView -> explicit Unavailable text in alert
+    const insufficientRecord = build30CaseRunRecord({
+      verdict_schema_version: '2.0',
+      verdict_policy_version: '2.2.0-observation-binary',
+      selected_cases: 15,
+      ready_count: 15,
+      executed_cases: 15,
+      total_cases: 15,
+      verdict_counts: { PASS: 12, FAIL: 3 },
+      evaluation_summary: {
+        schema_version: '2.0',
+        policy_version: '2.2.0-observation-binary',
+        total_cases: 15,
+        evaluated_cases: 15,
+        pass_count: 12,
+        fail_count: 3,
+        pass_rate_percent: 80.0,
+        fail_rate_percent: 20.0,
+        technical_failure_count: 5,
+        technical_failure_reasons: { JUDGE_ERROR: 5 },
+        not_evaluated_count: 0,
+        evaluation_coverage: 1.0,
+        evaluation_coverage_percent: 100.0,
+        not_evaluated_reasons: { JUDGE_ERROR: 5 },
+        evaluation_status_counts: {},
+      },
+      cases: [],
+    });
+    render(
+      <ScanResultsView
+        runRecord={insufficientRecord}
+        localSingleUser={true}
+        secret=""
+        onNewScan={() => {}}
+      />,
+    );
+    const alert = screen.getByTestId('degraded-evaluation-alert');
+    expect(alert).toHaveAttribute('role', 'alert');
+    expect(alert).toHaveTextContent(/Clean evaluation coverage:\s*Unavailable/i);
+  });
+
+  it('G16-R2-R1: rejects duplicate case IDs, partial case arrays without status_counts, and summary-mismatched case arrays -> returns unavailable', () => {
+    const mkCase = (
+      case_id: string,
+      verdict: 'PASS' | 'FAIL',
+      evaluation_status: string | null = 'EVALUATED',
+    ): GenericRunCaseResult => ({
+      case_id,
+      run_id: 'a'.repeat(32),
+      category: 'unexpected_code_execution',
+      prompt: 'Prompt',
+      response_text: 'Answer',
+      response_complete: true,
+      verdict,
+      evaluation_status,
+      evaluation_reason_code: evaluation_status === 'EVALUATED' ? null : evaluation_status,
+      verdict_schema_version: '2.0',
+      reason: 'Reason',
+      judge_reason: null,
+      judge_classification: null,
+      semantic_invoked: true,
+      evidence_level: 'target_reported_claim',
+      provenance_tiers: ['target_reported'],
+      execution_status: 'executed',
+      collector_diagnostics: [],
+      evidence: [],
+      report_path: `results/${case_id}.secagent.json`,
+    });
+
+    // 1) Duplicate case_ids matching expectedProcessed length (3 items, only 2 unique IDs) -> unavailable
+    const dupMetrics = computeEvaluationMetrics({
+      summary: {
+        schema_version: '2.0',
+        policy_version: '2.2.0-observation-binary',
+        total_cases: 3,
+        evaluated_cases: 3,
+        pass_count: 3,
+        fail_count: 0,
+        technical_failure_count: 1,
+        not_evaluated_count: 0,
+        evaluation_coverage: 1.0,
+        evaluation_coverage_percent: 100.0,
+        not_evaluated_reasons: { JUDGE_ERROR: 1 },
+        evaluation_status_counts: { EVALUATED: 2, JUDGE_ERROR: 1 },
+      },
+      verdictCounts: { PASS: 3 },
+      cases: [
+        mkCase('TC1', 'PASS', 'EVALUATED'),
+        mkCase('TC1', 'PASS', 'EVALUATED'),
+        mkCase('TC2', 'PASS', 'JUDGE_ERROR'),
+      ],
+      totalCases: 3,
+    });
+    expect(dupMetrics.cleanCoverageSource).toBe('unavailable');
+    expect(dupMetrics.cleanlyEvaluatedCases).toBeNull();
+    expect(dupMetrics.cleanEvaluationCoveragePercent).toBeNull();
+
+    // 2) Partial case array (1 of 3 cases) WITHOUT evaluation_status_counts -> unavailable
+    const partialNoCounts = computeEvaluationMetrics({
+      summary: {
+        schema_version: '2.0',
+        policy_version: '2.2.0-observation-binary',
+        total_cases: 3,
+        evaluated_cases: 3,
+        pass_count: 3,
+        fail_count: 0,
+        technical_failure_count: 1,
+        not_evaluated_count: 0,
+        evaluation_coverage: 1.0,
+        evaluation_coverage_percent: 100.0,
+        not_evaluated_reasons: { JUDGE_ERROR: 1 },
+        evaluation_status_counts: {},
+      },
+      verdictCounts: { PASS: 3 },
+      cases: [mkCase('TC1', 'PASS', 'EVALUATED')],
+      totalCases: 3,
+    });
+    expect(partialNoCounts.cleanCoverageSource).toBe('unavailable');
+    expect(partialNoCounts.cleanlyEvaluatedCases).toBeNull();
+
+    // 3) Case array totals disagree with summary (cases show 3 clean PASS, summary reports 1 technical failure) -> unavailable
+    const mismatchedTotals = computeEvaluationMetrics({
+      summary: {
+        schema_version: '2.0',
+        policy_version: '2.2.0-observation-binary',
+        total_cases: 3,
+        evaluated_cases: 3,
+        pass_count: 3,
+        fail_count: 0,
+        technical_failure_count: 1,
+        not_evaluated_count: 0,
+        evaluation_coverage: 1.0,
+        evaluation_coverage_percent: 100.0,
+        not_evaluated_reasons: { JUDGE_ERROR: 1 },
+        evaluation_status_counts: { EVALUATED: 2, JUDGE_ERROR: 1 },
+      },
+      verdictCounts: { PASS: 3 },
+      cases: [
+        mkCase('TC1', 'PASS', 'EVALUATED'),
+        mkCase('TC2', 'PASS', 'EVALUATED'),
+        mkCase('TC3', 'PASS', 'EVALUATED'),
+      ],
+      totalCases: 3,
+    });
+    expect(mismatchedTotals.cleanCoverageSource).toBe('unavailable');
+    expect(mismatchedTotals.cleanlyEvaluatedCases).toBeNull();
+
+    // 4) v2.0 case with missing evaluation_status=null -> not counted as cleanly evaluated -> unavailable
+    const missingStatus = computeEvaluationMetrics({
+      summary: {
+        schema_version: '2.0',
+        policy_version: '2.2.0-observation-binary',
+        total_cases: 1,
+        evaluated_cases: 1,
+        pass_count: 1,
+        fail_count: 0,
+        technical_failure_count: 0,
+        not_evaluated_count: 0,
+        evaluation_coverage: 1.0,
+        evaluation_coverage_percent: 100.0,
+        not_evaluated_reasons: {},
+        evaluation_status_counts: {},
+      },
+      verdictCounts: { PASS: 1 },
+      cases: [mkCase('TC1', 'PASS', null)],
+      totalCases: 1,
+    });
+    expect(missingStatus.cleanCoverageSource).toBe('unavailable');
+    expect(missingStatus.cleanlyEvaluatedCases).toBeNull();
   });
 });
