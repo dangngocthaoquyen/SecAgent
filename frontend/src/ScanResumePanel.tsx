@@ -1,7 +1,7 @@
 import { type GenericResumePreview } from './testingApi';
 
 const RESUME_BLOCKER_LABELS: Record<string, string> = {
-  generic_resume_not_interrupted: 'Only interrupted scans can be resumed.',
+  generic_resume_not_interrupted: 'Only interrupted or cancelled scans can be resumed.',
   generic_resume_already_active: 'A continuation run for this scan lineage is already active.',
   generic_resume_no_remaining_cases: 'All originally selected testcases in this lineage already have completed results.',
   generic_resume_no_cases_selected: 'No testcases are selected for continuation. Re-enable at least one uncertain testcase in Advanced Resume Options to resume.',
@@ -121,8 +121,12 @@ export default function ScanResumePanel({
     <section className="panel" aria-label="Resume Scan Preview">
       <div className="section-title">
         <div>
-          <span className="eyebrow">INTERRUPTED SCAN RECOVERY · LINKED CONTINUATION RUN</span>
-          <h3>Resume Interrupted Scan</h3>
+          <span className="eyebrow">
+            {preview.parent_status === 'cancelled'
+              ? 'CANCELLED SCAN CONTINUATION · LINKED CONTINUATION RUN'
+              : 'INTERRUPTED SCAN RECOVERY · LINKED CONTINUATION RUN'}
+          </span>
+          <h3>{preview.parent_status === 'cancelled' ? 'Resume Cancelled Scan' : 'Resume Interrupted Scan'}</h3>
           <p className="muted">
             Parent run <code className="mono">{preview.parent_run_id}</code> · Target{' '}
             <strong>{preview.target_name}</strong> (<code className="mono">{preview.target_id}</code>) · Dataset{' '}

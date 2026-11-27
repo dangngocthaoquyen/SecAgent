@@ -434,7 +434,7 @@ export type WorkflowStageName =
   | 'evaluating'
   | 'reporting';
 
-export type StageStatus = 'pending' | 'running' | 'completed' | 'failed' | 'blocked' | 'skipped';
+export type StageStatus = 'pending' | 'running' | 'completed' | 'failed' | 'blocked' | 'skipped' | 'cancelled';
 
 export type WorkflowOverallStatus =
   | 'running'
@@ -442,7 +442,8 @@ export type WorkflowOverallStatus =
   | 'failed'
   | 'blocked'
   | 'partial_stopped'
-  | 'interrupted';
+  | 'interrupted'
+  | 'cancelled';
 
 export type ActiveTargetReservation = {
   target_id: string;
@@ -645,6 +646,9 @@ export type GenerateAndRunSnapshot = {
   submission_id: string | null;
   idempotent_replay: boolean;
   status: WorkflowOverallStatus;
+  cancellation_requested?: boolean;
+  cancellation_requested_at?: string | null;
+  cancelled_at?: string | null;
   current_stage: WorkflowStageName;
   created_at: string;
   updated_at: string;
@@ -1068,4 +1072,20 @@ export const generatorApi = {
         body: payload,
       },
     ),
+
+  cancelGenerateAndRun: (
+    workflowId: string,
+    nonce: string,
+    secret = '',
+  ) =>
+    generatorFetch<{
+      workflow_schema_version: '1.0.0';
+      cancel_outcome: string;
+      workflow: GenerateAndRunSnapshot;
+    }>(`generate-and-run/${encodeURIComponent(workflowId)}/cancel`, {
+      method: 'POST',
+      nonce,
+      secret,
+      body: {},
+    }),
 };

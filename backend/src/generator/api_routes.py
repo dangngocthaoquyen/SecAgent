@@ -86,6 +86,7 @@ GENERATOR_REGEX_ROUTES: tuple[tuple[str, str], ...] = (
     (r"/api/testing/generator/previews/prev-[a-f0-9]{32}/save-status", "GET"),
     (r"/api/testing/generator/generate-and-run/gnr-[a-f0-9]{32}", "GET"),
     (r"/api/testing/generator/generate-and-run/gnr-[a-f0-9]{32}/rerun", "POST"),
+    (r"/api/testing/generator/generate-and-run/gnr-[a-f0-9]{32}/cancel", "POST"),
     (r"/api/testing/generator/generate-and-run/submission/[a-f0-9]{32}", "GET"),
 )
 
@@ -776,6 +777,36 @@ def register_generator_routes(app: Flask, ctx: GeneratorApiContext) -> None:
         return jsonify(
             workflow_schema_version="1.0.0",
             **result_payload,
+        ), status_code
+
+    @app.post("/api/testing/generator/generate-and-run/<workflow_id>/cancel")
+    def generator_cancel_generate_and_run(workflow_id: str):
+        denied = _require_auth()
+        if denied:
+            return denied
+
+        if ctx.orchestrator is None:
+            return _error("generic_runner_unavailable", 503)
+
+        raw = request.get_data()
+        if raw:
+            _, err = _read_checked_json()
+            if err:
+                return err
+
+        try:
+            snapshot, cancel_outcome = ctx.orchestrator.cancel_workflow(
+                workflow_id=workflow_id,
+                owner_id=ctx.operator_identity(),
+            )
+        except OrchestrationError as exc:
+            return _error(exc.code, exc.status_code, exc.message, conflict=exc.conflict)
+
+        status_code = 202 if cancel_outcome == "cancel_requested" else 200
+        return jsonify(
+            workflow_schema_version="1.0.0",
+            cancel_outcome=cancel_outcome,
+            workflow=snapshot.model_dump(mode="json"),
         ), status_code
 
 

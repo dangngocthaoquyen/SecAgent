@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 
+from core.cancellation import RunCancelledError
 from core.models import EvaluationResult, EvaluationStatus, Observation, TestCase
 from core.models.asi05_execution import Asi05ExecutionDecision
 from core.models.evidence import classify_observation_evidence, is_execution_verified
@@ -394,6 +395,8 @@ class HybridEvaluator(BaseEvaluator):
             try:
                 outcome = self._provider.evaluate(request)
                 last_exc = None
+            except RunCancelledError:
+                raise
             except Exception as exc:
                 last_exc = exc
                 outcome = None

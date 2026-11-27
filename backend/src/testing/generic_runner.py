@@ -17,12 +17,14 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import sys
+from threading import Event
 from typing import Any, Literal, Sequence
 from uuid import uuid4
 
 import yaml
 
 from attack_modules import BaseAttackModule, build_default_attack_module_registry
+from core.cancellation import RunCancelledError
 from core.models import EvaluationConfig, EvaluationRule, TargetProfile, TestCase, TestInput
 from core.models.execution import resolve_response_completeness
 from core.models.provenance import (
@@ -238,6 +240,7 @@ def run_generic_cases(
     dataset_metadata: dict[str, Any] | None = None,
     credential_resolver: Any = None,
     extra_sensitive_values: Sequence[str] = (),
+    cancel_event: Event | None = None,
 ) -> dict[str, Any]:
     """Execute one or more cases through Runner -> Collectors -> HybridEvaluator -> Report."""
     out_root = Path(output_dir).resolve()
@@ -285,13 +288,19 @@ def run_generic_cases(
         allowed_collector_endpoints=allowed_collector_endpoints,
         include_submitted_prompt_preview=True,
         extra_sensitive_values=extra_sensitive_values,
+        cancel_event=cancel_event,
     )
 
     verdict_counts: Counter[str] = Counter()
     case_summaries: list[dict[str, Any]] = []
     batch_id = f"batch-{uuid4().hex[:12]}"
+    cancelled = False
+    cancelled_case_id: str | None = None
 
     for idx, (testcase, test_input) in enumerate(cases):
+        if cancel_event is not None and cancel_event.is_set():
+            cancelled = True
+            break
         active_case_meta["case_id"] = testcase.id
         active_case_meta["category"] = testcase.category
         if callable(case_progress_callback):
@@ -308,7 +317,12 @@ def run_generic_cases(
             except Exception:
                 pass
 
-        result = runner.run(testcase, target, test_input)
+        try:
+            result = runner.run(testcase, target, test_input)
+        except RunCancelledError:
+            cancelled = True
+            cancelled_case_id = testcase.id
+            break
         snapshot = runner.last_report or {}
         run_id = str(snapshot.get("run_id") or uuid4().hex)
         envelope = build_summary(
@@ -528,6 +542,7 @@ def run_generic_cases(
         ),
         "research_provenance": run_provenance,
         "cases": case_summaries,
+        **({"cancelled": True, "cancelled_case_id": cancelled_case_id} if cancelled else {}),
     }
     summary_path = out_root / "batch-summary.json"
     summary_bytes = (json.dumps(batch_summary, indent=2, ensure_ascii=False) + "\n").encode("utf-8")

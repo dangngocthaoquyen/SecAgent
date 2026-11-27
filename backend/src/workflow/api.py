@@ -75,6 +75,7 @@ class WorkflowApiContext:
     fail: object
     operator_authorized: object
     generic_run_service: object | None = None
+    operator_identity: object | None = None
 
 
 def create_app(catalog, *, port=8092, admission_policy=None,
@@ -269,7 +270,10 @@ def create_app(catalog, *, port=8092, admission_policy=None,
             "generic_submission_init_failed": "The initial submission failed before creating a Run record; verify status and preview again before retrying.",
             "generic_submission_record_unavailable": "The submission mapping exists on disk, but the Run record is temporarily unavailable. Retry GET verification without starting a duplicate scan.",
             "judge_provider_unavailable": "Hybrid LLM Judge is unavailable or missing credentials. Configure Judge credentials on the server or switch to Deterministic Rules / Evidence Only.",
-            "generic_resume_not_interrupted": "Only interrupted scans can be resumed. Completed, running, or failed runs cannot be resumed.",
+            "generic_resume_not_interrupted": "Only interrupted or cancelled scans can be resumed. Completed, running, or failed runs cannot be resumed.",
+            "generic_run_not_found": "Generic scan run record was not found.",
+            "generic_run_access_denied": "This scan run belongs to a different operator session and cannot be cancelled.",
+            "cancellation_persistence_failed": "Cancellation was signaled to the active scan, but persisting the stop request to disk failed. Retry stop or reload scan status to verify final state.",
             "generic_resume_already_active": "Another continuation run for this scan lineage is already active. Wait for it to finish before resuming again.",
             "generic_resume_no_remaining_cases": "No remaining pending or uncertain testcases exist for this scan lineage.",
             "generic_resume_no_cases_selected": "No definitely pending testcases remain. Explicitly opt into uncertain in-flight testcase(s) and confirm re-execution to resume.",
@@ -391,6 +395,8 @@ def create_app(catalog, *, port=8092, admission_policy=None,
             routes[request.path] = "POST"
         if re.fullmatch(r"/api/testing/generic-runs/[a-f0-9]{32}(?:/(?:report|unified-report)\.json)?", request.path):
             routes[request.path] = "GET"
+        if re.fullmatch(r"/api/testing/generic-runs/[a-f0-9]{32}/cancel", request.path):
+            routes[request.path] = "POST"
         if re.fullmatch(r"/api/testing/generic-runs/[a-f0-9]{32}/resume/(?:preview|start)", request.path):
             routes[request.path] = "POST"
         if re.fullmatch(r"/api/testing/generic-runs/submission/[a-f0-9]{32}", request.path):
@@ -639,6 +645,17 @@ def create_app(catalog, *, port=8092, admission_policy=None,
             return dispatcher.authorized(supplied)
         return bool(operator_secret and supplied and secrets.compare_digest(supplied, operator_secret))
 
+    from hashlib import sha256 as _sha256
+
+    def operator_identity() -> str:
+        if not operator_authorized():
+            return ""
+        if local_single_user:
+            sess = request.headers.get("X-SecAgent-Session", "").strip()
+            return _sha256(f"secagent-local:{sess or 'default'}".encode("utf-8")).hexdigest()
+        supplied = request.headers.get("X-SecAgent-Operator", "")
+        return _sha256(f"secagent-op:{supplied}".encode("utf-8")).hexdigest()
+
     ctx = WorkflowApiContext(
         catalog=catalog,
         managed=managed,
@@ -661,14 +678,13 @@ def create_app(catalog, *, port=8092, admission_policy=None,
         fail=fail,
         operator_authorized=operator_authorized,
         generic_run_service=generic_run_service,
+        operator_identity=operator_identity,
     )
     register_target_routes(app, ctx)
     register_dataset_policy_routes(app, ctx)
     register_execution_routes(app, ctx)
     register_agent_onboarding_routes(app, ctx)
     register_generic_runner_routes(app, ctx)
-
-    from hashlib import sha256 as _sha256
 
     gen_policy_store = getattr(generic_run_service, "policy_store", None)
     gen_dataset_repo = dataset_repo if dataset_repo is not None else getattr(generic_run_service, "dataset_repo", None)
@@ -704,15 +720,6 @@ def create_app(catalog, *, port=8092, admission_policy=None,
         else None
     )
 
-    def generator_operator_identity() -> str:
-        if not operator_authorized():
-            return ""
-        if local_single_user:
-            sess = request.headers.get("X-SecAgent-Session", "").strip()
-            return _sha256(f"secagent-local:{sess or 'default'}".encode("utf-8")).hexdigest()
-        supplied = request.headers.get("X-SecAgent-Operator", "")
-        return _sha256(f"secagent-op:{supplied}".encode("utf-8")).hexdigest()
-
     gen_ctx = GeneratorApiContext(
         generator_service=resolved_gen_service,
         preview_store=gen_preview_store,
@@ -723,7 +730,7 @@ def create_app(catalog, *, port=8092, admission_policy=None,
         orchestrator=gen_orchestrator,
         nonce=nonce,
         operator_authorized=operator_authorized,
-        operator_identity=generator_operator_identity,
+        operator_identity=operator_identity,
     )
     register_generator_routes(app, gen_ctx)
 

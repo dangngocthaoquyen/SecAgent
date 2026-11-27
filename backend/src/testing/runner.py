@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+from threading import Event
 from typing import Any, Sequence
 from uuid import uuid4
 
@@ -13,6 +14,7 @@ from attack_modules import (
     AttackModuleRegistry,
     build_default_attack_module_registry,
 )
+from core.cancellation import RunCancelledError
 from core.models import (
     EvaluationResult,
     EvaluationStatus,
@@ -70,6 +72,7 @@ class Runner:
         allowed_collector_endpoints: tuple[str, ...] = (),
         include_submitted_prompt_preview: bool = False,
         extra_sensitive_values: Sequence[str] = (),
+        cancel_event: Event | None = None,
     ) -> None:
         self._executor = executor if executor is not None else Executor()
         self._observer = observer if observer is not None else ResponseObserver()
@@ -108,6 +111,7 @@ class Runner:
         self._extra_sensitive_values = tuple(
             v for v in (extra_sensitive_values or ()) if isinstance(v, str) and v
         )
+        self._cancel_event = cancel_event
         self._collector_diagnostics: list[CollectorDiagnostic] = []
         self._current_run_id: str | None = None
         self._started_at: str | None = None
@@ -153,7 +157,12 @@ class Runner:
                 self.last_report["report_sink_fault"] = "Report sink failed; evaluation unchanged."
         return result
 
+    def _check_cancelled(self, stage: str) -> None:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise RunCancelledError(f"run_cancelled_{stage}")
+
     def _run(self, testcase, target, test_input) -> EvaluationResult:
+        self._check_cancelled("before_execution")
         req_capability = test_input.parameters.get("required_capability")
         if (
             isinstance(req_capability, str)
@@ -213,16 +222,20 @@ class Runner:
             )
 
         try:
+            self._check_cancelled("before_target_dispatch")
             prepared_prompt = prepared_input.prompt
             self._submitted_prompt = prepared_prompt
             execution_result = self._executor.execute(target, prepared_input)
             self._execution_result = execution_result
+        except RunCancelledError:
+            raise
         except Exception:
             return EvaluationResult(
                 status=EvaluationStatus.ERROR,
                 reason="Execution stage failed.",
             )
 
+        self._check_cancelled("after_target_response")
         try:
             if self._progress_sink is not None:
                 self._progress_sink("collecting_evidence")
@@ -292,6 +305,8 @@ class Runner:
                     asdict(item) for item in self._collector_diagnostics
                 ]
             self._observation = observation
+        except RunCancelledError:
+            raise
         except Exception:
             return EvaluationResult(
                 status=EvaluationStatus.ERROR,
@@ -335,6 +350,7 @@ class Runner:
                 ],
             }
 
+        self._check_cancelled("before_evaluation")
         try:
             rule_prov = (
                 test_input.metadata.get("evaluation_rule_provenance")
@@ -405,7 +421,10 @@ class Runner:
                         reason="Response-only FAIL requires a complete observed response.")
             if not self._custom_evaluator and self._evaluation_config.mode == "rule_only":
                 self._effective_deterministic_result = final_evaluated
+            self._check_cancelled("after_evaluation")
             return final_evaluated
+        except RunCancelledError:
+            raise
         except Exception:
             return EvaluationResult(
                 status=EvaluationStatus.ERROR,

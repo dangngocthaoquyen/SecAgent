@@ -25,6 +25,10 @@ const readableStage = (stage: string | null | undefined) => {
     running_rule_evaluator: 'Evaluating rules',
     persisting_result: 'Persisting result',
     case_completed: 'Case completed',
+    cancellation_requested: 'Cancellation requested',
+    cancelling: 'Stopping...',
+    cancelled_in_flight: 'Cancelled in-flight',
+    not_executed: 'Not executed',
     completed: 'Completed',
     interrupted: 'Interrupted',
     failed: 'Failed',
@@ -34,12 +38,21 @@ const readableStage = (stage: string | null | undefined) => {
   return map[stage] ?? stage.replaceAll('_', ' ');
 };
 
-export function ExecutionStatusIndicator({ status, stage }: { status: string; stage?: string | null }) {
+export function ExecutionStatusIndicator({
+  status,
+  stage,
+  cancellationRequested = false,
+}: {
+  status: string;
+  stage?: string | null;
+  cancellationRequested?: boolean;
+}) {
   const active = status === 'preparing' || status === 'running';
+  const isStopping = active && (cancellationRequested || stage === 'cancelling');
   return (
     <span className={`batch-status-pill ${active ? 'is-running' : status}`}>
       {active && <span className="running-indicator" aria-hidden="true" />}
-      {readableStage(active ? (stage || status) : status)}
+      {isStopping ? 'Stopping...' : readableStage(active ? (stage || status) : status)}
     </span>
   );
 }
@@ -94,7 +107,15 @@ export function ProgressMetadata({ record }: { record: GenericRunRecord }) {
   );
 }
 
-export function ScanProgressBar({ record }: { record: GenericRunRecord }) {
+export function ScanProgressBar({
+  record,
+  onStopScan,
+  stopping = false,
+}: {
+  record: GenericRunRecord;
+  onStopScan?: () => void;
+  stopping?: boolean;
+}) {
   const unified = resolveUnifiedDisplay(record);
   const executed = unified.executedCount;
   const skipped = unified.skippedCount;
@@ -102,6 +123,7 @@ export function ScanProgressBar({ record }: { record: GenericRunRecord }) {
   const ready = unified.readyCount;
   const status = unified.logicalStatus;
   const active = status === 'preparing' || status === 'running';
+  const isStopping = active && (stopping || record.cancellation_requested === true || record.current_stage === 'cancelling');
   const rawPercent = unified.progressPercent;
   const percent =
     (status === 'completed' || status === 'completed_with_errors') && ready > 0 && executed >= ready
@@ -112,22 +134,43 @@ export function ScanProgressBar({ record }: { record: GenericRunRecord }) {
     <section className="card live-hero" aria-label="Live Scan Progress Bar">
       <div className="live-hero-top">
         <div>
-          <ExecutionStatusIndicator status={status} stage={record.current_stage} />
+          <ExecutionStatusIndicator
+            status={status}
+            stage={record.current_stage}
+            cancellationRequested={isStopping}
+          />
           <h2>
-            Scan {status.replaceAll('_', ' ')}
+            {isStopping
+              ? 'Stopping scan...'
+              : `Scan ${status.replaceAll('_', ' ')}`}
             {unified.isUnified && unified.resumeCount > 0 ? ` · Session ${unified.sessionCount}` : ''}
           </h2>
           <p className="caption">
-            {active
-              ? unified.isUnified
-                ? `Continuing logical scan ${unified.logicalScanId.slice(0, 12)} (preserving previously completed results without re-running them).`
-                : 'Results persist to disk incrementally as each testcase finishes. Re-opening this Run ID never replays payloads.'
-              : 'Scan execution finished and results are persisted.'}
+            {isStopping
+              ? 'Cancellation requested on backend — no new testcases will be dispatched. Preserving completed results safely...'
+              : active
+                ? unified.isUnified
+                  ? `Continuing logical scan ${unified.logicalScanId.slice(0, 12)} (preserving previously completed results without re-running them).`
+                  : 'Results persist to disk incrementally as each testcase finishes. Re-opening this Run ID never replays payloads.'
+                : status === 'cancelled'
+                  ? 'Scan was cancelled. Completed testcase verdicts and reports remain persisted; unexecuted testcases were not evaluated.'
+                  : 'Scan execution finished and results are persisted.'}
           </p>
         </div>
-        <div className="live-hero-pct">
+        <div className="live-hero-pct" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
           <strong>{percent}%</strong>
           <span>{executed} / {ready} ready cases</span>
+          {active && onStopScan && (
+            <button
+              type="button"
+              className="btn danger sm"
+              data-testid="stop-scan-btn"
+              disabled={isStopping}
+              onClick={onStopScan}
+            >
+              {isStopping ? 'Stopping...' : 'Stop Scan'}
+            </button>
+          )}
         </div>
       </div>
 
@@ -143,6 +186,16 @@ export function ScanProgressBar({ record }: { record: GenericRunRecord }) {
         </span>
       </div>
 
+      {isStopping && (
+        <p className="notice warn" role="status" data-testid="scan-stopping-notice">
+          Stopping... Backend cancellation has been recorded. Waiting for active step cleanup without dispatching further testcases.
+        </p>
+      )}
+      {status === 'cancelled' && (
+        <p className="notice warn" role="status" data-testid="scan-cancelled-notice">
+          Scan cancelled by operator. Completed testcase verdicts and reports remain preserved; unexecuted testcases were not graded PASS or FAIL.
+        </p>
+      )}
       {status === 'interrupted' && (
         <p className="notice warn" role="alert">
           The scan process stopped before all testcases finished ({record.interrupted_reason || 'process_interrupted'}). Completed testcase records remain safely persisted; re-opening this Run ID does not resend payloads.

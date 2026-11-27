@@ -56,7 +56,7 @@ type ScanStep = 1 | 2 | 3;
 type TestSource = 'ai_generate' | 'existing_dataset' | 'import_dataset';
 
 const TERMINAL_RUN_STATUSES=new Set(['completed','failed','interrupted','cancelled']);
-const TERMINAL_WORKFLOW_STATUSES=new Set(['completed','failed','blocked','partial_stopped','interrupted']);
+const TERMINAL_WORKFLOW_STATUSES=new Set(['completed','failed','blocked','partial_stopped','interrupted','cancelled']);
 const WORKFLOW_ID_RE=/^gnr-[a-f0-9]{32}$/;
 
 function buildReadinessFingerprint(cfg:GeneratorConfigState):string{
@@ -181,6 +181,8 @@ export default function SecurityScanWizard({
  const resumePreviewSeqRef=useRef(0);
 
  const [busy,setBusy]=useState(false);
+ const [stoppingRun,setStoppingRun]=useState(false);
+ const stopInFlightRef=useRef(false);
  const [error,setError]=useState('');
  const [pollConnectionLost,setPollConnectionLost]=useState(false);
  const [pollStopped,setPollStopped]=useState(false);
@@ -372,6 +374,8 @@ export default function SecurityScanWizard({
     }
     if(TERMINAL_WORKFLOW_STATUSES.has(wf.status)){
      clearActiveWorkflowId();
+     setStoppingRun(false);
+     stopInFlightRef.current=false;
      testingApi.listDatasets(secret,nonce).then(setDatasets).catch(()=>{});
      testingApi.listGenericRuns(secret,nonce).then(setSavedRuns).catch(()=>{});
      if(typeof generatorApi.listGenerateAndRunWorkflows==='function'){
@@ -522,6 +526,12 @@ export default function SecurityScanWizard({
     setStep(3);
     setError('');
     const st=loaded.status??'completed';
+    if(TERMINAL_RUN_STATUSES.has(st)&&!loaded.lineage_summary?.active_lineage_run_id){
+     setStoppingRun(false);
+     stopInFlightRef.current=false;
+    }else if(loaded.cancellation_requested){
+     setStoppingRun(true);
+    }
     if(!TERMINAL_RUN_STATUSES.has(st)||Boolean(loaded.lineage_summary?.active_lineage_run_id)){
      timer=setTimeout(refreshRun,350);
     }else{
@@ -654,6 +664,8 @@ export default function SecurityScanWizard({
   setPollConnectionLost(false);
   setPollStopped(false);
   setError('');
+  setStoppingRun(false);
+  stopInFlightRef.current=false;
   setRunRecord(null);
   setActiveRunId('');
   setActiveWorkflowId('');
@@ -706,6 +718,46 @@ export default function SecurityScanWizard({
    location.hash=`#scan/wf/${wf.workflow_id}`;
    window.history.replaceState(null,'',`#scan/wf/${wf.workflow_id}`);
   }catch{}
+ }
+
+ async function handleStopScan(){
+  if(!nonce||stopInFlightRef.current)return;
+  const activeWf=workflowSnapshot&&!TERMINAL_WORKFLOW_STATUSES.has(workflowSnapshot.status)?workflowSnapshot:null;
+  const targetRunId=runRecord
+   ?(runRecord.unified_lineage?.active_session_run_id||runRecord.lineage_summary?.active_lineage_run_id||runRecord.generic_run_id)
+   :'';
+  if(!activeWf&&!targetRunId)return;
+  stopInFlightRef.current=true;
+  setStoppingRun(true);
+  setError('');
+  try{
+   if(activeWf){
+    const res=await generatorApi.cancelGenerateAndRun(activeWf.workflow_id,nonce,secret);
+    setWorkflowSnapshot(res.workflow);
+    if(res.workflow.run_id&&/^[a-f0-9]{32}$/.test(res.workflow.run_id)){
+     try{
+      const refreshedRun=await testingApi.getGenericRun(res.workflow.run_id,secret,nonce);
+      setRunRecord(refreshedRun);
+     }catch{}
+    }
+    if(TERMINAL_WORKFLOW_STATUSES.has(res.workflow.status)){
+     setStoppingRun(false);
+     stopInFlightRef.current=false;
+    }
+   }else if(targetRunId){
+    const updated=await testingApi.cancelGenericRun(targetRunId,secret,nonce);
+    setRunRecord(updated);
+    const st=updated.status??'running';
+    if(TERMINAL_RUN_STATUSES.has(st)&&!updated.lineage_summary?.active_lineage_run_id){
+     setStoppingRun(false);
+     stopInFlightRef.current=false;
+    }
+   }
+  }catch(e){
+   setStoppingRun(false);
+   stopInFlightRef.current=false;
+   setError(e instanceof Error?e.message:'Failed to request scan cancellation.');
+  }
  }
 
  async function handleRerunWorkflowSavedDataset(){
@@ -937,6 +989,8 @@ export default function SecurityScanWizard({
   }
   resetResumeState();
   setError('');
+  setStoppingRun(false);
+  stopInFlightRef.current=false;
   setRunRecord(null);
   setActiveRunId(clean);
   setStep(3);
@@ -1658,6 +1712,17 @@ export default function SecurityScanWizard({
        </h3>
       </div>
       <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+       {!runRecord&&!TERMINAL_WORKFLOW_STATUSES.has(workflowSnapshot.status)&&(
+        <button
+         type="button"
+         className="btn danger sm"
+         data-testid="stop-scan-btn"
+         disabled={stoppingRun||workflowSnapshot.cancellation_requested===true}
+         onClick={()=>{void handleStopScan();}}
+        >
+         {stoppingRun||workflowSnapshot.cancellation_requested?'Stopping...':'Stop Scan'}
+        </button>
+       )}
        {workflowSnapshot.dataset_id&&(
         <a className="btn ghost sm" href="#datasets">
          Dataset: {workflowSnapshot.dataset_name||workflowSnapshot.dataset_id.slice(0,10)}
@@ -1682,6 +1747,11 @@ export default function SecurityScanWizard({
        );
       })}
      </ol>
+     {workflowSnapshot.status==='cancelled'&&(
+      <div className="notice warn" role="status" data-testid="unified-workflow-cancelled-notice" style={{marginTop:'0.65rem'}}>
+       <strong>Workflow Cancelled:</strong> Stopped by operator. Any already-saved dataset and completed testcase reports remain preserved.
+      </div>
+     )}
      {workflowSnapshot.error_message&&(
       <div className="notice error" role="alert" style={{marginTop:'0.65rem'}}>
        <strong>Stopped at <code>{workflowSnapshot.error_stage||workflowSnapshot.current_stage}</code> (<code>{workflowSnapshot.error_code||'error'}</code>):</strong>{' '}
@@ -1712,7 +1782,11 @@ export default function SecurityScanWizard({
        </div>
       </div>
       <ProgressMetadata record={runRecord}/>
-      <ScanProgressBar record={runRecord}/>
+      <ScanProgressBar
+       record={runRecord}
+       onStopScan={()=>{void handleStopScan();}}
+       stopping={stoppingRun||runRecord.cancellation_requested===true}
+      />
       <TechnicalDiagnosticsNotice record={runRecord}/>
       <ExecutionCounters record={runRecord}/>
       <div className="split live-work-grid">

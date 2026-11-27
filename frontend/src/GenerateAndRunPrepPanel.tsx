@@ -58,6 +58,7 @@ const TERMINAL_WORKFLOW_STATUSES = new Set([
   'blocked',
   'partial_stopped',
   'interrupted',
+  'cancelled',
 ]);
 
 function randomHex32(): string {
@@ -168,6 +169,7 @@ export default function GenerateAndRunPrepPanel({
   const [authorizationConfirmed, setAuthorizationConfirmed] = useState(false);
   const [datasetName, setDatasetName] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [rerunning, setRerunning] = useState(false);
   const [workflow, setWorkflow] = useState<GenerateAndRunSnapshot | null>(null);
   const [submitError, setSubmitError] = useState('');
@@ -184,6 +186,7 @@ export default function GenerateAndRunPrepPanel({
   );
 
   const inFlightRef = useRef(false);
+  const stopInFlightRef = useRef(false);
   const rerunInFlightRef = useRef(false);
   const notifiedDatasetRef = useRef<string | null>(null);
 
@@ -282,6 +285,8 @@ export default function GenerateAndRunPrepPanel({
     if (!workflow || !nonce) return;
     if (TERMINAL_WORKFLOW_STATUSES.has(workflow.status)) {
       clearActiveWorkflowId();
+      setStopping(false);
+      stopInFlightRef.current = false;
       setDiscoveredReservation(null);
       setConflictDetail(null);
       return;
@@ -482,6 +487,33 @@ export default function GenerateAndRunPrepPanel({
       authorizationConfirmed &&
       !hybridBlockedByJudge,
   );
+
+  async function handleStopWorkflow() {
+    if (!workflow || !nonce || TERMINAL_WORKFLOW_STATUSES.has(workflow.status) || stopInFlightRef.current) {
+      return;
+    }
+    stopInFlightRef.current = true;
+    setStopping(true);
+    setSubmitError('');
+    try {
+      const res = await generatorApi.cancelGenerateAndRun(workflow.workflow_id, nonce, secret);
+      setWorkflow(res.workflow);
+      if (TERMINAL_WORKFLOW_STATUSES.has(res.workflow.status)) {
+        setStopping(false);
+        stopInFlightRef.current = false;
+      }
+    } catch (err) {
+      setStopping(false);
+      stopInFlightRef.current = false;
+      setSubmitError(
+        err instanceof GeneratorApiError
+          ? `${err.code}: ${err.message}`
+          : err instanceof Error
+            ? err.message
+            : 'Failed to cancel workflow.',
+      );
+    }
+  }
 
   async function handleRerunSavedDataset() {
     if (!canRerunWorkflow || !workflow?.dataset_id || !nonce || rerunInFlightRef.current) {
@@ -1033,10 +1065,22 @@ export default function GenerateAndRunPrepPanel({
                 <strong data-testid="workflow-overall-status">{workflow.status}</strong> · Stage:{' '}
                 <code>{workflow.current_stage}</code>
               </div>
-              <div style={{ fontSize: 12, color: 'var(--muted)' }}>
-                Provider: <code>{workflow.provider_id ?? 'n/a'}</code> /{' '}
-                <code>{workflow.model ?? 'n/a'}</code> · Active Evaluation:{' '}
-                <code data-testid="workflow-eval-mode">{workflow.evaluation_mode}</code>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                {isWorkflowActive && (
+                  <button
+                    type="button"
+                    data-testid="workflow-stop-btn"
+                    disabled={stopping || workflow.cancellation_requested === true}
+                    onClick={() => { void handleStopWorkflow(); }}
+                  >
+                    {stopping || workflow.cancellation_requested ? 'Stopping...' : 'Stop Scan'}
+                  </button>
+                )}
+                <div style={{ fontSize: 12, color: 'var(--muted)' }}>
+                  Provider: <code>{workflow.provider_id ?? 'n/a'}</code> /{' '}
+                  <code>{workflow.model ?? 'n/a'}</code> · Active Evaluation:{' '}
+                  <code data-testid="workflow-eval-mode">{workflow.evaluation_mode}</code>
+                </div>
               </div>
             </div>
 

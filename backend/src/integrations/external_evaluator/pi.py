@@ -1,5 +1,6 @@
 """Stateless Pi CLI connector. No target verdict is produced on process failure."""
 
+import inspect
 import json
 import os
 import re
@@ -14,6 +15,7 @@ from typing import Mapping, Protocol, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from core.cancellation import RunCancelledError
 from integrations.external_evaluator.base import ExternalEvaluatorProvider
 from integrations.external_evaluator.models import (
     EvaluationRequest, ExternalEvaluationOutcome, ProviderFault, ProviderFaultCode,
@@ -42,6 +44,7 @@ class ProcessOutput:
     stderr: bytes = b""
     timed_out: bool = False
     output_exceeded: bool = False
+    cancelled: bool = False
 
 
 class ProcessRunner(Protocol):
@@ -83,7 +86,10 @@ class BoundedSubprocessRunner:
     def run(
         self, argv: Sequence[str], *, input_bytes: bytes, cwd: Path,
         env: Mapping[str, str], timeout_seconds: float, max_output_bytes: int,
+        cancel_event: threading.Event | None = None,
     ) -> ProcessOutput:
+        if cancel_event is not None and cancel_event.is_set():
+            return ProcessOutput(exit_code=None, cancelled=True)
         process = subprocess.Popen(
             list(argv), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, cwd=cwd, env=dict(env), shell=False,
@@ -118,8 +124,13 @@ class BoundedSubprocessRunner:
             thread.start()
         deadline = time.monotonic() + timeout_seconds
         timed_out = False
+        cancelled = False
         try:
             while process.poll() is None:
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    self._stop(process)
+                    break
                 if exceeded.is_set():
                     self._stop(process)
                     break
@@ -136,7 +147,7 @@ class BoundedSubprocessRunner:
                 thread.join(timeout=1)
         return ProcessOutput(
             exit_code=process.returncode, stdout=bytes(stdout), stderr=bytes(stderr),
-            timed_out=timed_out, output_exceeded=exceeded.is_set(),
+            timed_out=timed_out, output_exceeded=exceeded.is_set(), cancelled=cancelled,
         )
 
     @staticmethod
@@ -166,12 +177,16 @@ class PiEvaluatorProvider(ExternalEvaluatorProvider):
         self, config: PiEvaluatorConfig, *,
         bundle_loader: SkillBundleLoader | None = None,
         process_runner: ProcessRunner | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         self._config = config
         self._bundle_loader = bundle_loader or SkillBundleLoader()
         self._process_runner = process_runner or BoundedSubprocessRunner()
+        self._cancel_event = cancel_event
 
     def evaluate(self, request: EvaluationRequest) -> ExternalEvaluationOutcome:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise RunCancelledError("judge_cancelled_before_invocation")
         started = time.monotonic()
         request_hash = request.sha256
         loaded_skill: SkillIdentity | None = None
@@ -211,6 +226,8 @@ class PiEvaluatorProvider(ExternalEvaluatorProvider):
         except OSError:
             return fault(ProviderFaultCode.PROCESS_ERROR, "Pi process or isolated workspace could not be started.")
 
+        if process.cancelled or (self._cancel_event is not None and self._cancel_event.is_set()):
+            raise RunCancelledError("judge_cancelled")
         if process.timed_out:
             return fault(ProviderFaultCode.TIMEOUT, "Pi process timed out.", process.exit_code)
         if process.output_exceeded or len(process.stdout) > self._config.max_output_bytes or len(process.stderr) > self._config.max_output_bytes:
@@ -281,11 +298,23 @@ class PiEvaluatorProvider(ExternalEvaluatorProvider):
                 "--model", self._config.model,
             ]
             try:
-                return self._process_runner.run(
-                    argv, input_bytes=payload, cwd=workdir, env=env,
-                    timeout_seconds=self._config.timeout_seconds,
-                    max_output_bytes=self._config.max_output_bytes,
-                )
+                run_kwargs: dict[str, object] = {
+                    "input_bytes": payload,
+                    "cwd": workdir,
+                    "env": env,
+                    "timeout_seconds": self._config.timeout_seconds,
+                    "max_output_bytes": self._config.max_output_bytes,
+                }
+                if self._cancel_event is not None:
+                    try:
+                        sig = inspect.signature(self._process_runner.run)
+                        if "cancel_event" in sig.parameters or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                        ):
+                            run_kwargs["cancel_event"] = self._cancel_event
+                    except (TypeError, ValueError):
+                        pass
+                return self._process_runner.run(argv, **run_kwargs)
             except FileNotFoundError as exc:
                 raise PiExecutableMissing() from exc
             finally:

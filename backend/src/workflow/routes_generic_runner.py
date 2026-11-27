@@ -7,6 +7,7 @@ from contextlib import contextmanager, nullcontext
 import copy
 from datetime import datetime, timezone
 from hashlib import sha256
+import inspect
 import ipaddress
 import json
 import os
@@ -22,6 +23,7 @@ from uuid import uuid4
 from flask import Response, jsonify, request
 from pydantic import ValidationError
 
+from core.cancellation import RunCancelledError
 from core.models import TargetProfile, TestCase as CoreTestCase, TestInput as CoreTestInput
 from core.models.provenance import (
     extract_context_provenance,
@@ -371,6 +373,27 @@ class LiveTargetReservationHandle:
 
 
 _WORKFLOW_ID_OPT_RE = re.compile(r"^gnr-[a-f0-9]{32}$")
+_TERMINAL_RUN_STATUSES: frozenset[str] = frozenset({"completed", "cancelled", "failed", "interrupted"})
+
+
+class CancellationPersistenceError(OSError):
+    """Raised when cancellation was signaled in memory but persisting it to disk failed."""
+
+    code = "cancellation_persistence_failed"
+
+    def __init__(
+        self,
+        message: str = (
+            "Cancellation was signaled to the active scan, but persisting the stop request to disk failed. "
+            "Retry stop or inspect run status to verify final state."
+        ),
+        *,
+        run_id: str | None = None,
+        cancellation_signaled: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.run_id = run_id
+        self.cancellation_signaled = cancellation_signaled
 
 
 class GenericRunService:
@@ -413,6 +436,13 @@ class GenericRunService:
         self._live_target_reservations: dict[str, dict[str, Any]] = {}
         self._in_progress_runs: dict[str, Thread] = {}
         self._initializing_runs: dict[str, Event] = {}
+        self._cancel_events: dict[str, Event] = {}
+        self._active_run_records: dict[str, tuple[Path, dict[str, Any]]] = {}
+        self._record_versions: dict[str, int] = {}
+        self._last_persisted_versions: dict[str, int] = {}
+        self._persisted_terminal_runs: set[str] = set()
+        self._cancel_persisted: dict[str, bool] = {}
+        self._run_persist_locks: dict[str, RLock] = {}
         self._active_resumes_by_root: dict[str, str] = {}
         self._submissions_in_flight: dict[str, dict[str, Any]] = {}
         self._resume_submissions_in_flight: dict[str, dict[str, Any]] = {}
@@ -575,17 +605,182 @@ class GenericRunService:
         handle: LiveTargetReservationHandle | None,
         *,
         workflow_id: str | None = None,
+        owner_digest: str | None = None,
     ):
         """Server-internal, thread-local context passing a verified reservation handle to start_run().
 
         Public HTTP routes never enter this context, preventing caller-controlled adoption.
         """
         prev = getattr(self._internal_handoff_tls, "handoff", None)
-        self._internal_handoff_tls.handoff = (handle, workflow_id)
+        self._internal_handoff_tls.handoff = (handle, workflow_id, owner_digest)
         try:
             yield
         finally:
             self._internal_handoff_tls.handoff = prev
+
+    @staticmethod
+    def _resolve_owner_digest(owner_id: str | None = None, owner_digest: str | None = None) -> str | None:
+        if isinstance(owner_digest, str) and _HEX64_RE.fullmatch(owner_digest.strip()):
+            return owner_digest.strip()
+        if isinstance(owner_id, str) and owner_id.strip():
+            return sha256(owner_id.strip().encode("utf-8")).hexdigest()
+        return None
+
+    def _get_run_persist_lock(self, run_id: str) -> RLock:
+        with self._lock:
+            lock = self._run_persist_locks.get(run_id)
+            if lock is None:
+                lock = RLock()
+                self._run_persist_locks[run_id] = lock
+            return lock
+
+    def _bump_record_version_locked(self, run_id: str) -> int:
+        next_ver = self._record_versions.get(run_id, 0) + 1
+        self._record_versions[run_id] = next_ver
+        return next_ver
+
+    def _persist_run_record(
+        self,
+        run_dir: Path,
+        record: dict[str, Any],
+        *,
+        expected_version: int | None = None,
+    ) -> bool:
+        """Invoke `_write_run_record`, forwarding `expected_version` when supported by the callable."""
+        write_fn = self._write_run_record
+        if expected_version is not None:
+            try:
+                sig = inspect.signature(write_fn)
+                if "expected_version" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                ):
+                    res = write_fn(run_dir, record, expected_version=expected_version)
+                    return True if res is None else bool(res)
+            except (TypeError, ValueError):
+                pass
+        res = write_fn(run_dir, record)
+        return True if res is None else bool(res)
+
+    def cancel_run(
+        self,
+        run_id: str,
+        *,
+        owner_id: str | None = None,
+        owner_digest: str | None = None,
+    ) -> tuple[dict[str, Any], str]:
+        """Request idempotent per-run cancellation without affecting other runs.
+
+        Synchronizes cancellation persistence with state transitions under the per-run
+        persistence lock so a stale ``running/cancelling`` snapshot can NEVER overwrite a
+        newer terminal record on disk, and fails closed with ``CancellationPersistenceError``
+        if durable disk persistence fails (never falsely returning ``cancel_requested`` / 202).
+
+        Returns ``(run_record, cancel_outcome)`` where ``cancel_outcome`` is one of:
+        - ``cancel_requested``: active run newly marked & durably persisted for cancellation
+        - ``already_cancel_requested``: active run already had cancellation durably requested
+        - ``already_cancelled``: run already finished in ``cancelled`` status
+        - ``already_completed``: run already finished in ``completed`` status (never overwritten)
+        - ``already_terminal``: run already finished in ``failed`` or ``interrupted`` status
+        """
+        if not isinstance(run_id, str) or not _HEX32_RE.fullmatch(run_id.strip()):
+            raise ValueError("generic_run_not_found")
+        clean_id = run_id.strip()
+        caller_digest = self._resolve_owner_digest(owner_id=owner_id, owner_digest=owner_digest)
+
+        persist_lock = self._get_run_persist_lock(clean_id)
+        with persist_lock:
+            snap_to_write: tuple[Path, dict[str, Any], int] | None = None
+            outcome: str | None = None
+            active_snap: dict[str, Any] | None = None
+
+            with self._lock:
+                active_pair = self._active_run_records.get(clean_id)
+                if active_pair is not None:
+                    run_dir, record = active_pair
+                    rec_owner = record.get("owner_digest")
+                    if isinstance(rec_owner, str) and rec_owner and caller_digest is not None and rec_owner != caller_digest:
+                        raise ValueError("generic_run_access_denied")
+                    cur_status = str(record.get("status") or "")
+                    if cur_status == "completed":
+                        active_snap = copy.deepcopy(record)
+                        outcome = "already_completed"
+                    elif cur_status == "cancelled":
+                        active_snap = copy.deepcopy(record)
+                        outcome = "already_cancelled"
+                    elif cur_status in {"failed", "interrupted"}:
+                        active_snap = copy.deepcopy(record)
+                        outcome = "already_terminal"
+                    else:
+                        cancel_evt = self._cancel_events.get(clean_id)
+                        if cancel_evt is not None:
+                            cancel_evt.set()
+                        if record.get("cancellation_requested") is True and self._cancel_persisted.get(clean_id) is True:
+                            active_snap = copy.deepcopy(record)
+                            outcome = "already_cancel_requested"
+                        else:
+                            if record.get("cancellation_requested") is not True:
+                                now_iso = datetime.now(timezone.utc).isoformat()
+                                record["cancellation_requested"] = True
+                                record["cancellation_requested_at"] = now_iso
+                                record["current_stage"] = "cancelling"
+                                record["events"] = (
+                                    record["events"]
+                                    + [{"at": now_iso, "stage": "cancellation_requested", "case_id": record.get("current_case_id")}]
+                                )[-120:]
+                            ver = self._bump_record_version_locked(clean_id)
+                            self._cancel_persisted[clean_id] = False
+                            active_snap = copy.deepcopy(record)
+                            snap_to_write = (run_dir, active_snap, ver)
+                            outcome = "cancel_requested"
+
+            if snap_to_write is not None:
+                try:
+                    wrote = self._persist_run_record(
+                        snap_to_write[0],
+                        snap_to_write[1],
+                        expected_version=snap_to_write[2],
+                    )
+                except OSError as exc:
+                    with self._lock:
+                        self._cancel_persisted[clean_id] = False
+                    raise CancellationPersistenceError(
+                        run_id=clean_id,
+                        cancellation_signaled=True,
+                    ) from exc
+                if not wrote:
+                    # A newer (e.g., terminal) state already superseded this snapshot; return authoritative state.
+                    active_snap = None
+                    outcome = None
+                else:
+                    with self._lock:
+                        self._cancel_persisted[clean_id] = True
+                        live_pair = self._active_run_records.get(clean_id)
+                        if live_pair is not None:
+                            live_rec = live_pair[1]
+                            live_st = str(live_rec.get("status") or "")
+                            if live_st == "completed":
+                                return copy.deepcopy(live_rec), "already_completed"
+                            if live_st == "cancelled":
+                                return copy.deepcopy(live_rec), "already_cancelled"
+                            if live_st in {"failed", "interrupted"}:
+                                return copy.deepcopy(live_rec), "already_terminal"
+                    return active_snap, outcome  # type: ignore[return-value]
+
+            if active_snap is not None and outcome is not None:
+                return active_snap, outcome
+
+        persisted = self.get_run(clean_id)
+        if persisted is None:
+            raise ValueError("generic_run_not_found")
+        rec_owner = persisted.get("owner_digest")
+        if isinstance(rec_owner, str) and rec_owner and caller_digest is not None and rec_owner != caller_digest:
+            raise ValueError("generic_run_access_denied")
+        st = str(persisted.get("status") or "")
+        if st == "completed":
+            return persisted, "already_completed"
+        if st == "cancelled":
+            return persisted, "already_cancelled"
+        return persisted, "already_terminal"
 
     def judge_status(self) -> dict[str, Any]:
         if self.judge_provider is not None:
@@ -1639,15 +1834,77 @@ class GenericRunService:
         sum_target = case_run_dir / "run-summary.json"
         write_atomic_bytes(sum_target, (json.dumps(run_sum, indent=2) + "\n").encode("utf-8"))
 
-    def _write_run_record(self, run_dir: Path, record: dict[str, Any]) -> None:
-        with self._lock:
-            run_dir.mkdir(parents=True, exist_ok=True)
+    def _write_run_record(
+        self,
+        run_dir: Path,
+        record: dict[str, Any],
+        *,
+        expected_version: int | None = None,
+    ) -> bool:
+        """Atomically persist `generic-run.json` with per-run monotonic & terminal-state protection.
+
+        Lock order is strictly ``persist_lock -> self._lock`` so concurrent writes for the same
+        run are serialized without blocking unrelated runs, and a stale non-terminal snapshot
+        can NEVER overwrite a newer committed or terminal record on disk.
+        """
+        raw_rid = record.get("generic_run_id")
+        rid = raw_rid.strip() if isinstance(raw_rid, str) and raw_rid.strip() else ""
+        persist_lock = self._get_run_persist_lock(rid) if rid else self._lock
+        with persist_lock:
             target_file = run_dir / "generic-run.json"
-            data = (json.dumps(record, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+            with self._lock:
+                incoming_status = str(record.get("status") or "")
+                if rid and expected_version is not None:
+                    cur_ver = self._record_versions.get(rid, 0)
+                    last_persisted = self._last_persisted_versions.get(rid, 0)
+                    if expected_version < cur_ver or expected_version <= last_persisted:
+                        return False
+                if rid and incoming_status not in _TERMINAL_RUN_STATUSES:
+                    live_pair = self._active_run_records.get(rid)
+                    if live_pair is not None:
+                        live_status = str(live_pair[1].get("status") or "")
+                        if live_status in _TERMINAL_RUN_STATUSES:
+                            return False
+                    if rid in self._persisted_terminal_runs:
+                        return False
+                commit_version = (
+                    expected_version
+                    if expected_version is not None
+                    else (self._record_versions.get(rid, 0) if rid else 0)
+                )
+                data = (json.dumps(record, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+            # Disk-level guard: even after worker cleanup or restart, never let a non-terminal
+            # snapshot regress an already-persisted terminal record on disk.
+            if incoming_status not in _TERMINAL_RUN_STATUSES and target_file.is_file():
+                try:
+                    existing_doc = json.loads(target_file.read_text(encoding="utf-8"))
+                    if (
+                        isinstance(existing_doc, dict)
+                        and str(existing_doc.get("status") or "") in _TERMINAL_RUN_STATUSES
+                    ):
+                        if rid:
+                            with self._lock:
+                                self._persisted_terminal_runs.add(rid)
+                        return False
+                except (OSError, ValueError):
+                    pass
+
+            run_dir.mkdir(parents=True, exist_ok=True)
             try:
                 write_atomic_bytes(target_file, data, retries=20, retry_delay=0.005)
             except OSError as exc:
                 raise OSError("generic_run_atomic_write_failed") from exc
+
+            if rid:
+                with self._lock:
+                    if commit_version > self._last_persisted_versions.get(rid, 0):
+                        self._last_persisted_versions[rid] = commit_version
+                    if incoming_status in _TERMINAL_RUN_STATUSES:
+                        self._persisted_terminal_runs.add(rid)
+                        if len(self._persisted_terminal_runs) > 4096:
+                            self._persisted_terminal_runs.pop()
+            return True
 
     @staticmethod
     def _submission_fingerprint(payload: dict[str, Any], mode: str, target_id: str, asi_category: str, use_judge: bool) -> str:
@@ -1880,6 +2137,7 @@ class GenericRunService:
         _owns_root_lock: str | None = None,
         _reservation_handle: LiveTargetReservationHandle | None = None,
         _workflow_id: str | None = None,
+        _owner_id: str | None = None,
     ) -> dict[str, Any]:
         if payload.get("authorization_confirmed") is not True:
             raise ValueError("generic_authorization_required")
@@ -2003,10 +2261,15 @@ class GenericRunService:
         # in-process server-owned LiveTargetReservationHandle passed via keyword argument or
         # server-internal thread-local handoff context is accepted.
         tls_handoff = getattr(self._internal_handoff_tls, "handoff", None)
-        if _reservation_handle is None and isinstance(tls_handoff, tuple) and len(tls_handoff) == 2:
-            _reservation_handle = tls_handoff[0]
+        tls_owner_digest: str | None = None
+        if isinstance(tls_handoff, tuple) and len(tls_handoff) >= 2:
+            if _reservation_handle is None:
+                _reservation_handle = tls_handoff[0]
             if _workflow_id is None:
                 _workflow_id = tls_handoff[1]
+            if len(tls_handoff) >= 3 and isinstance(tls_handoff[2], str):
+                tls_owner_digest = tls_handoff[2]
+        resolved_owner_digest = self._resolve_owner_digest(owner_id=_owner_id, owner_digest=tls_owner_digest)
         valid_internal_handle: LiveTargetReservationHandle | None = (
             _reservation_handle
             if (
@@ -2023,6 +2286,7 @@ class GenericRunService:
         )
         run_id = uuid4().hex
         released = False
+        cancel_event = Event()
         init_evt: Event | None = None
         initial_record_written = False
         record_ref: dict[str, Any] | None = None
@@ -2196,17 +2460,33 @@ class GenericRunService:
             provider = None
             pi_cfg = None
             if use_judge:
-                pi_cfg = self.resolved_pi_config()
+                pi_cfg = None if self.judge_provider is not None else self.resolved_pi_config()
                 if self.judge_provider is not None:
-                    provider = self.judge_provider
-                    eval_cfg = RunnerEvaluationConfig(
-                        mode="hybrid",
-                        judge_enabled=True,
-                        max_judge_calls=max(1, len(pairs)),
-                        require_complete_response_for_semantic=True,
-                    )
+                    if isinstance(self.judge_provider, PiEvaluatorProvider):
+                        provider = PiEvaluatorProvider(
+                            self.judge_provider._config,
+                            bundle_loader=self.judge_provider._bundle_loader,
+                            process_runner=self.judge_provider._process_runner,
+                            cancel_event=cancel_event,
+                        )
+                        eval_cfg = RunnerEvaluationConfig(
+                            mode="hybrid",
+                            judge_enabled=True,
+                            allow_live_judge=True,
+                            max_judge_calls=max(1, len(pairs)),
+                            pi=self.judge_provider._config,
+                            require_complete_response_for_semantic=True,
+                        )
+                    else:
+                        provider = self.judge_provider
+                        eval_cfg = RunnerEvaluationConfig(
+                            mode="hybrid",
+                            judge_enabled=True,
+                            max_judge_calls=max(1, len(pairs)),
+                            require_complete_response_for_semantic=True,
+                        )
                 elif pi_cfg is not None:
-                    provider = PiEvaluatorProvider(pi_cfg)
+                    provider = PiEvaluatorProvider(pi_cfg, cancel_event=cancel_event)
                     eval_cfg = RunnerEvaluationConfig(
                         mode="hybrid",
                         judge_enabled=True,
@@ -2341,7 +2621,11 @@ class GenericRunService:
                 "generic_run_id": run_id,
                 "workflow_id": workflow_id,
                 "submission_id": submission_id,
+                **({"owner_digest": resolved_owner_digest} if resolved_owner_digest else {}),
                 "status": "running",
+                "cancellation_requested": False,
+                "cancellation_requested_at": None,
+                "cancelled_at": None,
                 "started_at": started_at,
                 "completed_at": None,
                 "mode": mode,
@@ -2427,9 +2711,13 @@ class GenericRunService:
             with self._lock:
                 # Register initializing run BEFORE writing generic-run.json to disk so get_run/list_runs never see a false orphan
                 self._initializing_runs[run_id] = init_evt
+                self._cancel_events[run_id] = cancel_event
+                self._active_run_records[run_id] = (run_dir, record)
+                self._cancel_persisted[run_id] = False
+                init_ver = self._bump_record_version_locked(run_id)
                 if _owns_root_lock:
                     self._active_resumes_by_root[_owns_root_lock] = run_id
-            self._write_run_record(run_dir, record)
+            self._persist_run_record(run_dir, record, expected_version=init_ver)
             initial_record_written = True
             if submission_id and fingerprint:
                 with self._lock:
@@ -2464,7 +2752,8 @@ class GenericRunService:
                     is_pre_dispatch = ev_type == "case_started" or stage_name == "sending_request_to_target"
                     with self._lock:
                         record["current_case_id"] = cid
-                        record["current_stage"] = stage_name
+                        if not record.get("cancellation_requested"):
+                            record["current_stage"] = stage_name
                         for row in record["case_statuses"]:
                             if row["case_id"] == cid and row["status"] in {"queued", "running"}:
                                 row["status"] = "running"
@@ -2473,8 +2762,9 @@ class GenericRunService:
                         record["events"] = (
                             record["events"] + [{"at": now_iso, "stage": stage_name, "case_id": cid}]
                         )[-120:]
+                        stage_ver = self._bump_record_version_locked(run_id)
                     try:
-                        self._write_run_record(run_dir, record)
+                        self._persist_run_record(run_dir, record, expected_version=stage_ver)
                     except OSError as exc:
                         if is_pre_dispatch:
                             raise DispatchCheckpointError("dispatch_checkpoint_write_failed") from exc
@@ -2637,75 +2927,186 @@ class GenericRunService:
                                 "evaluation_status": case_eval_status,
                             }]
                         )[-120:]
-                    self._write_run_record(run_dir, record)
+                        case_ver = self._bump_record_version_locked(run_id)
+                    self._persist_run_record(run_dir, record, expected_version=case_ver)
+
+            def _finalize_cancelled_locked(done_iso: str, cancelled_case_id: str | None) -> None:
+                record["executed_cases"] = len(record["cases"])
+                record["total_cases"] = len(pairs)
+                record["verdict_counts"] = dict(sorted(verdict_counter.items()))
+                record["evaluation_summary"] = build_evaluation_summary(
+                    record["cases"],
+                    total_cases=len(pairs),
+                    selected_cases=len(preview_meta["items"]),
+                    skipped_cases=len(preview_meta["skipped_cases"]),
+                    schema_version=VERDICT_SCHEMA_VERSION,
+                    policy_version=VERDICT_POLICY_VERSION,
+                )
+                record["research_provenance"] = summarize_run_research_provenance(
+                    [
+                        c.get("research_provenance")
+                        for c in record["cases"]
+                        if isinstance(c, dict) and isinstance(c.get("research_provenance"), dict)
+                    ],
+                    target=target,
+                    target_revision_sha256=target_revision_sha256,
+                    dataset_id=dataset_id,
+                    dataset_revision_sha256=dataset_revision_sha256,
+                    dataset_name=dataset_name,
+                )
+                skipped_preflight = len(preview_meta["skipped_cases"])
+                final_denom = (
+                    len(preview_meta["items"])
+                    if skipped_preflight > 0
+                    else len(pairs)
+                )
+                record["status"] = "cancelled"
+                record["cancellation_requested"] = True
+                if not record.get("cancellation_requested_at"):
+                    record["cancellation_requested_at"] = done_iso
+                record["cancelled_at"] = done_iso
+                record["completed_at"] = done_iso
+                record["completion_scope"] = "cancelled"
+                record["current_case_id"] = None
+                record["current_stage"] = "cancelled"
+                record["progress_percent"] = int(round((len(record["cases"]) / max(1, final_denom)) * 100))
+                completed_ids = {
+                    c.get("case_id")
+                    for c in record["cases"]
+                    if isinstance(c, dict) and isinstance(c.get("case_id"), str)
+                }
+                for row in record["case_statuses"]:
+                    if row["case_id"] in completed_ids:
+                        continue
+                    if row["status"] == "running" or (
+                        cancelled_case_id is not None
+                        and row["case_id"] == cancelled_case_id
+                        and row["status"] not in {"completed", "error", "unsupported", "blocked"}
+                    ):
+                        row["status"] = "cancelled"
+                        row["stage"] = "cancelled_in_flight"
+                        row["verdict"] = None
+                        row["evaluation_status"] = "NOT_EXECUTED"
+                        row["evaluation_reason_code"] = "RUN_CANCELLED"
+                        row["reason"] = "Cancelled while in-flight before result was recorded"
+                    elif row["status"] == "queued":
+                        row["status"] = "cancelled"
+                        row["stage"] = "not_executed"
+                        row["verdict"] = None
+                        row["evaluation_status"] = "NOT_EXECUTED"
+                        row["evaluation_reason_code"] = "RUN_CANCELLED"
+                        row["reason"] = "Not executed because scan was cancelled"
+                record["judge_metadata"] = self._build_judge_metadata(
+                    use_judge=use_judge,
+                    run_status="cancelled",
+                    cases=record["cases"],
+                    pi_cfg=pi_cfg,
+                )
+                record["events"] = (
+                    record["events"] + [{"at": done_iso, "stage": "cancelled", "case_id": None}]
+                )[-120:]
 
             def _execute_worker() -> None:
                 try:
-                    summary = run_generic_cases(
-                        mode=mode,
-                        target=run_target,
-                        cases=pairs,
-                        output_dir=run_dir,
-                        evaluation_config=eval_cfg,
-                        judge_provider=provider,
-                        collectors=tuple(injected_collectors),
-                        allowed_collector_roots=tuple(extra_roots),
-                        allowed_collector_endpoints=tuple(allowed_endpoints),
-                        generic_run_id=run_id,
-                        case_progress_callback=_on_progress,
-                        target_revision_sha256=target_revision_sha256,
-                        dataset_metadata=run_dataset_metadata,
-                        credential_resolver=session_resolver,
-                        extra_sensitive_values=tuple(session_secrets),
-                    )
+                    run_kwargs: dict[str, Any] = {
+                        "mode": mode,
+                        "target": run_target,
+                        "cases": pairs,
+                        "output_dir": run_dir,
+                        "evaluation_config": eval_cfg,
+                        "judge_provider": provider,
+                        "collectors": tuple(injected_collectors),
+                        "allowed_collector_roots": tuple(extra_roots),
+                        "allowed_collector_endpoints": tuple(allowed_endpoints),
+                        "generic_run_id": run_id,
+                        "case_progress_callback": _on_progress,
+                        "target_revision_sha256": target_revision_sha256,
+                        "dataset_metadata": run_dataset_metadata,
+                        "credential_resolver": session_resolver,
+                        "extra_sensitive_values": tuple(session_secrets),
+                    }
+                    try:
+                        sig = inspect.signature(run_generic_cases)
+                        if "cancel_event" in sig.parameters or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                        ):
+                            run_kwargs["cancel_event"] = cancel_event
+                    except (TypeError, ValueError):
+                        run_kwargs["cancel_event"] = cancel_event
+                    summary = run_generic_cases(**run_kwargs)
+                    done_iso = datetime.now(timezone.utc).isoformat()
+                    was_cancelled_in_runner = bool(isinstance(summary, dict) and summary.get("cancelled"))
+                    cancelled_cid = summary.get("cancelled_case_id") if isinstance(summary, dict) else None
+                    final_is_cancelled = False
+                    with self._lock:
+                        if was_cancelled_in_runner or (cancel_event.is_set() and len(record["cases"]) < len(pairs)):
+                            _finalize_cancelled_locked(done_iso, cancelled_cid)
+                            final_is_cancelled = True
+                        else:
+                            record["executed_cases"] = len(record["cases"])
+                            record["total_cases"] = len(pairs)
+                            record["verdict_counts"] = summary["verdict_counts"]
+                            record["evaluation_summary"] = build_evaluation_summary(
+                                record["cases"],
+                                total_cases=len(pairs),
+                                selected_cases=len(preview_meta["items"]),
+                                skipped_cases=len(preview_meta["skipped_cases"]),
+                                schema_version=VERDICT_SCHEMA_VERSION,
+                                policy_version=VERDICT_POLICY_VERSION,
+                            )
+                            if isinstance(summary.get("research_provenance"), dict):
+                                record["research_provenance"] = summary["research_provenance"]
+                            self._verify_completion_invariants(
+                                run_id=run_id,
+                                record=record,
+                                expected_cases_count=len(pairs),
+                            )
+                            tech_failures = int(record["evaluation_summary"].get("technical_failure_count", 0))
+                            skipped_preflight = len(preview_meta["skipped_cases"])
+                            record["status"] = "completed"
+                            if skipped_preflight > 0:
+                                record["completion_scope"] = "partial_preflight_blocked"
+                            else:
+                                record["completion_scope"] = "full"
+                            if tech_failures > 0 and not record.get("error_code"):
+                                record["error_code"] = "technical_evaluation_failure"
+                            record["completed_at"] = done_iso
+                            record["current_case_id"] = None
+                            record["current_stage"] = "completed"
+                            final_denom = (
+                                len(preview_meta["items"])
+                                if skipped_preflight > 0
+                                else len(pairs)
+                            )
+                            record["progress_percent"] = int(round((len(record["cases"]) / max(1, final_denom)) * 100))
+                            record["judge_metadata"] = self._build_judge_metadata(
+                                use_judge=use_judge,
+                                run_status="completed",
+                                cases=record["cases"],
+                                pi_cfg=pi_cfg,
+                            )
+                            record["events"] = (
+                                record["events"] + [{"at": done_iso, "stage": "completed", "case_id": None}]
+                            )[-120:]
+                        final_ver = self._bump_record_version_locked(run_id)
+                    if final_is_cancelled:
+                        try:
+                            self._persist_run_record(run_dir, record, expected_version=final_ver)
+                        except OSError:
+                            # Do not downgrade a cancelled run to `failed` if final persistence fails;
+                            # prior valid atomic checkpoint remains intact on disk for clean recovery.
+                            pass
+                    else:
+                        self._persist_run_record(run_dir, record, expected_version=final_ver)
+                except RunCancelledError:
                     done_iso = datetime.now(timezone.utc).isoformat()
                     with self._lock:
-                        record["executed_cases"] = len(record["cases"])
-                        record["total_cases"] = len(pairs)
-                        record["verdict_counts"] = summary["verdict_counts"]
-                        record["evaluation_summary"] = build_evaluation_summary(
-                            record["cases"],
-                            total_cases=len(pairs),
-                            selected_cases=len(preview_meta["items"]),
-                            skipped_cases=len(preview_meta["skipped_cases"]),
-                            schema_version=VERDICT_SCHEMA_VERSION,
-                            policy_version=VERDICT_POLICY_VERSION,
-                        )
-                        if isinstance(summary.get("research_provenance"), dict):
-                            record["research_provenance"] = summary["research_provenance"]
-                        self._verify_completion_invariants(
-                            run_id=run_id,
-                            record=record,
-                            expected_cases_count=len(pairs),
-                        )
-                        tech_failures = int(record["evaluation_summary"].get("technical_failure_count", 0))
-                        skipped_preflight = len(preview_meta["skipped_cases"])
-                        record["status"] = "completed"
-                        if skipped_preflight > 0:
-                            record["completion_scope"] = "partial_preflight_blocked"
-                        else:
-                            record["completion_scope"] = "full"
-                        if tech_failures > 0 and not record.get("error_code"):
-                            record["error_code"] = "technical_evaluation_failure"
-                        record["completed_at"] = done_iso
-                        record["current_case_id"] = None
-                        record["current_stage"] = "completed"
-                        final_denom = (
-                            len(preview_meta["items"])
-                            if skipped_preflight > 0
-                            else len(pairs)
-                        )
-                        record["progress_percent"] = int(round((len(record["cases"]) / max(1, final_denom)) * 100))
-                        record["judge_metadata"] = self._build_judge_metadata(
-                            use_judge=use_judge,
-                            run_status="completed",
-                            cases=record["cases"],
-                            pi_cfg=pi_cfg,
-                        )
-                        record["events"] = (
-                            record["events"] + [{"at": done_iso, "stage": "completed", "case_id": None}]
-                        )[-120:]
-                    self._write_run_record(run_dir, record)
+                        _finalize_cancelled_locked(done_iso, record.get("current_case_id"))
+                        cancel_ver = self._bump_record_version_locked(run_id)
+                    try:
+                        self._persist_run_record(run_dir, record, expected_version=cancel_ver)
+                    except OSError:
+                        pass
                 except Exception as exc:
                     fail_iso = datetime.now(timezone.utc).isoformat()
                     err_code = (
@@ -2731,14 +3132,18 @@ class GenericRunService:
                             cases=record["cases"],
                             pi_cfg=pi_cfg,
                         )
+                        fail_ver = self._bump_record_version_locked(run_id)
                     try:
-                        self._write_run_record(run_dir, record)
+                        self._persist_run_record(run_dir, record, expected_version=fail_ver)
                     except OSError:
                         pass
                 finally:
                     with self._lock:
                         self._in_progress_runs.pop(run_id, None)
                         self._initializing_runs.pop(run_id, None)
+                        self._cancel_events.pop(run_id, None)
+                        self._cancel_persisted.pop(run_id, None)
+                        self._active_run_records.pop(run_id, None)
                         if _owns_root_lock and self._active_resumes_by_root.get(_owns_root_lock) in {run_id, "reserving"}:
                             self._active_resumes_by_root.pop(_owns_root_lock, None)
                     init_evt.set()
@@ -2806,6 +3211,8 @@ class GenericRunService:
                 with self._lock:
                     self._in_progress_runs.pop(run_id, None)
                     self._initializing_runs.pop(run_id, None)
+                    self._cancel_events.pop(run_id, None)
+                    self._active_run_records.pop(run_id, None)
                     if _owns_root_lock:
                         self._active_resumes_by_root.pop(_owns_root_lock, None)
                     for tid, res_handle in newly_reserved_handles:
@@ -3025,7 +3432,7 @@ class GenericRunService:
         is_multi_session = len(lineage_info["lineage_run_ids"]) > 1 or bool(record.get("continuation_of_run_id"))
         if (
             is_multi_session
-            or record.get("status") == "interrupted"
+            or record.get("status") in {"interrupted", "cancelled"}
             or (
                 record.get("status") == "completed"
                 and (
@@ -3263,10 +3670,10 @@ class GenericRunService:
             logical_status = str(current_record.get("status") or "failed")
 
         has_remaining_cases = len(cls["pending_case_ids"]) > 0 or len(cls["uncertain_case_ids"]) > 0
-        interrupted_sessions = [s["generic_run_id"] for s in sessions if s["status"] == "interrupted"]
+        resumable_sessions = [s["generic_run_id"] for s in sessions if s["status"] in {"interrupted", "cancelled"}]
         resumable_run_id: str | None = None
-        if active_id is None and not state_incomplete and has_remaining_cases and interrupted_sessions:
-            resumable_run_id = run_id if run_id in interrupted_sessions else interrupted_sessions[-1]
+        if active_id is None and not state_incomplete and has_remaining_cases and resumable_sessions:
+            resumable_run_id = run_id if run_id in resumable_sessions else resumable_sessions[-1]
 
         has_resumable_work = resumable_run_id is not None
 
@@ -3693,7 +4100,7 @@ class GenericRunService:
     @staticmethod
     def _validate_run_checkpoint(doc: dict[str, Any]) -> dict[str, Any]:
         """Validate a single persisted generic-run.json checkpoint fail-closed."""
-        valid_statuses = {"queued", "running", "completed", "error", "unsupported", "blocked"}
+        valid_statuses = {"queued", "running", "completed", "error", "unsupported", "blocked", "cancelled"}
         valid_verdicts = {"PASS", "FAIL", "INCONCLUSIVE", "ERROR"}
 
         if not isinstance(doc, dict):
@@ -3790,6 +4197,9 @@ class GenericRunService:
                 skipped_ids.add(cid)
             elif st == "running":
                 dispatched_ids.add(cid)
+            elif st == "cancelled":
+                if stage == "cancelled_in_flight":
+                    dispatched_ids.add(cid)
             elif st in {"completed", "error"} and cid not in completed_in_doc:
                 # Status claims terminal completion without a persisted result -> uncertain, never pending.
                 dispatched_ids.add(cid)
@@ -3801,7 +4211,7 @@ class GenericRunService:
             if not isinstance(curr_cid, str) or not curr_cid or curr_cid not in status_by_id:
                 return {"valid": False}
             curr_stage = str(doc.get("current_stage") or "")
-            if curr_stage not in {"", "queued"}:
+            if curr_stage not in {"", "queued", "cancelled", "not_executed"}:
                 dispatched_ids.add(curr_cid)
 
         raw_events = doc.get("events")
@@ -3816,7 +4226,7 @@ class GenericRunService:
                 if isinstance(ev_cid, str) and ev_cid:
                     if ev_cid not in status_by_id:
                         return {"valid": False}
-                    if ev_stage not in {"", "queued", "skipped"}:
+                    if ev_stage not in {"", "queued", "skipped", "cancellation_requested", "cancelled", "not_executed"}:
                         dispatched_ids.add(ev_cid)
 
         return {
@@ -3983,7 +4393,7 @@ class GenericRunService:
             if code and code not in blockers:
                 blockers.append(code)
 
-        if parent_record.get("status") != "interrupted":
+        if parent_record.get("status") not in {"interrupted", "cancelled"}:
             _add_blocker("generic_resume_not_interrupted")
         if lineage_info["active_lineage_run_id"] is not None:
             _add_blocker("generic_resume_already_active")
@@ -4313,7 +4723,7 @@ class GenericRunService:
             "warnings": warnings,
         }
 
-    def start_resume(self, parent_run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def start_resume(self, parent_run_id: str, payload: dict[str, Any], *, _owner_id: str | None = None) -> dict[str, Any]:
         """Start a linked continuation run for an interrupted Generic Scan run."""
         if not isinstance(payload, dict):
             raise ValueError("generic_run_rejected")
@@ -4496,6 +4906,7 @@ class GenericRunService:
                 start_payload,
                 _continuation_meta=continuation_meta,
                 _owns_root_lock=root_run_id,
+                _owner_id=_owner_id,
             )
             if resume_sub_owner and resume_sub_entry is not None:
                 with self._lock:
@@ -4590,6 +5001,9 @@ class GenericRunService:
                 "generic_run_id": rec.get("generic_run_id") or entry.name,
                 "workflow_id": rec.get("workflow_id"),
                 "status": rec.get("status", "completed"),
+                "cancellation_requested": bool(rec.get("cancellation_requested", False)),
+                "cancellation_requested_at": rec.get("cancellation_requested_at"),
+                "cancelled_at": rec.get("cancelled_at"),
                 "started_at": rec.get("started_at"),
                 "completed_at": rec.get("completed_at"),
                 "mode": rec.get("mode", "live"),
@@ -4629,6 +5043,13 @@ def register_generic_runner_routes(app, ctx) -> None:
     nonce = ctx.nonce
     fail = ctx.fail
     operator_authorized = ctx.operator_authorized
+    operator_identity_fn = getattr(ctx, "operator_identity", None)
+
+    def caller_owner_id() -> str | None:
+        if callable(operator_identity_fn):
+            val = operator_identity_fn()
+            return val if isinstance(val, str) and val.strip() else None
+        return None
 
     def auth():
         if not operator_authorized():
@@ -4706,7 +5127,7 @@ def register_generic_runner_routes(app, ctx) -> None:
             return denied
         try:
             payload = read_json(request.get_data())
-            record = service.start_run(payload)
+            record = service.start_run(payload, _owner_id=caller_owner_id())
             status_code = 202 if payload.get("async_execution") is True and record.get("status") in {"preparing", "running"} else 201
             return jsonify(record), status_code
         except TargetExecutionConflictError as exc:
@@ -4744,6 +5165,36 @@ def register_generic_runner_routes(app, ctx) -> None:
             } else 400
             return fail(code, status)
 
+    @app.post("/api/testing/generic-runs/<run_id>/cancel")
+    def generic_run_cancel(run_id):
+        denied = auth()
+        if denied:
+            return denied
+        try:
+            raw_bytes = request.get_data()
+            if raw_bytes:
+                read_json(raw_bytes)
+            record, cancel_outcome = service.cancel_run(run_id, owner_id=caller_owner_id())
+            status_code = 202 if cancel_outcome == "cancel_requested" else 200
+            return jsonify({**record, "cancel_outcome": cancel_outcome}), status_code
+        except CancellationPersistenceError as exc:
+            return jsonify(
+                workflow_schema_version="1.0.0",
+                error={
+                    "code": exc.code,
+                    "message": str(exc),
+                    "cancellation_signaled": bool(exc.cancellation_signaled),
+                    "cancellation_persisted": False,
+                },
+            ), 500
+        except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+            code = str(exc)
+            if code == "generic_run_not_found":
+                return fail(code, 404)
+            if code == "generic_run_access_denied":
+                return fail(code, 403)
+            return fail("generic_run_rejected", 400)
+
     @app.post("/api/testing/generic-runs/<run_id>/resume/preview")
     def generic_run_resume_preview(run_id):
         denied = auth()
@@ -4770,7 +5221,7 @@ def register_generic_runner_routes(app, ctx) -> None:
             return denied
         try:
             payload = read_json(request.get_data())
-            record = service.start_resume(run_id, payload)
+            record = service.start_resume(run_id, payload, _owner_id=caller_owner_id())
             status_code = 202 if payload.get("async_execution") is True and record.get("status") in {"preparing", "running"} else 201
             return jsonify(record), status_code
         except TargetExecutionConflictError as exc:

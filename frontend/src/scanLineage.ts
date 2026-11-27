@@ -332,7 +332,7 @@ export function resolveUnifiedDisplay(record: GenericRunRecord): {
     integrityStatus === 'valid' &&
     (record.lineage_summary !== undefined && record.lineage_summary !== null
       ? record.lineage_summary.has_resumable_work
-      : rawStatus === 'interrupted' && executedCount < readyCount);
+      : (rawStatus === 'interrupted' || rawStatus === 'cancelled') && executedCount < readyCount);
 
   return {
     isUnified: false,

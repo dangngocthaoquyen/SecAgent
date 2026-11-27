@@ -76,7 +76,7 @@ WorkflowStageName = Literal[
     "evaluating",
     "reporting",
 ]
-StageStatus = Literal["pending", "running", "completed", "failed", "blocked", "skipped"]
+StageStatus = Literal["pending", "running", "completed", "failed", "blocked", "skipped", "cancelled"]
 WorkflowOverallStatus = Literal[
     "running",
     "completed",
@@ -84,6 +84,7 @@ WorkflowOverallStatus = Literal[
     "blocked",
     "partial_stopped",
     "interrupted",
+    "cancelled",
 ]
 EvaluationMode = Literal["rule_only", "hybrid"]
 ExecutionMode = Literal["live"]
@@ -188,6 +189,7 @@ _SAFE_PUBLIC_ERROR_MESSAGES: dict[str, str] = {
     "runner_cancelled": "Generic Runner execution was cancelled.",
     "workflow_interrupted_by_restart": "Backend process restarted before this workflow completed. Inspect saved datasets or start a fresh scan instead of auto-retrying.",
     "workflow_persistence_failed": "Failed to persist durable workflow state safely; operation aborted.",
+    "cancellation_persistence_failed": "Cancellation was signaled, but persisting the cancellation state to disk failed. Retry stop or reload workflow status to verify final state.",
     "worker_startup_failed": "Failed to start background workflow worker; live target reservation was released safely.",
     "runner_worker_startup_failed": "Failed to start background scan worker; live target reservation was released safely.",
     "generic_target_execution_in_progress": "Another live security test is already active for this Target. Wait for it to finish or open the active progress view.",
@@ -387,6 +389,9 @@ class GenerateAndRunSnapshot(StrictGeneratorModel):
     submission_id: str | None = None
     idempotent_replay: bool = False
     status: WorkflowOverallStatus
+    cancellation_requested: bool = False
+    cancellation_requested_at: str | None = None
+    cancelled_at: str | None = None
     current_stage: WorkflowStageName
     created_at: str
     updated_at: str
@@ -765,6 +770,9 @@ class _WorkflowEntry:
         self.completed_at: str | None = None
 
         self.status: WorkflowOverallStatus = "running"
+        self.cancellation_requested: bool = False
+        self.cancellation_requested_at: str | None = None
+        self.cancelled_at: str | None = None
         self.current_stage: WorkflowStageName = "generating"
         self.stages: dict[WorkflowStageName, dict[str, Any]] = _make_initial_stages()
 
@@ -842,9 +850,9 @@ class _WorkflowEntry:
         error_message: str | None = None,
     ) -> None:
         st = self.stages[stage]
-        if st["started_at"] is None and status in {"running", "completed", "failed", "blocked"}:
+        if st["started_at"] is None and status in {"running", "completed", "failed", "blocked", "cancelled"}:
             st["started_at"] = now_iso
-        if status in {"completed", "failed", "blocked", "skipped"}:
+        if status in {"completed", "failed", "blocked", "skipped", "cancelled"}:
             st["finished_at"] = now_iso
         st["status"] = status
         if detail is not None:
@@ -903,13 +911,57 @@ class _WorkflowEntry:
                 update={"run_status": run_status, "evaluation_mode": effective_mode}
             )
 
+        if run_record.get("cancellation_requested") is True:
+            self.cancellation_requested = True
+            if run_record.get("cancellation_requested_at") and not self.cancellation_requested_at:
+                self.cancellation_requested_at = str(run_record["cancellation_requested_at"])
+        if run_record.get("cancelled_at"):
+            self.cancelled_at = str(run_record["cancelled_at"])
+
         if run_status in {"queued", "preparing", "running"}:
             self.status = "running"
             self.error_stage = None
             self.error_code = None
             self.error_message = None
             self.evaluation_error_code = None
-            self.mark_stage("executing", "running", now_iso, detail=f"Executed {self.executed_cases}/{self.total_cases}")
+            detail_msg = (
+                f"Stopping… ({self.executed_cases}/{self.total_cases} executed)"
+                if self.cancellation_requested
+                else f"Executed {self.executed_cases}/{self.total_cases}"
+            )
+            self.mark_stage("executing", "running", now_iso, detail=detail_msg)
+            return
+
+        if run_status == "cancelled":
+            self.status = "cancelled"
+            self.cancellation_requested = True
+            if not self.cancellation_requested_at:
+                self.cancellation_requested_at = now_iso
+            if not self.cancelled_at:
+                self.cancelled_at = now_iso
+            self.error_stage = None
+            self.error_code = None
+            self.error_message = None
+            self.evaluation_error_code = None
+            self.mark_stage(
+                "executing",
+                "cancelled",
+                now_iso,
+                detail=f"Cancelled after {self.executed_cases}/{self.total_cases} testcase(s)",
+            )
+            self.mark_stage(
+                "evaluating",
+                "skipped",
+                now_iso,
+                detail="Stopped before remaining testcases were evaluated.",
+            )
+            self.mark_stage(
+                "reporting",
+                "completed",
+                now_iso,
+                detail=f"Partial cancelled run report persisted as {self.run_id}",
+            )
+            self.completed_at = now_iso
             return
 
         if run_status == "completed":
@@ -1039,6 +1091,9 @@ class _WorkflowEntry:
             submission_id=self.submission_id,
             idempotent_replay=idempotent_replay,
             status=self.status,
+            cancellation_requested=self.cancellation_requested,
+            cancellation_requested_at=self.cancellation_requested_at,
+            cancelled_at=self.cancelled_at,
             current_stage=self.current_stage,
             created_at=self.created_at,
             updated_at=self.updated_at,
@@ -1197,6 +1252,9 @@ class _WorkflowEntry:
             entry.updated_at = str(snap.get("updated_at") or entry.created_at)
             entry.completed_at = snap.get("completed_at")
             entry.status = snap.get("status", "failed")
+            entry.cancellation_requested = bool(snap.get("cancellation_requested", False))
+            entry.cancellation_requested_at = snap.get("cancellation_requested_at")
+            entry.cancelled_at = snap.get("cancelled_at")
             entry.current_stage = snap.get("current_stage", "generating")
             entry.active_evaluation_mode = snap.get("evaluation_mode", req.evaluation_mode)
             stages_raw = snap.get("stages")
@@ -1370,6 +1428,8 @@ class GenerateAndRunOrchestrator:
         self._lock = RLock()
         self._workflows: dict[str, _WorkflowEntry] = {}
         self._live_workflow_ids: set[str] = set()
+        self._cancel_events: dict[str, Event] = {}
+        self._cancel_persisted: dict[str, bool] = {}
         self._local_live_reservations: dict[str, dict[str, Any]] = {}
         self._submissions: dict[str, tuple[str, str, str]] = {}  # sub_id -> (owner_digest, req_digest, workflow_id)
         self._in_flight_submissions: dict[str, tuple[str, str, Event]] = {}
@@ -1750,7 +1810,7 @@ class GenerateAndRunOrchestrator:
         completed = [
             w
             for w in self._workflows.values()
-            if w.status in {"completed", "failed", "blocked", "partial_stopped", "interrupted"}
+            if w.status in {"completed", "failed", "blocked", "partial_stopped", "interrupted", "cancelled"}
         ]
         if completed:
             oldest = min(completed, key=lambda w: w.created_at)
@@ -2136,6 +2196,7 @@ class GenerateAndRunOrchestrator:
                 if req.submission_id is not None:
                     self._submissions[req.submission_id] = (owner_digest, req_digest, workflow_id)
                 self._live_workflow_ids.add(workflow_id)
+                self._cancel_events[workflow_id] = Event()
                 committed_in_memory = True
 
             if req.async_execution:
@@ -2205,6 +2266,7 @@ class GenerateAndRunOrchestrator:
             if not reservation_handed_to_worker:
                 with self._lock:
                     self._live_workflow_ids.discard(workflow_id)
+                    self._cancel_events.pop(workflow_id, None)
                 self._release_live_target(req.target_id, handle=reservation_handle)
 
     def _run_pipeline_stages(
@@ -2223,6 +2285,7 @@ class GenerateAndRunOrchestrator:
         finally:
             with self._lock:
                 self._live_workflow_ids.discard(entry.workflow_id)
+                self._cancel_events.pop(entry.workflow_id, None)
             try:
                 self._persist_entry(entry)
             except OrchestrationError:
@@ -2230,6 +2293,25 @@ class GenerateAndRunOrchestrator:
                 self._record_persistence_failure(entry, "reporting")
             if not handed_off_to_runner:
                 self._release_live_target(req.target_id, handle=reservation_handle)
+
+    def _abort_workflow_if_cancelled(self, entry: _WorkflowEntry, stage: WorkflowStageName) -> bool:
+        with self._lock:
+            ev = self._cancel_events.get(entry.workflow_id)
+            if not (entry.cancellation_requested or (ev is not None and ev.is_set())):
+                return False
+            now = self._now_iso()
+            entry.cancellation_requested = True
+            if not entry.cancellation_requested_at:
+                entry.cancellation_requested_at = now
+            entry.cancelled_at = now
+            entry.completed_at = now
+            entry.status = "cancelled"
+            entry.error_stage = None
+            entry.error_code = None
+            entry.error_message = None
+            entry.mark_stage(stage, "cancelled", now, detail=f"Cancelled by operator before completing {stage}.")
+            entry.skip_remaining_after(stage, now)
+            return True
 
     def _run_pipeline_stages_body(
         self,
@@ -2240,6 +2322,9 @@ class GenerateAndRunOrchestrator:
         reservation_handle: Any,
     ) -> bool:
         assert self._generic_run_service is not None
+
+        if self._abort_workflow_if_cancelled(entry, "generating"):
+            return False
 
         # ---------------- STAGE 1: GENERATING ----------------
         try:
@@ -2272,6 +2357,9 @@ class GenerateAndRunOrchestrator:
                 entry.error_message = "Generator encountered an internal error."
                 entry.completed_at = now
             return
+
+        if self._abort_workflow_if_cancelled(entry, "generating"):
+            return False
 
         with self._lock:
             entry.generation_id = gen_result.generation_id
@@ -2361,6 +2449,9 @@ class GenerateAndRunOrchestrator:
                 entry.error_message = err_msg
                 entry.completed_at = now
             return
+
+        if self._abort_workflow_if_cancelled(entry, "generating"):
+            return False
 
         with self._lock:
             entry.mark_stage(
@@ -2454,6 +2545,9 @@ class GenerateAndRunOrchestrator:
                 detail="Auto-persisting dataset before execution.",
             )
 
+        if self._abort_workflow_if_cancelled(entry, "saving_dataset"):
+            return False
+
         # ---------------- STAGE 3: AUTO-SAVING DATASET ----------------
         try:
             dataset_id, dataset_name, dataset_sha, testcase_ids = self._persist_generated_dataset(
@@ -2496,6 +2590,9 @@ class GenerateAndRunOrchestrator:
             self._persist_entry(entry)
         except OrchestrationError:
             self._record_persistence_failure(entry, "saving_dataset")
+            return False
+
+        if self._abort_workflow_if_cancelled(entry, "preflight"):
             return False
 
         # ---------------- STAGE 4: PREFLIGHT ----------------
@@ -2607,6 +2704,9 @@ class GenerateAndRunOrchestrator:
                     entry.completed_at = now
                 return
 
+        if self._abort_workflow_if_cancelled(entry, "executing"):
+            return False
+
         preflight_detail = (
             f"Preflight passed: {ready_count}/{selected_cases} executable testcase(s) ready"
             + (
@@ -2643,6 +2743,7 @@ class GenerateAndRunOrchestrator:
                 with self._generic_run_service.internal_reservation_context(
                     reservation_handle,
                     workflow_id=entry.workflow_id,
+                    owner_digest=entry.owner_digest,
                 ):
                     run_record = self._generic_run_service.start_run(start_payload)
             else:
@@ -2674,6 +2775,26 @@ class GenerateAndRunOrchestrator:
         with self._lock:
             entry.run_id = str(run_record.get("generic_run_id") or "")
             entry.sync_from_run_record(run_record, self._now_iso(), evaluation_mode=req.evaluation_mode)
+            cancel_arrived_during_handoff = bool(
+                entry.run_id
+                and (
+                    entry.cancellation_requested
+                    or (
+                        self._cancel_events.get(entry.workflow_id) is not None
+                        and self._cancel_events[entry.workflow_id].is_set()
+                    )
+                )
+            )
+        if cancel_arrived_during_handoff and hasattr(self._generic_run_service, "cancel_run"):
+            try:
+                cancelled_rec, _ = self._generic_run_service.cancel_run(
+                    entry.run_id,
+                    owner_digest=entry.owner_digest,
+                )
+                with self._lock:
+                    entry.sync_from_run_record(cancelled_rec, self._now_iso(), evaluation_mode=req.evaluation_mode)
+            except Exception:
+                pass
         # G13-R02: Only consider ownership handed off if GenericRunService actually adopted the handle.
         return (not is_replay) and bool(getattr(reservation_handle, "adopted", False))
 
@@ -2730,6 +2851,107 @@ class GenerateAndRunOrchestrator:
     def get_workflow(self, *, workflow_id: str, owner_id: str) -> GenerateAndRunSnapshot:
         entry = self._get_owned_workflow(workflow_id, owner_id)
         return self._refresh_and_snapshot(entry)
+
+    def cancel_workflow(self, *, workflow_id: str, owner_id: str) -> tuple[GenerateAndRunSnapshot, str]:
+        """Request idempotent cancellation of an owned Generate & Run workflow.
+
+        - Verifies strict workflow ownership (403 ``workflow_access_denied`` on mismatch).
+        - Before Runner handoff, signals the per-workflow cancellation event so safe pre-execution
+          stage checkpoints stop cleanly without dispatching any target requests.
+        - After Runner handoff (``entry.run_id`` is set), delegates directly to the canonical
+          ``GenericRunService.cancel_run()`` coordinator (no second independent cancellation engine).
+        """
+        entry = self._get_owned_workflow(workflow_id, owner_id)
+        # Sync latest runner state first so already-completed runs are never misclassified.
+        self._refresh_and_snapshot(entry)
+
+        with self._lock:
+            cur_status = entry.status
+            run_id = entry.run_id
+            owner_digest = entry.owner_digest
+            if cur_status == "completed":
+                return entry.to_snapshot(), "already_completed"
+            if cur_status == "cancelled":
+                return entry.to_snapshot(), "already_cancelled"
+            if cur_status in {"failed", "blocked", "partial_stopped", "interrupted"}:
+                return entry.to_snapshot(), "already_terminal"
+
+        if run_id and self._generic_run_service is not None and hasattr(self._generic_run_service, "cancel_run"):
+            try:
+                cancelled_rec, outcome = self._generic_run_service.cancel_run(
+                    run_id,
+                    owner_digest=owner_digest,
+                )
+            except OSError:
+                raise OrchestrationError(
+                    "cancellation_persistence_failed",
+                    _SAFE_PUBLIC_ERROR_MESSAGES["cancellation_persistence_failed"],
+                    status_code=500,
+                ) from None
+            except ValueError as exc:
+                if str(exc) == "generic_run_access_denied":
+                    raise OrchestrationError(
+                        "workflow_access_denied",
+                        "Generate & Run workflow belongs to a different operator session.",
+                        status_code=403,
+                    ) from None
+                raise OrchestrationError(
+                    "runner_cancellation_failed",
+                    "Unable to cancel the underlying Generic Runner execution.",
+                    status_code=409,
+                ) from None
+            with self._lock:
+                entry.sync_from_run_record(cancelled_rec, self._now_iso())
+                snap = entry.to_snapshot()
+            try:
+                self._persist_entry(entry)
+            except OrchestrationError:
+                raise OrchestrationError(
+                    "cancellation_persistence_failed",
+                    _SAFE_PUBLIC_ERROR_MESSAGES["cancellation_persistence_failed"],
+                    status_code=500,
+                ) from None
+            with self._lock:
+                self._cancel_persisted[entry.workflow_id] = True
+            return snap, outcome
+
+        with self._lock:
+            wf_evt = self._cancel_events.get(entry.workflow_id)
+            if wf_evt is not None:
+                wf_evt.set()
+            already_persisted = entry.cancellation_requested and self._cancel_persisted.get(entry.workflow_id) is True
+            if already_persisted:
+                return entry.to_snapshot(), "already_cancel_requested"
+            if not entry.cancellation_requested:
+                now = self._now_iso()
+                entry.cancellation_requested = True
+                entry.cancellation_requested_at = now
+                entry.updated_at = now
+                cur_stage = entry.current_stage
+                if entry.stages[cur_stage]["status"] == "running":
+                    entry.stages[cur_stage]["detail"] = f"Stopping… (cancel requested during {cur_stage})"
+            self._cancel_persisted[entry.workflow_id] = False
+            snap = entry.to_snapshot()
+        try:
+            self._persist_entry(entry)
+        except OrchestrationError:
+            with self._lock:
+                self._cancel_persisted[entry.workflow_id] = False
+            raise OrchestrationError(
+                "cancellation_persistence_failed",
+                _SAFE_PUBLIC_ERROR_MESSAGES["cancellation_persistence_failed"],
+                status_code=500,
+            ) from None
+        with self._lock:
+            self._cancel_persisted[entry.workflow_id] = True
+            if entry.status == "completed":
+                return entry.to_snapshot(), "already_completed"
+            if entry.status == "cancelled":
+                return entry.to_snapshot(), "already_cancelled"
+            if entry.status in {"failed", "blocked", "partial_stopped", "interrupted"}:
+                return entry.to_snapshot(), "already_terminal"
+            snap = entry.to_snapshot()
+        return snap, "cancel_requested"
 
     def list_workflows(self, *, owner_id: str) -> list[GenerateAndRunSnapshot]:
         """List all owned workflows (in-memory + durable disk), newest-first, with zero ghost-running states."""
@@ -3073,6 +3295,10 @@ class GenerateAndRunOrchestrator:
                     entry.error_code = None
                     entry.error_message = None
                     entry.evaluation_error_code = None
+                    entry.cancellation_requested = False
+                    entry.cancellation_requested_at = None
+                    entry.cancelled_at = None
+                    self._cancel_persisted.pop(workflow_id, None)
                     entry.mark_stage(
                         "preflight",
                         "completed",
