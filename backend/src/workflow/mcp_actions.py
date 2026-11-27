@@ -22,6 +22,12 @@ from targets.adapters import McpJsonRpcTargetAdapter
 from testing import Executor, Runner, RunnerEvaluationConfig
 from workflow.catalog import make_profile, read_json
 from workflow.dispatch import OneRequestHttpClient, sanitized
+from workflow.persistence import write_atomic_bytes
+from workflow.target_locks import (
+    TargetExecutionConflictError,
+    TargetExecutionLockRegistry,
+    TargetLockHandle,
+)
 
 
 class McpActionRejected(ValueError):
@@ -89,7 +95,8 @@ class McpActionWorkflow:
     def __init__(self, catalog, output_root: Path, cases_path: Path, *,
                  hybrid_config: RunnerEvaluationConfig | None = None,
                  observer_factory=None, transport=None,
-                 reviewed_catalog_sha256: str | None = None):
+                 reviewed_catalog_sha256: str | None = None,
+                 target_lock_registry: TargetExecutionLockRegistry | None = None):
         self.catalog = catalog
         self.output_root = Path(output_root)
         self.cases_path = Path(cases_path)
@@ -101,6 +108,7 @@ class McpActionWorkflow:
         self.hybrid_config = hybrid_config
         self.observer_factory = observer_factory
         self.transport = transport
+        self.target_locks: TargetExecutionLockRegistry | None = target_lock_registry
         self._lock = Lock()
 
     def public_cases(self):
@@ -159,8 +167,20 @@ class McpActionWorkflow:
             raise McpActionRejected("mcp_endpoint_not_local") from None
         if not self._lock.acquire(blocking=False):
             raise McpActionRejected("mcp_action_run_active")
+        shared_lock_handle: TargetLockHandle | None = None
         try:
             execution_id = uuid4().hex
+            if self.target_locks is not None:
+                try:
+                    shared_lock_handle = self.target_locks.reserve(
+                        [target_id],
+                        endpoints=[preset.endpoint],
+                        owner_kind="mcp_action",
+                        run_id=execution_id,
+                        conflict_code="target_execution_in_progress",
+                    )
+                except TargetExecutionConflictError:
+                    raise McpActionRejected("target_execution_in_progress") from None
             run_dir = self.output_root / ("mcp-action-" + execution_id)
             run_dir.mkdir(parents=True, exist_ok=False)  # Reserve report location before network.
             target = make_profile(preset, preset.default_model, preset.timeout_default)
@@ -206,14 +226,17 @@ class McpActionWorkflow:
                 "report_path": str(run_dir / "native_report.json")}
             safe_report = sanitized(report)
             report_bytes = (json.dumps(safe_report, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-            (run_dir / "native_report.json").write_bytes(report_bytes)
-            (run_dir / "run-summary.json").write_text(json.dumps({
+            write_atomic_bytes(run_dir / "native_report.json", report_bytes)
+            summary_bytes = (json.dumps({
                 "run_id": execution_id, "report_file": "native_report.json",
                 "report_sha256": sha256(report_bytes).hexdigest(),
                 "native_execution_id": safe_report["run_id"],
                 "testcase_id": case_id, "target_id": target_id,
                 "report_persisted": True, "report_kind": "mcp_action",
-                "target_request_count": client.used}, sort_keys=True) + "\n", encoding="utf-8")
+                "target_request_count": client.used}, sort_keys=True) + "\n").encode("utf-8")
+            write_atomic_bytes(run_dir / "run-summary.json", summary_bytes)
             return result
         finally:
+            if shared_lock_handle is not None and self.target_locks is not None:
+                self.target_locks.release(shared_lock_handle)
             self._lock.release()

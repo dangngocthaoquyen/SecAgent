@@ -35,6 +35,7 @@ from workflow.routes_datasets_policies import register_dataset_policy_routes
 from workflow.routes_execution import register_execution_routes
 from workflow.response_policies import ResponsePolicyStore
 from workflow.routes_generic_runner import GenericRunService, register_generic_runner_routes
+from workflow.target_locks import TargetExecutionLockRegistry
 from workflow.routes_targets import (DiscoveryProbeRequest, LocalProbeRequest,
     register_target_routes)
 from generator.api_routes import (
@@ -434,6 +435,122 @@ def create_app(catalog, *, port=8092, admission_policy=None,
         return fail("request_rejected" if isinstance(exc, HTTPException) else "internal_error",
                     exc.code if isinstance(exc, HTTPException) else 500)
 
+    def _service_has_active_execution(svc) -> bool:
+        if isinstance(svc, GenericRunService):
+            with svc._lock:
+                return bool(
+                    svc._live_target_reservations
+                    or svc._initializing_runs
+                    or any(t.is_alive() for t in svc._in_progress_runs.values())
+                )
+        if isinstance(svc, GenericImportedBatchWorkflow):
+            worker = getattr(svc, "_worker", None)
+            svc_lock = getattr(svc, "_lock", None)
+            return bool(
+                (worker is not None and worker.is_alive())
+                or (svc_lock is not None and svc_lock.locked())
+            )
+        if isinstance(svc, McpActionWorkflow):
+            svc_lock = getattr(svc, "_lock", None)
+            return bool(svc_lock is not None and svc_lock.locked())
+        return False
+
+    def _reconcile_shared_target_locks(exec_services: list[object]) -> TargetExecutionLockRegistry:
+        """Enforce a single shared TargetExecutionLockRegistry across all app execution services.
+
+        - Preserves any registry that already holds active reservations or belongs to an actively
+          executing service (never replaces an active lock registry).
+        - Fails closed if two distinct active registries exist, if an actively executing service
+          lacks a valid registry, or if an invalid registry object was supplied.
+        - Safely normalizes idle pre-initialized services to the single shared registry.
+        """
+        unique_regs: list[TargetExecutionLockRegistry] = []
+        active_regs: list[TargetExecutionLockRegistry] = []
+        for svc in exec_services:
+            if not hasattr(svc, "target_locks"):
+                continue
+            reg = getattr(svc, "target_locks", None)
+            if reg is not None and not isinstance(reg, TargetExecutionLockRegistry):
+                raise ValueError("Execution services must use TargetExecutionLockRegistry for target_locks.")
+            svc_active = _service_has_active_execution(svc)
+            if svc_active and reg is None:
+                raise ValueError("Cannot attach target lock registry to an actively executing service.")
+            if reg is not None:
+                if all(existing is not reg for existing in unique_regs):
+                    unique_regs.append(reg)
+                if (svc_active or reg.has_active_reservations()) and all(existing is not reg for existing in active_regs):
+                    active_regs.append(reg)
+
+        if len(active_regs) > 1:
+            raise ValueError("Execution services have incompatible active target lock registries.")
+        if len(active_regs) == 1:
+            canonical_reg = active_regs[0]
+        elif (
+            generic_run_service is not None
+            and isinstance(getattr(generic_run_service, "target_locks", None), TargetExecutionLockRegistry)
+        ):
+            canonical_reg = generic_run_service.target_locks
+        elif unique_regs:
+            canonical_reg = unique_regs[0]
+        else:
+            canonical_reg = TargetExecutionLockRegistry()
+
+        # Rebind only idle services whose registry differs from canonical_reg, re-verifying under lock.
+        for svc in exec_services:
+            if not hasattr(svc, "target_locks"):
+                continue
+            current_reg = getattr(svc, "target_locks", None)
+            if current_reg is canonical_reg:
+                continue
+            if isinstance(svc, GenericRunService):
+                with svc._lock:
+                    old_reg = svc.target_locks
+                    if _service_has_active_execution(svc) or (
+                        old_reg is not None and old_reg.has_active_reservations()
+                    ):
+                        raise ValueError("Execution services have incompatible active target lock registries.")
+                    svc.target_locks = canonical_reg
+            elif isinstance(svc, McpActionWorkflow):
+                if not svc._lock.acquire(blocking=False):
+                    raise ValueError("Execution services have incompatible active target lock registries.")
+                try:
+                    old_reg = svc.target_locks
+                    if old_reg is not None and old_reg.has_active_reservations():
+                        raise ValueError("Execution services have incompatible active target lock registries.")
+                    svc.target_locks = canonical_reg
+                finally:
+                    svc._lock.release()
+            else:
+                svc_lock = getattr(svc, "_lock", None)
+                if svc_lock is not None:
+                    if not svc_lock.acquire(blocking=False):
+                        raise ValueError("Execution services have incompatible active target lock registries.")
+                    try:
+                        old_reg = getattr(svc, "target_locks", None)
+                        worker = getattr(svc, "_worker", None)
+                        if (worker is not None and worker.is_alive()) or (
+                            old_reg is not None and old_reg.has_active_reservations()
+                        ):
+                            raise ValueError("Execution services have incompatible active target lock registries.")
+                        svc.target_locks = canonical_reg
+                    finally:
+                        svc_lock.release()
+                else:
+                    old_reg = getattr(svc, "target_locks", None)
+                    if _service_has_active_execution(svc) or (
+                        old_reg is not None and old_reg.has_active_reservations()
+                    ):
+                        raise ValueError("Execution services have incompatible active target lock registries.")
+                    svc.target_locks = canonical_reg
+        return canonical_reg
+
+    pre_supplied_exec_services = [
+        svc
+        for svc in (generic_run_service, *services.values(), mcp_action_service)
+        if svc is not None
+    ]
+    shared_target_locks = _reconcile_shared_target_locks(pre_supplied_exec_services)
+
     if generic_run_service is None:
         default_policy_dir = response_policy_dir or (
             (catalog.data_dir / "response_policies") if managed else (ROOT / "data" / "response_policies")
@@ -459,7 +576,17 @@ def create_app(catalog, *, port=8092, admission_policy=None,
             pi_config=pi_cfg,
             application_contexts=application_contexts,
             evidence_source_store=evidence_sources,
+            target_lock_registry=shared_target_locks,
         )
+
+    # Postcondition invariant: every active execution service in this app shares the exact same registry.
+    for svc in (
+        generic_run_service,
+        *services.values(),
+        *([mcp_action_service] if mcp_action_service is not None else []),
+    ):
+        if hasattr(svc, "target_locks") and getattr(svc, "target_locks", None) is not shared_target_locks:
+            raise ValueError("Execution services failed to share a single target lock registry.")
 
     @app.get("/api/testing/health")
     def health():

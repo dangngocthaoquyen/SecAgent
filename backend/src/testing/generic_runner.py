@@ -51,6 +51,7 @@ from testing.offline_stored_import import (
 )
 from testing.report_builder import build_summary
 from testing.runner import Runner
+from workflow.persistence import write_atomic_bytes
 from workflow.response_policies import (
     DEFAULT_EVALUATION_SCOPES,
     POLICY_REVISION_KEYS,
@@ -383,7 +384,7 @@ def run_generic_cases(
         Runner._verify_report_integrity(envelope["evaluation"])
         report_file = runs_dir / f"native-{testcase.id}-{run_id}.secagent.json"
         report_bytes = (json.dumps(envelope, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-        report_file.write_bytes(report_bytes)
+        write_atomic_bytes(report_file, report_bytes)
 
         ev_class = snapshot.get("evidence_classification") or {}
         judge_info = snapshot.get("judge") if isinstance(snapshot.get("judge"), dict) else {}
@@ -529,7 +530,8 @@ def run_generic_cases(
         "cases": case_summaries,
     }
     summary_path = out_root / "batch-summary.json"
-    summary_path.write_text(json.dumps(batch_summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    summary_bytes = (json.dumps(batch_summary, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    write_atomic_bytes(summary_path, summary_bytes)
     batch_summary["summary_path"] = str(summary_path)
     return batch_summary
 

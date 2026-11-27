@@ -39,6 +39,11 @@ from workflow.mcp_agent_runtime_binding import (
     WorkflowAgentExecutionGuard,
 )
 from workflow.models import ClosedModel, Identifier, TargetDraft
+from workflow.target_locks import (
+    TargetExecutionConflictError,
+    TargetExecutionLockRegistry,
+    TargetLockHandle,
+)
 from tools.http import HttpClientError
 
 
@@ -204,7 +209,8 @@ class GenericImportedBatchWorkflow:
                  *, root: Path = ROOT, execution_mode: str = "offline_mock",
                  mock_live_transport: httpx.MockTransport | None = None,
                  mock_mcp_transport: httpx.MockTransport | None = None,
-                 mcp_agent_receipt_collector_factory=None):
+                 mcp_agent_receipt_collector_factory=None,
+                 target_lock_registry: TargetExecutionLockRegistry | None = None):
         if (not isinstance(dispatcher, ControlledDispatcher)
                 or execution_mode not in {"offline_mock", "live_local_http", "both"}
                 or (execution_mode == "offline_mock" and type(dispatcher.transport) is not httpx.MockTransport)
@@ -232,6 +238,7 @@ class GenericImportedBatchWorkflow:
         self.repository_root = Path(root).resolve()
         self.root = dispatcher.output_root / "batch-runs"
         self.orchestrator = BatchOrchestrator(self.root)
+        self.target_locks: TargetExecutionLockRegistry | None = target_lock_registry
         self._lock = Lock()
         self._worker: Thread | None = None
         self._active_grant_id: str | None = None
@@ -724,7 +731,10 @@ class GenericImportedBatchWorkflow:
             "expected_plan_id", "submission_id", "authorization_confirmed"}))
         is_agent = self._is_agent_path(selection)
 
-        with self._lock:
+        shared_lock_handle: TargetLockHandle | None = None
+        lock_handed_off = False
+        try:
+          with self._lock:
             with self.dispatcher._lock:
                 if self.dispatcher._active or (self.root / ".active-batch").exists():
                     raise BatchRejected("Another controlled execution is active.")
@@ -772,6 +782,23 @@ class GenericImportedBatchWorkflow:
                             "agent_binding_revision_sha256": agent_binding["revision_sha256"]} if is_agent and agent_binding else {}),
                     },
                 )
+                identity = uuid4().hex
+                if self.target_locks is not None and self._transport_mode(selection) == "live_local_http":
+                    lock_target_ids = [selection.target.target_id]
+                    lock_endpoints = [selection.target.endpoint]
+                    if is_agent and selection.mcp_target is not None:
+                        lock_target_ids.append(selection.mcp_target.target_id)
+                        lock_endpoints.append(selection.mcp_target.endpoint)
+                    try:
+                        shared_lock_handle = self.target_locks.reserve(
+                            lock_target_ids,
+                            endpoints=lock_endpoints,
+                            owner_kind="legacy_batch",
+                            run_id=identity,
+                            conflict_code="target_execution_in_progress",
+                        )
+                    except TargetExecutionConflictError:
+                        raise BatchRejected("target_execution_in_progress") from None
                 self._authorized_cases = {case_id: self._find_dataset_and_case(case_id, selection.dataset_id)
                                           for case_id in selection.testcase_ids}
                 self._authorized_contracts = {r["testcase_id"]: (r.get("asi03_contract_id"),
@@ -783,7 +810,6 @@ class GenericImportedBatchWorkflow:
                 self._authorized_agent_binding = agent_binding
                 self._authorized_agent_config_digest = agent_config.config_digest() if agent_config else None
                 submission = self.root / ("submission-" + item.submission_id + ".json")
-                identity = uuid4().hex
                 try:
                     write_exclusive_json(submission, {"batch_run_id": identity, "plan_id": preview["plan_id"],
                         "submitted_at": datetime.now(timezone.utc).isoformat()})
@@ -837,7 +863,10 @@ class GenericImportedBatchWorkflow:
             def cleanup_worker():
                 self._active_grant_id = None
                 self._prune_grants()
+                if shared_lock_handle is not None and self.target_locks is not None:
+                    self.target_locks.release(shared_lock_handle)
 
+            lock_handed_off = True
             return launch_batch_worker(
                 dispatcher=self.dispatcher,
                 orchestrator=self.orchestrator,
@@ -850,6 +879,9 @@ class GenericImportedBatchWorkflow:
                 set_worker=lambda worker: setattr(self, "_worker", worker),
                 on_cleanup=cleanup_worker,
             )
+        finally:
+            if not lock_handed_off and shared_lock_handle is not None and self.target_locks is not None:
+                self.target_locks.release(shared_lock_handle)
 
     def _run_case(self, selection: ImportedBatchSelection, case: BatchCase,
                   execution_id: str, stage) -> CaseResult:

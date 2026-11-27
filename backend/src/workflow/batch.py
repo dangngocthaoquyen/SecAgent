@@ -16,6 +16,11 @@ from time import sleep
 from uuid import uuid4
 from typing import Any, Callable, Literal
 
+from workflow.persistence import (
+    write_atomic_json as _shared_write_atomic_json,
+    write_exclusive_json as _shared_write_exclusive_json,
+)
+
 
 CaseStatus = Literal["completed", "error", "blocked", "unsupported", "skipped", "cancelled"]
 Verdict = Literal["PASS", "FAIL", "INCONCLUSIVE", "ERROR"]
@@ -54,40 +59,17 @@ def _owner_alive(marker: dict) -> bool:
 
 
 def _write_atomic(path: Path, value: dict) -> None:
-    temporary = path.with_name("." + path.name + "." + uuid4().hex + ".tmp")
-    try:
-        with temporary.open("x", encoding="utf-8") as stream:
-            json.dump(value, stream, sort_keys=True, separators=(",", ":"))
-            stream.flush()
-            os.fsync(stream.fileno())
-        for attempt in range(20):
-            try:
-                os.replace(temporary, path)
-                break
-            except PermissionError:
-                if attempt == 19:
-                    raise
-                sleep(0.01)  # Windows readers briefly deny replacement.
-    finally:
-        temporary.unlink(missing_ok=True)
+    _shared_write_atomic_json(path, value, sort_keys=True, separators=(",", ":"))
 
 
 def write_exclusive_json(path: Path, payload: Any) -> None:
     """Create a new UTF-8 JSON file exclusively and flush + fsync it to disk."""
-
-    with path.open("x", encoding="utf-8") as stream:
-        json.dump(payload, stream)
-        stream.flush()
-        os.fsync(stream.fileno())
+    _shared_write_exclusive_json(path, payload, sort_keys=False)
 
 
 def _write_exclusive_sorted_json(path: Path, payload: Any) -> None:
     """Create a new UTF-8 JSON file exclusively with deterministic sorted keys."""
-
-    with path.open("x", encoding="utf-8") as stream:
-        json.dump(payload, stream, sort_keys=True)
-        stream.flush()
-        os.fsync(stream.fileno())
+    _shared_write_exclusive_json(path, payload, sort_keys=True)
 
 
 @dataclass(frozen=True)
@@ -416,9 +398,17 @@ class BatchOrchestrator:
                 state["events"].append({"at": _now(), "stage": stage, "testcase_id": case_id})
                 _write_atomic(directory / "state.json", state)
 
-            persist("preparing")
-            if on_started is not None:
-                on_started()
+            try:
+                persist("preparing")
+                if on_started is not None:
+                    on_started()
+            except Exception:
+                state["status"] = "failed"
+                try:
+                    persist("startup_fault")
+                except OSError:
+                    pass
+                raise
             try:
               for case in plan.cases:
                 if (directory / "cancel-requested.json").exists():

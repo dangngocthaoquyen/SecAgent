@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import contextmanager, nullcontext
+import copy
 from datetime import datetime, timezone
 from hashlib import sha256
 import ipaddress
@@ -67,6 +68,12 @@ from workflow.catalog import (
 from workflow.session_credentials import SessionCredentialError
 from workflow.dataset_models import infer_testcase_asi_code
 from workflow.evidence_sources import EvidenceSourceError
+from workflow.persistence import write_atomic_bytes
+from workflow.target_locks import (
+    TargetExecutionConflictError,
+    TargetExecutionLockRegistry,
+    TargetLockHandle,
+)
 from workflow.response_policies import (
     DEFAULT_EVALUATION_SCOPES,
     POLICY_REVISION_KEYS,
@@ -312,15 +319,6 @@ class _StaticDiagnosticCollector:
         return CollectedEvidenceOutput(evidence=[], diagnostics=list(self._diagnostics))
 
 
-class TargetExecutionConflictError(ValueError):
-    """Raised when a live execution or workflow reservation is already active for a target."""
-
-    def __init__(self, code: str, conflict: dict[str, Any]) -> None:
-        super().__init__(code)
-        self.code = code
-        self.conflict = dict(conflict)
-
-
 class LiveTargetReservationHandle:
     """Server-owned, unforgeable in-process capability handle for live target ownership.
 
@@ -328,12 +326,27 @@ class LiveTargetReservationHandle:
     ``workflow_id``, and never constructible from untrusted HTTP JSON payloads.
     """
 
-    __slots__ = ("_service_id", "_target_id", "_capability_token", "_adopted_run_id", "_released")
+    __slots__ = (
+        "_service_id",
+        "_target_id",
+        "_capability_token",
+        "_lock_handle",
+        "_adopted_run_id",
+        "_released",
+    )
 
-    def __init__(self, *, service_id: int, target_id: str, capability_token: str) -> None:
+    def __init__(
+        self,
+        *,
+        service_id: int,
+        target_id: str,
+        capability_token: str,
+        lock_handle: TargetLockHandle | None = None,
+    ) -> None:
         self._service_id = service_id
         self._target_id = target_id
         self._capability_token = capability_token
+        self._lock_handle = lock_handle
         self._adopted_run_id: str | None = None
         self._released: bool = False
 
@@ -377,6 +390,7 @@ class GenericRunService:
         allowed_collector_roots: tuple[Path, ...] = (),
         application_contexts: Any = None,
         evidence_source_store: Any = None,
+        target_lock_registry: TargetExecutionLockRegistry | None = None,
     ) -> None:
         self.catalog = catalog
         self.dataset_repo = dataset_repo
@@ -394,22 +408,47 @@ class GenericRunService:
         )
         self.application_contexts = application_contexts
         self.evidence_source_store = evidence_source_store
+        self.target_locks: TargetExecutionLockRegistry = target_lock_registry or TargetExecutionLockRegistry()
         self._active_target_counts: dict[str, int] = {}
         self._live_target_reservations: dict[str, dict[str, Any]] = {}
         self._in_progress_runs: dict[str, Thread] = {}
+        self._initializing_runs: dict[str, Event] = {}
         self._active_resumes_by_root: dict[str, str] = {}
         self._submissions_in_flight: dict[str, dict[str, Any]] = {}
+        self._resume_submissions_in_flight: dict[str, dict[str, Any]] = {}
         self._internal_handoff_tls = thread_local()
         self.submission_wait_timeout: float = 30.0
         self._lock = RLock()
+
+    def _catalog_endpoint_for_target(self, target_id: str) -> str | None:
+        clean_tid = str(target_id or "").strip()
+        if not clean_tid or self.catalog is None:
+            return None
+        targets_map = getattr(self.catalog, "_targets", None)
+        if isinstance(targets_map, dict):
+            preset = targets_map.get(clean_tid)
+            if preset is not None and isinstance(getattr(preset, "endpoint", None), str):
+                return str(preset.endpoint)
+        return None
+
+    def _is_run_in_progress_locked(self, run_id: str) -> bool:
+        if run_id in self._initializing_runs:
+            return True
+        worker = self._in_progress_runs.get(run_id)
+        return worker is not None and worker.is_alive()
 
     def active_run_count(self, target_id: str) -> int:
         with self._lock:
             return self._active_target_counts.get(target_id, 0)
 
     def is_active_for_target(self, target_id: str) -> bool:
+        ep = self._catalog_endpoint_for_target(target_id)
         with self._lock:
-            return self._active_target_counts.get(target_id, 0) > 0 or target_id in self._live_target_reservations
+            return (
+                self._active_target_counts.get(target_id, 0) > 0
+                or target_id in self._live_target_reservations
+                or self.target_locks.is_reserved(target_id=target_id, endpoint=ep)
+            )
 
     def _acquire_target_run(self, target_id: str) -> None:
         with self._lock:
@@ -440,28 +479,34 @@ class GenericRunService:
         owner_kind: str = "workflow",
         workflow_id: str | None = None,
         run_id: str | None = None,
+        endpoint: str | None = None,
     ) -> LiveTargetReservationHandle:
-        """Atomically reserve exclusive live execution ownership and return a server-owned handle."""
+        """Atomically reserve exclusive live execution ownership (logical ID + physical endpoint)."""
         clean_tid = str(target_id or "").strip()
         if not clean_tid:
             raise ValueError("generic_invalid_target_id")
+        resolved_endpoint = endpoint if endpoint is not None else self._catalog_endpoint_for_target(clean_tid)
         now_iso = datetime.now(timezone.utc).isoformat()
         cap_token = secrets.token_hex(32)
         with self._lock:
-            existing = self._live_target_reservations.get(clean_tid)
-            if existing is not None:
-                raise TargetExecutionConflictError(
-                    "generic_target_execution_in_progress",
-                    self._public_reservation(existing),
-                )
+            lock_handle = self.target_locks.reserve(
+                [clean_tid],
+                endpoints=[resolved_endpoint] if resolved_endpoint else (),
+                owner_kind=owner_kind,
+                workflow_id=workflow_id,
+                run_id=run_id,
+                conflict_code="generic_target_execution_in_progress",
+            )
             handle = LiveTargetReservationHandle(
                 service_id=id(self),
                 target_id=clean_tid,
                 capability_token=cap_token,
+                lock_handle=lock_handle,
             )
             entry = {
                 "target_id": clean_tid,
                 "handle": handle,
+                "lock_handle": lock_handle,
                 "capability_token": cap_token,
                 "owner_kind": owner_kind,
                 "workflow_id": workflow_id,
@@ -497,19 +542,32 @@ class GenericRunService:
                 handle._capability_token,
             ):
                 return False
-            self._live_target_reservations.pop(clean_tid, None)
+            stale_keys = [k for k, v in self._live_target_reservations.items() if v.get("handle") is handle]
+            for k in stale_keys:
+                self._live_target_reservations.pop(k, None)
+            if handle._lock_handle is not None:
+                self.target_locks.release(handle._lock_handle)
             handle._released = True
             return True
 
-    def get_live_target_reservation(self, target_id: str) -> dict[str, Any] | None:
+    def get_live_target_reservation(
+        self,
+        target_id: str,
+        *,
+        endpoint: str | None = None,
+    ) -> dict[str, Any] | None:
         clean_tid = str(target_id or "").strip()
+        resolved_ep = endpoint if endpoint is not None else self._catalog_endpoint_for_target(clean_tid)
         with self._lock:
+            shared = self.target_locks.get_reservation(target_id=clean_tid, endpoint=resolved_ep)
+            if shared is not None:
+                return shared
             existing = self._live_target_reservations.get(clean_tid)
             return self._public_reservation(existing) if existing is not None else None
 
     def list_live_target_reservations(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [self._public_reservation(v) for v in self._live_target_reservations.values()]
+            return self.target_locks.list_reservations()
 
     @contextmanager
     def internal_reservation_context(
@@ -1533,7 +1591,12 @@ class GenericRunService:
             "configured_evidence_source_count": configured_evidence_source_count,
             "evidence_source_diagnostics": evidence_source_diagnostics,
             "active_target_reservation": (
-                self.get_live_target_reservation(target.id) if mode == "live" else None
+                self.get_live_target_reservation(
+                    target.id,
+                    endpoint=str(target.interface.config.get("url") or ""),
+                )
+                if mode == "live"
+                else None
             ),
             **preview_meta,
         }
@@ -1559,9 +1622,7 @@ class GenericRunService:
         case_run_dir.mkdir(parents=True, exist_ok=True)
         sec_name = report_path.name
         sec_target = case_run_dir / sec_name
-        sec_tmp = case_run_dir / f".{sec_name}.{secrets.token_hex(4)}.tmp"
-        sec_tmp.write_bytes(report_bytes)
-        os.replace(sec_tmp, sec_target)
+        write_atomic_bytes(sec_target, report_bytes)
         run_sum = {
             "run_id": item["run_id"],
             "native_execution_id": ev_block.get("run_id") or item["run_id"],
@@ -1576,31 +1637,17 @@ class GenericRunService:
             "report_sha256": sha256(report_bytes).hexdigest(),
         }
         sum_target = case_run_dir / "run-summary.json"
-        sum_tmp = case_run_dir / f".run-summary-{secrets.token_hex(4)}.tmp"
-        sum_tmp.write_text(json.dumps(run_sum, indent=2) + "\n", encoding="utf-8")
-        os.replace(sum_tmp, sum_target)
+        write_atomic_bytes(sum_target, (json.dumps(run_sum, indent=2) + "\n").encode("utf-8"))
 
     def _write_run_record(self, run_dir: Path, record: dict[str, Any]) -> None:
         with self._lock:
             run_dir.mkdir(parents=True, exist_ok=True)
             target_file = run_dir / "generic-run.json"
-            tmp_file = run_dir / f".generic-run-{secrets.token_hex(6)}.tmp"
             data = (json.dumps(record, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-            tmp_file.write_bytes(data)
-            last_err: OSError | None = None
-            for _ in range(10):
-                try:
-                    os.replace(tmp_file, target_file)
-                    return
-                except OSError as exc:
-                    last_err = exc
-                    import time
-                    time.sleep(0.005)
             try:
-                tmp_file.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise OSError("generic_run_atomic_write_failed") from last_err
+                write_atomic_bytes(target_file, data, retries=20, retry_delay=0.005)
+            except OSError as exc:
+                raise OSError("generic_run_atomic_write_failed") from exc
 
     @staticmethod
     def _submission_fingerprint(payload: dict[str, Any], mode: str, target_id: str, asi_category: str, use_judge: bool) -> str:
@@ -1874,6 +1921,7 @@ class GenericRunService:
         if submission_id and fingerprint:
             existing_id_to_return: str | None = None
             worker_to_join: Thread | None = None
+            init_to_wait: Event | None = None
             wait_entry: dict[str, Any] | None = None
             with self._lock:
                 sub_file = submissions_dir / f"{submission_id}.json"
@@ -1885,6 +1933,7 @@ class GenericRunService:
                     if sub_doc.get("request_fingerprint") != fingerprint:
                         raise ValueError("generic_submission_conflict")
                     existing_id_to_return = str(sub_doc.get("generic_run_id") or "")
+                    init_to_wait = self._initializing_runs.get(existing_id_to_return)
                     worker_to_join = self._in_progress_runs.get(existing_id_to_return)
                 elif submission_id in self._submissions_in_flight:
                     wait_entry = self._submissions_in_flight[submission_id]
@@ -1903,8 +1952,13 @@ class GenericRunService:
             if existing_id_to_return is not None:
                 if not existing_id_to_return:
                     raise ValueError("generic_submission_record_unavailable")
-                if not async_execution and worker_to_join is not None and worker_to_join.is_alive():
-                    worker_to_join.join(timeout=300)
+                if not async_execution:
+                    if init_to_wait is not None:
+                        init_to_wait.wait(timeout=self.submission_wait_timeout)
+                        with self._lock:
+                            worker_to_join = self._in_progress_runs.get(existing_id_to_return)
+                    if worker_to_join is not None and worker_to_join.is_alive():
+                        worker_to_join.join(timeout=300)
                 existing_record = self.get_run(existing_id_to_return)
                 if existing_record is not None:
                     return {**existing_record, "idempotent_replay": True}
@@ -1922,10 +1976,16 @@ class GenericRunService:
                 waited_id = str(wait_entry.get("run_id") or "")
                 if not waited_id:
                     raise ValueError("generic_submission_init_failed")
-                with self._lock:
-                    w_thread = self._in_progress_runs.get(waited_id)
-                if not async_execution and w_thread is not None and w_thread.is_alive():
-                    w_thread.join(timeout=300)
+                if not async_execution:
+                    with self._lock:
+                        w_init = self._initializing_runs.get(waited_id)
+                        w_thread = self._in_progress_runs.get(waited_id)
+                    if w_init is not None:
+                        w_init.wait(timeout=self.submission_wait_timeout)
+                        with self._lock:
+                            w_thread = self._in_progress_runs.get(waited_id)
+                    if w_thread is not None and w_thread.is_alive():
+                        w_thread.join(timeout=300)
                 waited_record = self.get_run(waited_id)
                 if waited_record is not None:
                     return {**waited_record, "idempotent_replay": True}
@@ -1963,6 +2023,11 @@ class GenericRunService:
         )
         run_id = uuid4().hex
         released = False
+        init_evt: Event | None = None
+        initial_record_written = False
+        record_ref: dict[str, Any] | None = None
+        run_dir_ref: Path | None = None
+        startup_failed = False
         try:
             cat_lock = getattr(self.catalog, "_lock", None)
             session_resolver = None
@@ -2028,14 +2093,17 @@ class GenericRunService:
                     raise ValueError("generic_session_credential_stale")
 
                 tracked_ids = tuple(dict.fromkeys((target_id, target.id)))
-                # Atomically enforce single live execution per target_id (offline runs remain unblocked).
+                # Atomically enforce single live execution per logical target_id AND physical endpoint
+                # across Generic Runner, Generate & Run, Legacy Batch, and MCP Actions (offline runs unblocked).
                 if mode == "live":
                     now_res_iso = datetime.now(timezone.utc).isoformat()
-                    for tid in tracked_ids:
-                        existing_res = self._live_target_reservations.get(tid)
-                        if existing_res is not None:
-                            can_adopt = (
-                                valid_internal_handle is not None
+                    resolved_ep = str(target.interface.config.get("url") or "").strip() or None
+                    adopting_tid: str | None = None
+                    if valid_internal_handle is not None:
+                        for tid in tracked_ids:
+                            existing_res = self._live_target_reservations.get(tid)
+                            if (
+                                existing_res is not None
                                 and existing_res.get("handle") is valid_internal_handle
                                 and secrets.compare_digest(
                                     str(existing_res.get("capability_token") or ""),
@@ -2043,43 +2111,70 @@ class GenericRunService:
                                 )
                                 and existing_res.get("adopted_by_run_id") is None
                                 and valid_internal_handle._adopted_run_id is None
+                            ):
+                                adopting_tid = tid
+                                break
+
+                    if adopting_tid is not None and valid_internal_handle is not None:
+                        if valid_internal_handle._lock_handle is not None:
+                            ok = self.target_locks.adopt(
+                                valid_internal_handle._lock_handle,
+                                run_id=run_id,
+                                target_ids=tracked_ids,
+                                endpoints=[resolved_ep] if resolved_ep else (),
+                                conflict_code="generic_target_execution_in_progress",
                             )
-                            if can_adopt:
-                                adopted_reserved_handles.append((tid, valid_internal_handle))
-                            else:
-                                for rollback_tid, rollback_handle in newly_reserved_handles:
-                                    self.release_live_target(rollback_tid, handle=rollback_handle)
-                                newly_reserved_handles.clear()
+                            if not ok:
+                                conflict_info = (
+                                    self.target_locks.get_reservation(target_id=adopting_tid, endpoint=resolved_ep)
+                                    or self._public_reservation(self._live_target_reservations[adopting_tid])
+                                )
                                 raise TargetExecutionConflictError(
                                     "generic_target_execution_in_progress",
-                                    self._public_reservation(existing_res),
+                                    conflict_info,
                                 )
-                        else:
-                            fresh_cap = secrets.token_hex(32)
-                            fresh_handle = LiveTargetReservationHandle(
-                                service_id=id(self),
-                                target_id=tid,
-                                capability_token=fresh_cap,
-                            )
-                            fresh_handle._adopted_run_id = run_id
-                            self._live_target_reservations[tid] = {
-                                "target_id": tid,
-                                "handle": fresh_handle,
-                                "capability_token": fresh_cap,
-                                "owner_kind": "generic_run",
-                                "workflow_id": workflow_id,
-                                "run_id": run_id,
-                                "adopted_by_run_id": run_id,
-                                "reserved_at": now_res_iso,
-                            }
-                            newly_reserved_handles.append((tid, fresh_handle))
-                    for tid, adopted_handle in adopted_reserved_handles:
-                        existing_res = self._live_target_reservations[tid]
+                        existing_res = self._live_target_reservations[adopting_tid]
                         existing_res["run_id"] = run_id
                         existing_res["adopted_by_run_id"] = run_id
-                        adopted_handle._adopted_run_id = run_id
+                        valid_internal_handle._adopted_run_id = run_id
                         if workflow_id is not None:
                             existing_res["workflow_id"] = workflow_id
+                        adopted_reserved_handles.append((adopting_tid, valid_internal_handle))
+                        for extra_tid in tracked_ids:
+                            if extra_tid != adopting_tid and extra_tid not in self._live_target_reservations:
+                                self._live_target_reservations[extra_tid] = existing_res
+                    else:
+                        shared_lock_handle = self.target_locks.reserve(
+                            tracked_ids,
+                            endpoints=[resolved_ep] if resolved_ep else (),
+                            owner_kind="generic_run",
+                            workflow_id=workflow_id,
+                            run_id=run_id,
+                            conflict_code="generic_target_execution_in_progress",
+                        )
+                        fresh_cap = secrets.token_hex(32)
+                        primary_tid = tracked_ids[0]
+                        fresh_handle = LiveTargetReservationHandle(
+                            service_id=id(self),
+                            target_id=primary_tid,
+                            capability_token=fresh_cap,
+                            lock_handle=shared_lock_handle,
+                        )
+                        fresh_handle._adopted_run_id = run_id
+                        res_entry = {
+                            "target_id": primary_tid,
+                            "handle": fresh_handle,
+                            "lock_handle": shared_lock_handle,
+                            "capability_token": fresh_cap,
+                            "owner_kind": "generic_run",
+                            "workflow_id": workflow_id,
+                            "run_id": run_id,
+                            "adopted_by_run_id": run_id,
+                            "reserved_at": now_res_iso,
+                        }
+                        for tid in tracked_ids:
+                            self._live_target_reservations[tid] = res_entry
+                        newly_reserved_handles.append((primary_tid, fresh_handle))
                     live_reserved_handles = list(newly_reserved_handles) + list(adopted_reserved_handles)
                 for tid in tracked_ids:
                     self._acquire_target_run(tid)
@@ -2266,6 +2361,7 @@ class GenericRunService:
                 "asi_category": asi_category,
                 "use_judge": use_judge,
                 "policy_id": preview_meta["policy_id"],
+                **({"policy_ids_by_asi": dict(policy_ids_by_cat)} if policy_ids_by_cat else {}),
                 "policy_revision_sha256": preview_meta["policy_revision_sha256"],
                 "policy_review_status": preview_meta["policy_review_status"],
                 "context_source": preview_meta["context_source"],
@@ -2325,41 +2421,35 @@ class GenericRunService:
                     else {}
                 ),
             }
+            init_evt = Event()
+            record_ref = record
+            run_dir_ref = run_dir
             with self._lock:
-                # Register in-progress run BEFORE writing generic-run.json to disk so get_run/list_runs never see a false orphan
-                self._in_progress_runs[run_id] = Thread(name=f"init-{run_id[:8]}")
+                # Register initializing run BEFORE writing generic-run.json to disk so get_run/list_runs never see a false orphan
+                self._initializing_runs[run_id] = init_evt
                 if _owns_root_lock:
                     self._active_resumes_by_root[_owns_root_lock] = run_id
-            try:
-                self._write_run_record(run_dir, record)
-                if submission_id and fingerprint:
-                    with self._lock:
-                        submissions_dir.mkdir(parents=True, exist_ok=True)
-                        sub_path = submissions_dir / f"{submission_id}.json"
-                        sub_tmp = submissions_dir / f".sub-{secrets.token_hex(6)}.tmp"
-                        sub_tmp.write_text(
-                            json.dumps(
-                                {
-                                    "submission_id": submission_id,
-                                    "generic_run_id": run_id,
-                                    "request_fingerprint": fingerprint,
-                                    "created_at": started_at,
-                                },
-                                indent=2,
-                            )
-                            + "\n",
-                            encoding="utf-8",
-                        )
-                        os.replace(sub_tmp, sub_path)
-                        if in_flight_entry is not None:
-                            in_flight_entry["run_id"] = run_id
-            except Exception:
+            self._write_run_record(run_dir, record)
+            initial_record_written = True
+            if submission_id and fingerprint:
                 with self._lock:
-                    self._in_progress_runs.pop(run_id, None)
-                raise
-
-            if in_flight_owner and in_flight_entry is not None:
-                in_flight_entry["event"].set()
+                    submissions_dir.mkdir(parents=True, exist_ok=True)
+                    sub_path = submissions_dir / f"{submission_id}.json"
+                    sub_bytes = (
+                        json.dumps(
+                            {
+                                "submission_id": submission_id,
+                                "generic_run_id": run_id,
+                                "request_fingerprint": fingerprint,
+                                "created_at": started_at,
+                            },
+                            indent=2,
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                    write_atomic_bytes(sub_path, sub_bytes)
+                    if in_flight_entry is not None:
+                        in_flight_entry["run_id"] = run_id
 
             enriched_cases: list[dict[str, Any]] = []
             verdict_counter: Counter[str] = Counter()
@@ -2648,65 +2738,76 @@ class GenericRunService:
                 finally:
                     with self._lock:
                         self._in_progress_runs.pop(run_id, None)
+                        self._initializing_runs.pop(run_id, None)
                         if _owns_root_lock and self._active_resumes_by_root.get(_owns_root_lock) in {run_id, "reserving"}:
                             self._active_resumes_by_root.pop(_owns_root_lock, None)
+                    init_evt.set()
                     for tid, res_handle in live_reserved_handles:
                         self.release_live_target(tid, handle=res_handle)
                     for tid in tracked_ids:
                         self._release_target_run(tid)
 
             if async_execution:
-                worker_thread = Thread(target=_execute_worker, name=f"secagent-generic-run-{run_id[:8]}", daemon=True)
-                with self._lock:
-                    self._in_progress_runs[run_id] = worker_thread
                 try:
+                    worker_thread = Thread(target=_execute_worker, name=f"secagent-generic-run-{run_id[:8]}", daemon=True)
+                    with self._lock:
+                        # Take an immutable deep snapshot BEFORE starting worker so nested case_statuses mutations cannot race JSON serialization.
+                        snap = copy.deepcopy(record)
+                        self._in_progress_runs[run_id] = worker_thread
                     # G13-R04: Only mark ownership handed off AFTER worker_thread.start() succeeds.
                     worker_thread.start()
                     released = True
                 except Exception as start_exc:
-                    fail_iso = datetime.now(timezone.utc).isoformat()
+                    startup_failed = True
                     with self._lock:
                         self._in_progress_runs.pop(run_id, None)
-                        record["status"] = "failed"
-                        record["completed_at"] = fail_iso
-                        record["current_stage"] = "failed"
-                        record["error_code"] = "runner_worker_startup_failed"
-                        record["events"] = (
-                            record["events"] + [{"at": fail_iso, "stage": "failed", "case_id": None}]
-                        )[-120:]
-                    try:
-                        self._write_run_record(run_dir, record)
-                    except OSError:
-                        pass
                     raise ValueError("runner_worker_startup_failed") from start_exc
                 with self._lock:
-                    snap = dict(record)
+                    self._initializing_runs.pop(run_id, None)
+                init_evt.set()
+                if in_flight_owner and in_flight_entry is not None:
+                    in_flight_entry["event"].set()
                 if isinstance(_continuation_meta, dict):
                     return self._enrich_loaded_run(run_id, snap, run_dir, is_in_progress=True)
                 return snap
 
             released = True
+            if in_flight_owner and in_flight_entry is not None:
+                in_flight_entry["event"].set()
             _execute_worker()
             return self.get_run(run_id) or record
         except Exception as exc:
             if in_flight_owner and in_flight_entry is not None:
                 with self._lock:
                     in_flight_entry["error"] = exc
-                    if submission_id:
-                        self._submissions_in_flight.pop(submission_id, None)
-                in_flight_entry["event"].set()
             raise
         finally:
-            if in_flight_owner and submission_id:
-                with self._lock:
-                    self._submissions_in_flight.pop(submission_id, None)
-                    if in_flight_entry is not None and not in_flight_entry["event"].is_set():
-                        in_flight_entry["event"].set()
             if not released:
-                if _owns_root_lock:
+                if initial_record_written and record_ref is not None and run_dir_ref is not None:
+                    fail_iso = datetime.now(timezone.utc).isoformat()
+                    err_code = (
+                        "runner_worker_startup_failed"
+                        if startup_failed
+                        else "runner_initialization_failed"
+                    )
                     with self._lock:
-                        self._active_resumes_by_root.pop(_owns_root_lock, None)
+                        if record_ref.get("status") in {"preparing", "running"}:
+                            record_ref["status"] = "failed"
+                            record_ref["completed_at"] = fail_iso
+                            record_ref["current_stage"] = "failed"
+                            record_ref["error_code"] = err_code
+                            record_ref["events"] = (
+                                record_ref["events"] + [{"at": fail_iso, "stage": "failed", "case_id": None}]
+                            )[-120:]
+                    try:
+                        self._write_run_record(run_dir_ref, record_ref)
+                    except OSError:
+                        pass
                 with self._lock:
+                    self._in_progress_runs.pop(run_id, None)
+                    self._initializing_runs.pop(run_id, None)
+                    if _owns_root_lock:
+                        self._active_resumes_by_root.pop(_owns_root_lock, None)
                     for tid, res_handle in newly_reserved_handles:
                         self.release_live_target(tid, handle=res_handle)
                     for tid, adopted_handle in adopted_reserved_handles:
@@ -2716,10 +2817,19 @@ class GenericRunService:
                                 existing_res["run_id"] = None
                             if existing_res.get("adopted_by_run_id") == run_id:
                                 existing_res["adopted_by_run_id"] = None
+                        if adopted_handle._lock_handle is not None:
+                            self.target_locks.rollback_adoption(adopted_handle._lock_handle, run_id=run_id)
                         if adopted_handle._adopted_run_id == run_id:
                             adopted_handle._adopted_run_id = None
                 for tid in tracked_ids:
                     self._release_target_run(tid)
+                if init_evt is not None and not init_evt.is_set():
+                    init_evt.set()
+            if in_flight_owner and submission_id:
+                with self._lock:
+                    self._submissions_in_flight.pop(submission_id, None)
+                    if in_flight_entry is not None and not in_flight_entry["event"].is_set():
+                        in_flight_entry["event"].set()
 
     def _enrich_loaded_run(
         self,
@@ -2732,7 +2842,7 @@ class GenericRunService:
         record = dict(raw)
         if is_in_progress is None:
             with self._lock:
-                is_in_progress = run_id in self._in_progress_runs
+                is_in_progress = self._is_run_in_progress_locked(run_id)
         raw_status = record.get("status")
         if raw_status in {"preparing", "running"} and not is_in_progress:
             record["status"] = "interrupted"
@@ -2948,7 +3058,9 @@ class GenericRunService:
         active_id = lineage_info.get("active_lineage_run_id")
 
         with self._lock:
-            in_progress_ids = set(self._in_progress_runs.keys())
+            in_progress_ids = {
+                rid for rid, th in self._in_progress_runs.items() if th.is_alive()
+            } | set(self._initializing_runs.keys())
 
         sessions: list[dict[str, Any]] = []
         unified_cases_by_id: dict[str, dict[str, Any]] = {}
@@ -3481,7 +3593,9 @@ class GenericRunService:
                         continue
                     if isinstance(doc, dict):
                         raw_by_id[entry.name] = doc
-            in_progress_ids = set(self._in_progress_runs.keys())
+            in_progress_ids = {
+                rid for rid, th in self._in_progress_runs.items() if th.is_alive()
+            } | set(self._initializing_runs.keys())
             active_resumes = dict(self._active_resumes_by_root)
 
         def _resolve_root(rid: str) -> str:
@@ -3883,6 +3997,7 @@ class GenericRunService:
         asi_category = str(parent_raw.get("asi_category") or "auto")
         use_judge = bool(parent_raw.get("use_judge", False))
         policy_id = parent_raw.get("policy_id")
+        parent_policy_ids_by_cat = _normalize_policy_ids_by_category(parent_raw.get("policy_ids_by_asi"))
         parent_cap_states = (
             parent_raw.get("capability_states")
             if isinstance(parent_raw.get("capability_states"), dict)
@@ -4005,6 +4120,7 @@ class GenericRunService:
                     raw_cases=raw_cases,
                     use_judge=use_judge,
                     policy_id=policy_id,
+                    policy_ids_by_category=parent_policy_ids_by_cat or None,
                 )
 
                 # R02: Strict Policy consistency (distinguish legitimate None absence vs missing history vs drift).
@@ -4023,24 +4139,38 @@ class GenericRunService:
                         config_consistent = False
                         _add_blocker("resume_configuration_incomplete")
                 else:
+                    hist_reviewed_list = (
+                        parent_raw.get("reviewed_policies")
+                        if isinstance(parent_raw.get("reviewed_policies"), list)
+                        else None
+                    )
+                    hist_by_cat = (
+                        {
+                            p.get("category"): (p.get("policy_id"), p.get("revision_sha256"))
+                            for p in hist_reviewed_list
+                            if isinstance(p, dict) and p.get("category")
+                        }
+                        if hist_reviewed_list is not None
+                        else {}
+                    )
+                    is_multi_policy_parent = (
+                        hist_policy_id is None
+                        and hist_policy_rev is None
+                        and len(hist_by_cat) >= 2
+                    )
                     if hist_policy_rev is not None and (
                         not isinstance(hist_policy_rev, str) or not _HEX64_RE.fullmatch(hist_policy_rev)
                     ):
                         config_consistent = False
                         _add_blocker("resume_configuration_incomplete")
-                    elif (
+                    elif not is_multi_policy_parent and (
                         (hist_policy_rev is None) != (curr_policy_rev is None)
                         or hist_policy_rev != curr_policy_rev
                         or hist_policy_id != curr_policy_id
                     ):
                         config_consistent = False
                         _add_blocker("resume_policy_changed")
-                    elif isinstance(parent_raw.get("reviewed_policies"), list):
-                        hist_by_cat = {
-                            p.get("category"): (p.get("policy_id"), p.get("revision_sha256"))
-                            for p in parent_raw["reviewed_policies"]
-                            if isinstance(p, dict) and p.get("category")
-                        }
+                    elif hist_reviewed_list is not None:
                         curr_by_cat = {
                             p.get("category"): (p.get("policy_id"), p.get("revision_sha256"))
                             for p in (preview_meta.get("reviewed_policies") or [])
@@ -4129,6 +4259,7 @@ class GenericRunService:
             "judge_provider": curr_judge_provider if use_judge else None,
             "judge_model": curr_judge_model if use_judge else None,
             "policy_id": preview_meta.get("policy_id") if preview_meta else policy_id,
+            **({"policy_ids_by_asi": dict(parent_policy_ids_by_cat)} if parent_policy_ids_by_cat else {}),
             "policy_revision_sha256": preview_meta.get("policy_revision_sha256") if preview_meta else parent_raw.get("policy_revision_sha256"),
             "application_context_id": preview_meta.get("application_context_id") if preview_meta else parent_raw.get("application_context_id"),
             "application_context_revision_sha256": preview_meta.get("application_context_revision_sha256") if preview_meta else parent_raw.get("application_context_revision_sha256"),
@@ -4209,19 +4340,49 @@ class GenericRunService:
 
         submission_id_raw = payload.get("submission_id")
         submission_id: str | None = None
+        resume_sub_owner = False
+        resume_sub_entry: dict[str, Any] | None = None
+        resume_fingerprint = (parent_run_id, expected_resume_digest, tuple(sorted(include_uncertain)))
+        async_exec = bool(payload.get("async_execution", False))
         if submission_id_raw is not None:
             submission_id = str(submission_id_raw).strip()
             if not _HEX32_RE.fullmatch(submission_id):
                 raise ValueError("generic_invalid_submission_id")
             sub_file = self.runs_root / "submissions" / f"{submission_id}.json"
+            wait_resume_entry: dict[str, Any] | None = None
+            has_sub = False
             with self._lock:
                 has_sub = sub_file.is_file()
+                if not has_sub:
+                    if submission_id in self._resume_submissions_in_flight:
+                        wait_resume_entry = self._resume_submissions_in_flight[submission_id]
+                        if wait_resume_entry.get("fingerprint") != resume_fingerprint:
+                            raise ValueError("generic_submission_conflict")
+                    else:
+                        resume_sub_entry = {
+                            "fingerprint": resume_fingerprint,
+                            "event": Event(),
+                            "run_id": None,
+                            "error": None,
+                        }
+                        self._resume_submissions_in_flight[submission_id] = resume_sub_entry
+                        resume_sub_owner = True
             if has_sub:
                 try:
                     sub_doc = json.loads(sub_file.read_text(encoding="utf-8"))
                 except Exception as exc:
                     raise ValueError("generic_submission_record_unavailable") from exc
                 existing_id = str(sub_doc.get("generic_run_id") or "")
+                if existing_id and not async_exec:
+                    with self._lock:
+                        w_init = self._initializing_runs.get(existing_id)
+                        w_thread = self._in_progress_runs.get(existing_id)
+                    if w_init is not None:
+                        w_init.wait(timeout=self.submission_wait_timeout)
+                        with self._lock:
+                            w_thread = self._in_progress_runs.get(existing_id)
+                    if w_thread is not None and w_thread.is_alive():
+                        w_thread.join(timeout=300)
                 existing_rec = self.get_run(existing_id) if existing_id else None
                 if existing_rec is None:
                     raise ValueError("generic_submission_record_unavailable")
@@ -4232,17 +4393,43 @@ class GenericRunService:
                 ):
                     raise ValueError("generic_submission_conflict")
                 return existing_rec
+            if wait_resume_entry is not None:
+                signaled = wait_resume_entry["event"].wait(timeout=self.submission_wait_timeout)
+                if not signaled:
+                    raise ValueError("generic_submission_in_progress")
+                if wait_resume_entry.get("error") is not None:
+                    err = wait_resume_entry["error"]
+                    if isinstance(err, ValueError):
+                        raise err
+                    raise ValueError("generic_submission_init_failed") from err
+                waited_id = str(wait_resume_entry.get("run_id") or "")
+                if not waited_id:
+                    raise ValueError("generic_submission_init_failed")
+                if not async_exec:
+                    with self._lock:
+                        w_init = self._initializing_runs.get(waited_id)
+                        w_thread = self._in_progress_runs.get(waited_id)
+                    if w_init is not None:
+                        w_init.wait(timeout=self.submission_wait_timeout)
+                        with self._lock:
+                            w_thread = self._in_progress_runs.get(waited_id)
+                    if w_thread is not None and w_thread.is_alive():
+                        w_thread.join(timeout=300)
+                waited_rec = self.get_run(waited_id)
+                if waited_rec is None:
+                    raise ValueError("generic_submission_record_unavailable")
+                return waited_rec
 
-        lineage_info = self._scan_lineage(parent_run_id)
-        root_run_id = lineage_info["root_run_id"]
-
-        with self._lock:
-            if lineage_info["active_lineage_run_id"] is not None or root_run_id in self._active_resumes_by_root:
-                raise ValueError("generic_resume_already_active")
-            self._active_resumes_by_root[root_run_id] = "reserving"
-
-        lock_transferred = False
+        root_run_id: str | None = None
         try:
+            lineage_info = self._scan_lineage(parent_run_id)
+            root_run_id = lineage_info["root_run_id"]
+
+            with self._lock:
+                if lineage_info["active_lineage_run_id"] is not None or root_run_id in self._active_resumes_by_root:
+                    raise ValueError("generic_resume_already_active")
+                self._active_resumes_by_root[root_run_id] = "reserving"
+
             preview = self.preview_resume(
                 parent_run_id,
                 {"include_uncertain_case_ids": include_uncertain},
@@ -4265,6 +4452,7 @@ class GenericRunService:
                 if "expected_session_credential_generation" in payload
                 else preview["session_credential_generation"]
             )
+            parent_policy_ids_by_cat = _normalize_policy_ids_by_category(parent_raw.get("policy_ids_by_asi"))
             start_payload: dict[str, Any] = {
                 "authorization_confirmed": True,
                 "mode": preview["mode"],
@@ -4274,8 +4462,9 @@ class GenericRunService:
                 "asi_category": preview["asi_category"],
                 "use_judge": preview["use_judge"],
                 "policy_id": parent_raw.get("policy_id"),
+                **({"policy_ids_by_asi": dict(parent_policy_ids_by_cat)} if parent_policy_ids_by_cat else {}),
                 "capability_states": parent_raw.get("capability_states"),
-                "async_execution": bool(payload.get("async_execution", False)),
+                "async_execution": async_exec,
                 "expected_target_revision": expected_target_revision,
                 "expected_session_credential_generation": expected_session_gen,
                 "continuation_of_run_id": parent_run_id,
@@ -4303,15 +4492,28 @@ class GenericRunService:
                 "stateful_target_acknowledged": bool(payload.get("stateful_target_acknowledged")),
                 "uncertain_reexecution_confirmed": bool(payload.get("uncertain_reexecution_confirmed")),
             }
-            return self.start_run(
+            result_rec = self.start_run(
                 start_payload,
                 _continuation_meta=continuation_meta,
                 _owns_root_lock=root_run_id,
             )
+            if resume_sub_owner and resume_sub_entry is not None:
+                with self._lock:
+                    resume_sub_entry["run_id"] = result_rec.get("generic_run_id")
+            return result_rec
+        except Exception as exc:
+            if resume_sub_owner and resume_sub_entry is not None:
+                with self._lock:
+                    resume_sub_entry["error"] = exc
+            raise
         finally:
             with self._lock:
-                if self._active_resumes_by_root.get(root_run_id) == "reserving":
+                if root_run_id is not None and self._active_resumes_by_root.get(root_run_id) == "reserving":
                     self._active_resumes_by_root.pop(root_run_id, None)
+                if resume_sub_owner and submission_id is not None:
+                    self._resume_submissions_in_flight.pop(submission_id, None)
+            if resume_sub_owner and resume_sub_entry is not None:
+                resume_sub_entry["event"].set()
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         if not _HEX32_RE.fullmatch(run_id):
@@ -4325,7 +4527,7 @@ class GenericRunService:
                 raw = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
                 return None
-            is_in_progress = run_id in self._in_progress_runs
+            is_in_progress = self._is_run_in_progress_locked(run_id)
         if not isinstance(raw, dict):
             return None
         return self._enrich_loaded_run(run_id, raw, run_dir, is_in_progress=is_in_progress)
