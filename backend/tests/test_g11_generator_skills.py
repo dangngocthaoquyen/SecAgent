@@ -492,35 +492,38 @@ def test_r03c_scope_note_is_required_and_nonblank() -> None:
 def test_r03d_generation_limits_hard_ceilings_and_per_asi_counts() -> None:
     assert DEFAULT_GENERATION_LIMITS.min_per_asi == 1
     assert DEFAULT_GENERATION_LIMITS.default_per_asi == 5
-    assert DEFAULT_GENERATION_LIMITS.max_per_asi == HARD_MAX_PER_ASI == 15
+    assert DEFAULT_GENERATION_LIMITS.max_per_asi == HARD_MAX_PER_ASI == 50
     assert DEFAULT_GENERATION_LIMITS.max_total_cases == HARD_MAX_TOTAL_CASES == 50
 
-    # Hard ceilings cannot be overridden above 50 total or 15 per ASI.
+    # Hard ceilings cannot be overridden above 50 total or 50 per ASI.
     with pytest.raises(ValidationError):
         GenerationLimits(max_total_cases=100)
     with pytest.raises(ValidationError):
         GenerationLimits(max_total_cases=51)
     with pytest.raises(ValidationError):
-        GenerationLimits(max_per_asi=25)
+        GenerationLimits(max_per_asi=51)
     with pytest.raises(ValidationError):
-        GenerationLimits(max_per_asi=16)
+        GenerationLimits(max_per_asi=60)
 
-    # Per-ASI distinct counts allowed when each is within [1, 15] and sum <= 50.
+    # Single-ASI full allocation (50) and multi-ASI distinct counts summing <= 50 are allowed.
+    assert DEFAULT_GENERATION_LIMITS.validate_per_asi_counts({"ASI03": 50}) == {"ASI03": 50}
     validated = DEFAULT_GENERATION_LIMITS.validate_per_asi_counts(
-        {"ASI01": 15, "ASI02": 15, "ASI03": 10, "ASI05": 10}
+        {"ASI01": 10, "ASI03": 20, "ASI05": 20}
     )
-    assert validated == {"ASI01": 15, "ASI02": 15, "ASI03": 10, "ASI05": 10}
+    assert validated == {"ASI01": 10, "ASI03": 20, "ASI05": 20}
 
     # Duplicate ASI aliases rejected (ASI01 + goal_hijacking).
     with pytest.raises(ValueError, match="Duplicate ASI category"):
         DEFAULT_GENERATION_LIMITS.validate_per_asi_counts({"ASI01": 2, "goal_hijacking": 3})
 
     # Non-integer / boolean / invalid counts rejected.
-    for bad_count in (True, False, 3.5, "5", 0, -1, 16):
+    for bad_count in (True, False, 3.5, "5", 0, -1, 51):
         with pytest.raises(ValueError):
             DEFAULT_GENERATION_LIMITS.validate_per_asi_counts({"ASI01": bad_count})  # type: ignore[dict-item]
 
-    # Exceeding total max (15 * 4 = 60 > 50) rejected.
+    # Exceeding total max (30 + 30 = 60 > 50 and 15 * 4 = 60 > 50) rejected.
+    with pytest.raises(ValueError, match="exceeds maximum limit of 50"):
+        DEFAULT_GENERATION_LIMITS.validate_per_asi_counts({"ASI03": 30, "ASI05": 30})
     with pytest.raises(ValueError, match="exceeds maximum limit of 50"):
         DEFAULT_GENERATION_LIMITS.validate_per_asi_counts(
             {"ASI01": 15, "ASI02": 15, "ASI03": 15, "ASI05": 15}

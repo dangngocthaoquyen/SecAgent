@@ -266,18 +266,22 @@ def test_multi_asi_success_distinct_counts_and_canonical_order(tmp_path: Path) -
 
 
 def test_generation_limits_enforced_for_request_and_service(tmp_path: Path) -> None:
-    # Valid exact boundary: 15 + 15 + 15 + 5 = 50
+    # Valid exact boundaries: single-ASI 50 and multi-ASI sum 50
+    req_single_50 = GenerationServiceRequest(target_id="t1", counts_by_asi={"ASI03": 50})
+    assert req_single_50.counts_by_asi == {"ASI03": 50}
     req_50 = GenerationServiceRequest(
         target_id="t1",
-        counts_by_asi={"ASI01": 15, "ASI02": 15, "ASI03": 15, "ASI05": 5},
+        counts_by_asi={"ASI01": 10, "ASI03": 20, "ASI05": 20},
     )
     assert sum(req_50.counts_by_asi.values()) == 50
 
-    # Exceeds per-ASI hard limit (16 > 15)
+    # Exceeds per-ASI hard limit (51 > 50)
     with pytest.raises(ValidationError):
-        GenerationServiceRequest(target_id="t1", counts_by_asi={"ASI01": 16})
+        GenerationServiceRequest(target_id="t1", counts_by_asi={"ASI01": 51})
 
-    # Exceeds total hard limit (15+15+15+6 = 51 > 50)
+    # Exceeds total hard limit (30 + 30 = 60 > 50 and 15+15+15+6 = 51 > 50)
+    with pytest.raises(ValidationError):
+        GenerationServiceRequest(target_id="t1", counts_by_asi={"ASI03": 30, "ASI05": 30})
     with pytest.raises(ValidationError):
         GenerationServiceRequest(
             target_id="t1",

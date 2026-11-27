@@ -52,9 +52,9 @@ DEFAULT_MAX_SKILL_BUNDLE_BYTES: int = 96 * 1024  # 96 KiB per loaded ASI bundle
 # Hard ceilings lock v1 bounds; DatasetNormalizer (100) and GenericRunService (50) remain untouched.
 DEFAULT_MIN_PER_ASI: int = 1
 DEFAULT_PER_ASI: int = 5
-DEFAULT_MAX_PER_ASI: int = 15
+DEFAULT_MAX_PER_ASI: int = 50
 DEFAULT_MAX_TOTAL_CASES: int = 50
-HARD_MAX_PER_ASI: int = 15
+HARD_MAX_PER_ASI: int = 50
 HARD_MAX_TOTAL_CASES: int = 50
 
 # Candidate prompt byte bound per G11.1 design (enforced in UTF-8 bytes, not char count alone).

@@ -209,7 +209,13 @@ export default function GeneratorConfigForm({
       <section aria-label="OWASP ASI configuration" className="panel" style={{ marginBottom: 14, padding: 14 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
           <strong>OWASP Agentic ASI Categories &amp; Counts</strong>
-          <span data-testid="total-requested-count" style={{ fontWeight: 600 }}>
+          <span
+            data-testid="total-requested-count"
+            style={{
+              fontWeight: 600,
+              color: total > GENERATOR_LIMITS.maxTotalCases ? 'var(--fail)' : undefined,
+            }}
+          >
             Total: {total} / {GENERATOR_LIMITS.maxTotalCases}
           </span>
         </div>

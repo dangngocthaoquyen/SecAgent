@@ -30,9 +30,9 @@ function mockStatusResponse(ready = true): GeneratorStatusResponse {
     limits: {
       min_per_asi: 1,
       default_per_asi: 5,
-      max_per_asi: 15,
+      max_per_asi: 50,
       max_total_cases: 50,
-      hard_max_per_asi: 15,
+      hard_max_per_asi: 50,
       hard_max_total_cases: 50,
     },
     defaults: {

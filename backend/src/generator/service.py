@@ -2,7 +2,7 @@
 
 Orchestrates G11.2 and G11.3A components end-to-end without contacting any Target,
 calling any Judge/Evaluator, mutating any store, or persisting any dataset:
-1. Validate centralized generation count limits (<= 15/ASI, <= 50/generation).
+1. Validate centralized generation count limits (<= 50/ASI, <= 50/generation).
 2. Read read-only Confirmed Context Snapshot and per-ASI Readiness (`assess_target_readiness`).
 3. Skip/block blocked ASIs with zero provider calls and zero scope downgrade.
 4. Load allowlisted Generation Skills (`GeneratorSkillLoader`).

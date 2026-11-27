@@ -46,7 +46,7 @@ export const ALLOWED_SCOPES_BY_ASI: Record<AsiCode, readonly string[]> = {
 export const GENERATOR_LIMITS = {
   minPerAsi: 1,
   defaultPerAsi: 5,
-  maxPerAsi: 15,
+  maxPerAsi: 50,
   maxTotalCases: 50,
   maxPromptUtf8Bytes: 4096,
   maxDescriptionChars: 512,
@@ -756,25 +756,26 @@ export function extractActiveCounts(
   const counts: Partial<Record<AsiCode, number>> = {};
   const selectedList: AsiCode[] = [];
   let total = 0;
+  let perAsiError: string | null = null;
 
   for (const code of SUPPORTED_ASI_CODES) {
     if (!config.selectedAsi[code]) continue;
     selectedList.push(code);
     const val = config.countsByAsi[code];
+    if (Number.isInteger(val) && val > 0) {
+      total += val;
+    }
     if (
       !Number.isInteger(val) ||
       val < GENERATOR_LIMITS.minPerAsi ||
       val > GENERATOR_LIMITS.maxPerAsi
     ) {
-      return {
-        counts,
-        selectedList,
-        total,
-        error: `${code} count must be an integer between ${GENERATOR_LIMITS.minPerAsi} and ${GENERATOR_LIMITS.maxPerAsi}.`,
-      };
+      if (perAsiError === null) {
+        perAsiError = `${code} count must be an integer between ${GENERATOR_LIMITS.minPerAsi} and ${GENERATOR_LIMITS.maxPerAsi}.`;
+      }
+      continue;
     }
     counts[code] = val;
-    total += val;
   }
 
   if (selectedList.length === 0) {
@@ -783,6 +784,14 @@ export function extractActiveCounts(
       selectedList,
       total: 0,
       error: 'Select at least one OWASP ASI category.',
+    };
+  }
+  if (perAsiError !== null) {
+    return {
+      counts,
+      selectedList,
+      total,
+      error: perAsiError,
     };
   }
   if (total > GENERATOR_LIMITS.maxTotalCases) {

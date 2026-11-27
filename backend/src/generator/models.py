@@ -36,7 +36,7 @@ class StrictGeneratorModel(BaseModel):
 
 
 class GenerationLimits(StrictGeneratorModel):
-    """Centralized generation count limits with locked v1 hard ceilings (<= 15/ASI, <= 50 total)."""
+    """Centralized generation count limits with locked v1 hard ceilings (<= 50/ASI, <= 50 total)."""
 
     min_per_asi: int = Field(default=DEFAULT_MIN_PER_ASI, ge=1, le=HARD_MAX_PER_ASI, strict=True)
     default_per_asi: int = Field(default=DEFAULT_PER_ASI, ge=1, le=HARD_MAX_PER_ASI, strict=True)

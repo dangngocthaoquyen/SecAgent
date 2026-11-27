@@ -310,8 +310,11 @@ def test_api_security_boundaries_auth_origin_nonce_host_and_headers(tmp_path: Pa
     assert r.headers["Referrer-Policy"] == "no-referrer"
     body = r.get_json()
     assert body["defaults"]["deduplicate_across_asi"] is False
-    assert body["limits"]["max_per_asi"] == 15
+    assert body["limits"]["default_per_asi"] == 5
+    assert body["limits"]["max_per_asi"] == 50
+    assert body["limits"]["hard_max_per_asi"] == 50
     assert body["limits"]["max_total_cases"] == 50
+    assert body["limits"]["hard_max_total_cases"] == 50
     assert len(body["skills"]) == 4
 
 
