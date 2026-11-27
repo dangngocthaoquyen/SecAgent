@@ -19,12 +19,17 @@ from __future__ import annotations
 from hashlib import sha256
 import json
 import re
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 from uuid import uuid4
 
 from pydantic import Field
 
-from generator.constants import AsiCategory, AsiCode, HARD_MAX_PER_ASI
+from generator.constants import (
+    AsiCategory,
+    AsiCode,
+    HARD_MAX_PER_ASI,
+    MAX_PLANNED_CHUNKS_PER_ASI,
+)
 from generator.models import (
     DEFAULT_GENERATION_LIMITS,
     GenerationLimits,
@@ -70,6 +75,8 @@ _IP_PORT_RE = re.compile(
 )
 _PEM_BLOCK_RE = re.compile(r"-----BEGIN [A-Z0-9 ]+-----[\s\S]*?-----END [A-Z0-9 ]+-----")
 _PEM_HEADER_RE = re.compile(r"-----BEGIN [A-Z0-9 ]+-----")
+_SAFE_STRATEGY_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
+MAX_PRIOR_STRATEGY_TAGS_HINT: int = 32
 
 
 class GenerationRequestError(ValueError):
@@ -178,6 +185,9 @@ def build_sanitized_generation_request(
     limits: GenerationLimits = DEFAULT_GENERATION_LIMITS,
     request_id: str | None = None,
     extra_sensitive_values: tuple[str, ...] = (),
+    chunk_index: int | None = None,
+    total_chunks: int | None = None,
+    prior_strategy_tags: Sequence[str] | None = None,
 ) -> SanitizedGenerationRequestEnvelope:
     """Build a strictly separated, allowlisted Generation Request for one ASI.
 
@@ -247,6 +257,39 @@ def build_sanitized_generation_request(
         "excluded_missing_provenance_fields": list(snapshot.excluded_missing_provenance_fields),
         "readiness_warnings": list(assessment.warnings),
     }
+    if total_chunks is not None and total_chunks > 1:
+        if (
+            isinstance(total_chunks, bool)
+            or not isinstance(total_chunks, int)
+            or total_chunks > MAX_PLANNED_CHUNKS_PER_ASI
+        ):
+            raise GenerationRequestError(
+                "invalid_chunk_plan",
+                f"total_chunks must be an integer between 2 and {MAX_PLANNED_CHUNKS_PER_ASI}.",
+            )
+        if (
+            chunk_index is None
+            or isinstance(chunk_index, bool)
+            or not isinstance(chunk_index, int)
+            or chunk_index < 1
+            or chunk_index > total_chunks
+        ):
+            raise GenerationRequestError(
+                "invalid_chunk_index",
+                f"chunk_index must be an integer between 1 and {total_chunks}.",
+            )
+        generation_parameters["chunk_index"] = chunk_index
+        generation_parameters["total_chunks"] = total_chunks
+        if prior_strategy_tags:
+            safe_tags = sorted(
+                {
+                    tag.strip()
+                    for tag in prior_strategy_tags
+                    if isinstance(tag, str) and _SAFE_STRATEGY_TAG_RE.fullmatch(tag.strip())
+                }
+            )[:MAX_PRIOR_STRATEGY_TAGS_HINT]
+            if safe_tags:
+                generation_parameters["prior_chunk_strategy_tags"] = safe_tags
 
     user_payload: dict[str, Any] = {
         "generation_parameters": generation_parameters,

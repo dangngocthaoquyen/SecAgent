@@ -57,6 +57,15 @@ DEFAULT_MAX_TOTAL_CASES: int = 50
 HARD_MAX_PER_ASI: int = 50
 HARD_MAX_TOTAL_CASES: int = 50
 
+# Bounded multi-chunk generation limits (Phase 2 v1 — fixed server-owned chunk size).
+# Fixed chunk size 15 keeps every chunk's token budget (7068) under DeepSeek's 8192 ceiling
+# and locks worst-case planned chunks to ceil(50 / 15) = 4 per ASI.
+DEFAULT_GENERATION_CHUNK_SIZE: int = 15
+MAX_PLANNED_CHUNKS_PER_ASI: int = 4
+MAX_TOTAL_PROVIDER_CALLS_PER_ASI: int = 5
+MAX_GENERATION_TOTAL_PROVIDER_CALLS: int = 8
+MAX_GENERATION_OUTPUT_TOKEN_BUDGET: int = 32768
+
 # Candidate prompt byte bound per G11.1 design (enforced in UTF-8 bytes, not char count alone).
 MAX_CANDIDATE_PROMPT_UTF8_BYTES: int = 4096
 

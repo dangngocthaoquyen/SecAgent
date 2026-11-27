@@ -414,16 +414,26 @@ def test_direct_api_generate_only_allows_50_rejects_over_cap_and_handles_partial
     ds = env["repo"].get_dataset(save_rec["dataset_id"])
     assert ds is not None and len(ds.testcases) == 50
 
-    # 4. Partial generation: request 50, provider yields 35 valid -> status='partial', requires_partial_confirmation=True
-    partial_json = json.dumps(
-        {
-            "schema_version": "1.0",
-            "asi_category": "ASI05",
-            "context_gaps": [],
-            "candidates": [_candidate_dict(i, "ASI05") for i in range(35)],
-        }
+    # 4. Partial generation: request 50 across 4 bounded chunks [15,15,15,5], provider yields 35 valid
+    # (15 + 10 + 5 + 5 = 35) -> status='partial', requires_partial_confirmation=True
+    def _chunk_json(asi_code: str, start: int, count: int) -> str:
+        return json.dumps(
+            {
+                "schema_version": "1.0",
+                "asi_category": asi_code,
+                "context_gaps": [],
+                "candidates": [_candidate_dict(i, asi_code) for i in range(start, start + count)],
+            }
+        )
+
+    provider_partial = MockGeneratorProvider(
+        fixtures=[
+            MockFixtureResponse(mode="success", raw_text=_chunk_json("ASI05", 0, 15)),
+            MockFixtureResponse(mode="success", raw_text=_chunk_json("ASI05", 15, 10)),
+            MockFixtureResponse(mode="success", raw_text=_chunk_json("ASI05", 25, 5)),
+            MockFixtureResponse(mode="success", raw_text=_chunk_json("ASI05", 30, 5)),
+        ]
     )
-    provider_partial = MockGeneratorProvider(fixtures=[MockFixtureResponse(mode="success", raw_text=partial_json)])
     env_p = _setup_app(tmp_path / "partial", endpoint="http://127.0.0.1:19999/v1/chat/completions", provider=provider_partial)
     r_part = env_p["client"].post(
         "/api/testing/generator/generate",
@@ -538,17 +548,28 @@ def test_direct_api_generate_and_run_flexible_counts_and_partial_gate(tmp_path: 
         assert len(target_calls) == 50
         assert env["locks"].list_reservations() == []
 
-        # 4. Partial 35/50 with allow_partial_execution=False stops fail-closed at validating (0 target calls)
+        # 4. Partial 35/50 across 4 bounded chunks [15,15,15,5] with allow_partial_execution=False
+        # stops fail-closed at validating (0 target calls)
         target_calls.clear()
-        partial_json = json.dumps(
-            {
-                "schema_version": "1.0",
-                "asi_category": "ASI03",
-                "context_gaps": [],
-                "candidates": [_candidate_dict(i, "ASI03") for i in range(35)],
-            }
+
+        def _chunk_json_asi03(start: int, count: int) -> str:
+            return json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "asi_category": "ASI03",
+                    "context_gaps": [],
+                    "candidates": [_candidate_dict(i, "ASI03") for i in range(start, start + count)],
+                }
+            )
+
+        p_prov = MockGeneratorProvider(
+            fixtures=[
+                MockFixtureResponse(mode="success", raw_text=_chunk_json_asi03(0, 15)),
+                MockFixtureResponse(mode="success", raw_text=_chunk_json_asi03(15, 10)),
+                MockFixtureResponse(mode="success", raw_text=_chunk_json_asi03(25, 5)),
+                MockFixtureResponse(mode="success", raw_text=_chunk_json_asi03(30, 5)),
+            ]
         )
-        p_prov = MockGeneratorProvider(fixtures=[MockFixtureResponse(mode="success", raw_text=partial_json)])
         env_p = _setup_app(tmp_path / "gnr-partial", endpoint=endpoint, provider=p_prov)
         r_part = env_p["client"].post(
             "/api/testing/generator/generate-and-run",

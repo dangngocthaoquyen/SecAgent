@@ -152,8 +152,11 @@ def validate_parsed_output(
     snapshot: ConfirmedContextSnapshot,
     assessment: AsiReadinessAssessment,
     provenance_inputs: GenerationProvenanceInputs,
+    source_index_offset: int = 0,
 ) -> CandidateValidationOutcome:
     """Validate ASI consistency and confirmed context_basis grounding for one ASI output."""
+    if isinstance(source_index_offset, bool) or not isinstance(source_index_offset, int) or source_index_offset < 0:
+        raise ValueError("source_index_offset must be a non-negative integer.")
     if contract.asi_category != expected_asi_code:
         return CandidateValidationOutcome(
             asi_code=expected_asi_code,
@@ -169,6 +172,7 @@ def validate_parsed_output(
     rejected: list[ValidationRejection] = []
 
     for idx, draft in enumerate(contract.candidates):
+        global_idx = source_index_offset + idx
         prompt_hash = compute_prompt_sha256(draft.prompt)
         norm_hash = compute_normalized_prompt_sha256(draft.prompt)
         violation = _classify_context_basis_violation(
@@ -182,7 +186,7 @@ def validate_parsed_output(
             reason_code, invalid_fields, reason_message = violation
             rejected.append(
                 ValidationRejection(
-                    source_index=idx,
+                    source_index=global_idx,
                     asi_code=expected_asi_code,
                     reason_code=reason_code,
                     reason_message=reason_message,
@@ -195,7 +199,7 @@ def validate_parsed_output(
 
         valid.append(
             IndexedCandidateDraft(
-                source_index=idx,
+                source_index=global_idx,
                 asi_code=expected_asi_code,
                 draft=draft,
                 prompt_sha256=prompt_hash,

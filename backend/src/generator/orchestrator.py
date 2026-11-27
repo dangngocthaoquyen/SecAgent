@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from hashlib import sha256
+import inspect
 import json
 import os
 from pathlib import Path
@@ -37,6 +38,7 @@ from uuid import uuid4
 
 from pydantic import Field, field_validator
 
+from core.cancellation import RunCancelledError
 from generator.constants import AsiCode, GENERATOR_SOURCE_TOOL
 from generator.models import StrictGeneratorModel, normalize_asi_code
 from generator.preview_store import (
@@ -2313,6 +2315,15 @@ class GenerateAndRunOrchestrator:
             entry.skip_remaining_after(stage, now)
             return True
 
+    def _generator_accepts_cancel_event(self) -> bool:
+        try:
+            sig = inspect.signature(self._generator_service.generate)
+        except (TypeError, ValueError):
+            return False
+        if "cancel_event" in sig.parameters:
+            return True
+        return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+
     def _run_pipeline_stages_body(
         self,
         entry: _WorkflowEntry,
@@ -2327,8 +2338,30 @@ class GenerateAndRunOrchestrator:
             return False
 
         # ---------------- STAGE 1: GENERATING ----------------
+        with self._lock:
+            wf_cancel_evt = self._cancel_events.get(entry.workflow_id)
         try:
-            gen_result = self._generator_service.generate(service_req)
+            gen_kwargs: dict[str, Any] = {}
+            if wf_cancel_evt is not None and self._generator_accepts_cancel_event():
+                gen_kwargs["cancel_event"] = wf_cancel_evt
+            gen_result = self._generator_service.generate(service_req, **gen_kwargs)
+        except RunCancelledError:
+            # Explicit canonical cancellation path — NEVER convert RunCancelledError into status='failed'.
+            if not self._abort_workflow_if_cancelled(entry, "generating"):
+                now = self._now_iso()
+                with self._lock:
+                    entry.cancellation_requested = True
+                    if not entry.cancellation_requested_at:
+                        entry.cancellation_requested_at = now
+                    entry.cancelled_at = now
+                    entry.completed_at = now
+                    entry.status = "cancelled"
+                    entry.error_stage = None
+                    entry.error_code = None
+                    entry.error_message = None
+                    entry.mark_stage("generating", "cancelled", now, detail="Cancelled by operator during generating.")
+                    entry.skip_remaining_after("generating", now)
+            return False
         except GenerationServiceError as exc:
             now = self._now_iso()
             with self._lock:
@@ -2339,7 +2372,7 @@ class GenerateAndRunOrchestrator:
                 entry.error_code = exc.code
                 entry.error_message = exc.message
                 entry.completed_at = now
-            return
+            return False
         except Exception:
             now = self._now_iso()
             with self._lock:
@@ -2356,7 +2389,7 @@ class GenerateAndRunOrchestrator:
                 entry.error_code = "generation_failed"
                 entry.error_message = "Generator encountered an internal error."
                 entry.completed_at = now
-            return
+            return False
 
         if self._abort_workflow_if_cancelled(entry, "generating"):
             return False
@@ -2395,6 +2428,15 @@ class GenerateAndRunOrchestrator:
                     "skill_id": asi_res.skill_id,
                     "skill_version": asi_res.skill_version,
                     "reviewed_policy_id": asi_res.reviewed_policy_id,
+                    "call_count": asi_res.call_count,
+                    "chunking_used": asi_res.chunking_used,
+                    "planned_chunk_count": asi_res.planned_chunk_count,
+                    "attempted_chunk_count": asi_res.attempted_chunk_count,
+                    "executed_chunk_count": asi_res.executed_chunk_count,
+                    "completed_chunk_count": asi_res.completed_chunk_count,
+                    "budget_blocked_chunk_count": asi_res.budget_blocked_chunk_count,
+                    "dispatched_request_sha256s": list(asi_res.dispatched_request_sha256s),
+                    "chunk_summaries": [cs.model_dump(mode="json") for cs in asi_res.chunk_summaries],
                 }
                 if asi_res.reviewed_policy_id and asi_res.reviewed_policy_revision_sha256:
                     entry.reviewed_policies[code] = {

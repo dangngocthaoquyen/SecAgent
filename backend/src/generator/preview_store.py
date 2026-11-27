@@ -394,6 +394,14 @@ class _PreviewEntry:
                 "reviewed_policy_revision_sha256": r.reviewed_policy_revision_sha256,
                 "call_count": r.call_count,
                 "duration_ms": r.duration_ms,
+                "chunking_used": r.chunking_used,
+                "planned_chunk_count": r.planned_chunk_count,
+                "attempted_chunk_count": r.attempted_chunk_count,
+                "executed_chunk_count": r.executed_chunk_count,
+                "completed_chunk_count": r.completed_chunk_count,
+                "budget_blocked_chunk_count": r.budget_blocked_chunk_count,
+                "dispatched_request_sha256s": list(r.dispatched_request_sha256s),
+                "chunk_summaries": [cs.model_dump(mode="json") for cs in r.chunk_summaries],
             }
 
         return GeneratorPreviewSnapshot(
@@ -505,6 +513,31 @@ def serialize_preview_candidates_to_dataset_json(
             "skill_sha256": asi_res.skill_sha256,
             "sanitized_request_sha256": asi_res.sanitized_request_sha256,
             "effective_scope_metadata": asi_res.effective_scope,
+            "call_count": asi_res.call_count,
+            "chunking_used": asi_res.chunking_used,
+            "planned_chunk_count": asi_res.planned_chunk_count,
+            "attempted_chunk_count": asi_res.attempted_chunk_count,
+            "executed_chunk_count": asi_res.executed_chunk_count,
+            "completed_chunk_count": asi_res.completed_chunk_count,
+            "budget_blocked_chunk_count": asi_res.budget_blocked_chunk_count,
+            "dispatched_request_sha256s": list(asi_res.dispatched_request_sha256s),
+            "chunk_summaries": [
+                {
+                    "chunk_index": cs.chunk_index,
+                    "requested_count": cs.requested_count,
+                    "generated_count": cs.generated_count,
+                    "accepted_count": cs.accepted_count,
+                    "rejected_count": cs.rejected_count,
+                    "status": cs.status,
+                    "dispatched": cs.dispatched,
+                    "blocked_before_dispatch": cs.blocked_before_dispatch,
+                    "call_count": cs.call_count,
+                    "finish_reason": cs.finish_reason,
+                    "sanitized_request_sha256": cs.sanitized_request_sha256,
+                    "error_code": cs.error_code,
+                }
+                for cs in asi_res.chunk_summaries
+            ],
         }
         if asi_res.reviewed_policy_id and asi_res.reviewed_policy_revision_sha256:
             reviewed_policies[code] = {
@@ -574,6 +607,33 @@ def serialize_preview_candidates_to_dataset_json(
             "accepted": result.total_accepted,
             "rejected": result.total_rejected,
             "selected_for_save": len(selected_views),
+        },
+        "execution_accounting": {
+            "total_call_count": result.total_call_count,
+            "authorized_output_token_budget": result.authorized_output_token_budget,
+            "allocated_output_tokens": result.allocated_output_tokens,
+            "token_usage_unreported_calls": result.token_usage_unreported_calls,
+            "total_token_usage": (
+                result.total_token_usage.model_dump(mode="json")
+                if result.total_token_usage is not None
+                else None
+            ),
+            "asi_chunk_accounting": {
+                code: {
+                    "status": result.asi_results[code].status,
+                    "call_count": result.asi_results[code].call_count,
+                    "chunking_used": result.asi_results[code].chunking_used,
+                    "planned_chunk_count": result.asi_results[code].planned_chunk_count,
+                    "attempted_chunk_count": result.asi_results[code].attempted_chunk_count,
+                    "executed_chunk_count": result.asi_results[code].executed_chunk_count,
+                    "completed_chunk_count": result.asi_results[code].completed_chunk_count,
+                    "budget_blocked_chunk_count": result.asi_results[code].budget_blocked_chunk_count,
+                    "sanitized_request_sha256": result.asi_results[code].sanitized_request_sha256,
+                    "dispatched_request_sha256s": list(result.asi_results[code].dispatched_request_sha256s),
+                    "error_code": result.asi_results[code].error_code,
+                }
+                for code in result.asi_order
+            },
         },
         "asi_skills": asi_skills,
         "reviewed_policies": reviewed_policies,

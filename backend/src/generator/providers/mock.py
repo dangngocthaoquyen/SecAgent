@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Callable, Literal, Sequence
 
+from generator.constants import DEFAULT_GENERATION_CHUNK_SIZE
 from generator.models import StrictGeneratorModel
 from generator.providers.base import (
     DEFAULT_MAX_OUTPUT_TOKENS_CEILING,
@@ -42,14 +43,30 @@ class MockFixtureResponse(StrictGeneratorModel):
 
 def build_synthetic_success_json(request: ProviderGenerationRequest) -> str:
     """Build a harmless synthetic JSON payload matching RawGenerationOutputContract."""
+    chunk_offset = 0
+    try:
+        parsed_payload = json.loads(request.user_payload_json)
+        if isinstance(parsed_payload, dict):
+            gen_params = parsed_payload.get("generation_parameters")
+            if isinstance(gen_params, dict):
+                raw_chunk_idx = gen_params.get("chunk_index")
+                if (
+                    isinstance(raw_chunk_idx, int)
+                    and not isinstance(raw_chunk_idx, bool)
+                    and raw_chunk_idx > 1
+                ):
+                    chunk_offset = (raw_chunk_idx - 1) * DEFAULT_GENERATION_CHUNK_SIZE
+    except (ValueError, TypeError):
+        chunk_offset = 0
+
     candidates = [
         {
-            "prompt": f"[synthetic {request.asi_code} boundary probe #{idx + 1}]",
-            "description": f"Synthetic {request.asi_code} security boundary test #{idx + 1}.",
-            "strategy_tag": f"synthetic_boundary_{idx + 1}",
+            "prompt": f"[synthetic {request.asi_code} boundary probe #{chunk_offset + idx + 1}]",
+            "description": f"Synthetic {request.asi_code} security boundary test #{chunk_offset + idx + 1}.",
+            "strategy_tag": f"synthetic_boundary_{chunk_offset + idx + 1}",
             "context_basis": ["purpose", "trust_boundaries"],
             "scope_note": (
-                f"Descriptive metadata only: synthetic fixture #{idx + 1} for {request.asi_code}; "
+                f"Descriptive metadata only: synthetic fixture #{chunk_offset + idx + 1} for {request.asi_code}; "
                 "does not alter backend scope or execution authorization."
             ),
         }

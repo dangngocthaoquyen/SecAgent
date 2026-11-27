@@ -93,20 +93,23 @@ def deduplicate_asi_candidates(
     candidates: Sequence[IndexedCandidateDraft],
     *,
     asi_code: AsiCode,
+    within_seen: dict[str, IndexedCandidateDraft] | None = None,
     cross_asi_seen: dict[str, CrossAsiDuplicateReference] | None = None,
     deduplicate_across_asi: bool = True,
 ) -> DeduplicationOutcome:
     """Deduplicate validated candidates in stable input order without mutating taxonomy.
 
     - Within the same ASI: always keeps the first candidate and rejects later duplicates
-      with `duplicate_within_asi`.
+      with `duplicate_within_asi`. Callers executing bounded multi-chunk generation for one
+      ASI can pass a shared `within_seen` mapping so exact/normalized deduplication applies
+      globally across all chunks of that ASI.
     - Across ASIs: when `deduplicate_across_asi=True` and `cross_asi_seen` is provided,
       rejects candidates whose normalized prompt already appeared in an earlier ASI with
       `duplicate_across_asi` while referencing the earlier ASI/candidate (never merging or
       overwriting taxonomy). When `deduplicate_across_asi=False`, preserves each ASI's
       taxonomy independently.
     """
-    within_seen: dict[str, IndexedCandidateDraft] = {}
+    seen_within: dict[str, IndexedCandidateDraft] = within_seen if within_seen is not None else {}
     kept: list[IndexedCandidateDraft] = []
     rejected: list[DuplicateRejection] = []
     within_removed = 0
@@ -115,8 +118,8 @@ def deduplicate_asi_candidates(
     for item in candidates:
         norm_hash = item.normalized_prompt_sha256
 
-        if norm_hash in within_seen:
-            first = within_seen[norm_hash]
+        if norm_hash in seen_within:
+            first = seen_within[norm_hash]
             within_removed += 1
             rejected.append(
                 DuplicateRejection(
@@ -156,7 +159,7 @@ def deduplicate_asi_candidates(
             )
             continue
 
-        within_seen[norm_hash] = item
+        seen_within[norm_hash] = item
         kept.append(item)
 
     return DeduplicationOutcome(

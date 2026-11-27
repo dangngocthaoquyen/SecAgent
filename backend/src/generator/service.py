@@ -18,22 +18,32 @@ calling any Judge/Evaluator, mutating any store, or persisting any dataset:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from hashlib import sha256
 import re
+from threading import Event
 from typing import Any, Literal, Mapping, Sequence
 from uuid import uuid4
 
 from pydantic import Field, field_validator
 
+from core.cancellation import RunCancelledError
 from generator.constants import (
     ASI_CODE_TO_CATEGORY,
     AsiCategory,
     AsiCode,
+    DEFAULT_GENERATION_CHUNK_SIZE,
     DEFAULT_PER_ASI,
+    HARD_MAX_PER_ASI,
+    MAX_GENERATION_OUTPUT_TOKEN_BUDGET,
+    MAX_GENERATION_TOTAL_PROVIDER_CALLS,
+    MAX_PLANNED_CHUNKS_PER_ASI,
+    MAX_TOTAL_PROVIDER_CALLS_PER_ASI,
     SUPPORTED_ASI_CODES,
 )
 from generator.deduplication import (
     CrossAsiDuplicateReference,
     DEDUPLICATION_METHOD_V1,
+    IndexedCandidateDraft,
     deduplicate_asi_candidates,
 )
 from generator.models import (
@@ -273,6 +283,47 @@ class RejectedCandidateRecord(StrictGeneratorModel):
     invalid_context_fields: tuple[str, ...] = ()
 
 
+class ChunkExecutionSummary(StrictGeneratorModel):
+    """Secret-free per-chunk execution accounting for bounded multi-chunk generation."""
+
+    chunk_index: int = Field(ge=1, le=MAX_PLANNED_CHUNKS_PER_ASI, strict=True)
+    requested_count: int = Field(ge=1, le=DEFAULT_GENERATION_CHUNK_SIZE, strict=True)
+    generated_count: int = Field(default=0, ge=0, strict=True)
+    accepted_count: int = Field(default=0, ge=0, strict=True)
+    rejected_count: int = Field(default=0, ge=0, strict=True)
+    status: AsiGenerationStatus
+    dispatched: bool = False
+    blocked_before_dispatch: bool = False
+    finish_reason: str | None = None
+    call_count: int = Field(default=0, ge=0, le=2, strict=True)
+    duration_ms: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+    token_usage: TokenUsage | None = None
+    sanitized_request_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    error_code: str | None = None
+    provider_error_category: ProviderErrorCategory | None = None
+
+
+def plan_asi_chunks(requested_count: int) -> tuple[int, ...]:
+    """Deterministically split a per-ASI testcase count into fixed-size chunks (size 15, max 4)."""
+    if isinstance(requested_count, bool) or not isinstance(requested_count, int):
+        raise ValueError("requested_count must be an integer.")
+    if requested_count < 1 or requested_count > HARD_MAX_PER_ASI:
+        raise ValueError(
+            f"requested_count ({requested_count}) must be between 1 and {HARD_MAX_PER_ASI}."
+        )
+    if requested_count <= DEFAULT_GENERATION_CHUNK_SIZE:
+        return (requested_count,)
+    full_chunks, remainder = divmod(requested_count, DEFAULT_GENERATION_CHUNK_SIZE)
+    plan = [DEFAULT_GENERATION_CHUNK_SIZE] * full_chunks
+    if remainder > 0:
+        plan.append(remainder)
+    if len(plan) > MAX_PLANNED_CHUNKS_PER_ASI:
+        raise ValueError(
+            f"Planned chunk count ({len(plan)}) exceeds hard limit {MAX_PLANNED_CHUNKS_PER_ASI}."
+        )
+    return tuple(plan)
+
+
 class AsiGenerationResult(StrictGeneratorModel):
     """Complete per-ASI outcome, statistics, provenance, and accepted/rejected candidates."""
 
@@ -306,10 +357,18 @@ class AsiGenerationResult(StrictGeneratorModel):
     sanitized_request_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     reviewed_policy_id: str | None = None
     reviewed_policy_revision_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
-    call_count: int = Field(default=0, ge=0, le=2, strict=True)
+    call_count: int = Field(default=0, ge=0, le=MAX_TOTAL_PROVIDER_CALLS_PER_ASI, strict=True)
     duration_ms: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
     token_usage: TokenUsage | None = None
     provenance_inputs: GenerationProvenanceInputs | None = None
+    chunking_used: bool = False
+    planned_chunk_count: int = Field(default=1, ge=1, le=MAX_PLANNED_CHUNKS_PER_ASI, strict=True)
+    attempted_chunk_count: int = Field(default=0, ge=0, le=MAX_PLANNED_CHUNKS_PER_ASI, strict=True)
+    executed_chunk_count: int = Field(default=0, ge=0, le=MAX_PLANNED_CHUNKS_PER_ASI, strict=True)
+    completed_chunk_count: int = Field(default=0, ge=0, le=MAX_PLANNED_CHUNKS_PER_ASI, strict=True)
+    budget_blocked_chunk_count: int = Field(default=0, ge=0, le=MAX_PLANNED_CHUNKS_PER_ASI, strict=True)
+    dispatched_request_sha256s: tuple[str, ...] = ()
+    chunk_summaries: tuple[ChunkExecutionSummary, ...] = ()
 
 
 class GenerationResult(StrictGeneratorModel):
@@ -337,6 +396,11 @@ class GenerationResult(StrictGeneratorModel):
     total_call_count: int = Field(ge=0, strict=True)
     total_duration_ms: float = Field(ge=0.0, allow_inf_nan=False)
     total_token_usage: TokenUsage | None = None
+    authorized_output_token_budget: int = Field(
+        default=MAX_GENERATION_OUTPUT_TOKEN_BUDGET, ge=1, strict=True
+    )
+    allocated_output_tokens: int = Field(default=0, ge=0, strict=True)
+    token_usage_unreported_calls: int = Field(default=0, ge=0, strict=True)
     asi_order: tuple[AsiCode, ...]
     asi_results: dict[AsiCode, AsiGenerationResult]
     explicit_policy_ids_by_asi: dict[AsiCode, str] = Field(default_factory=dict)
@@ -403,8 +467,65 @@ def _compute_overall_status(
     return "failed"
 
 
+def _raise_if_cancelled(cancel_event: Event | None, reason: str) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise RunCancelledError(reason)
+
+
+class _GenerationBudgetTracker:
+    """Per-generation call & output-token budget guard (never shared across requests)."""
+
+    def __init__(
+        self,
+        *,
+        max_total_calls: int = MAX_GENERATION_TOTAL_PROVIDER_CALLS,
+        output_token_budget: int = MAX_GENERATION_OUTPUT_TOKEN_BUDGET,
+    ) -> None:
+        self.max_total_calls = max_total_calls
+        self.output_token_budget = output_token_budget
+        self.calls_used: int = 0
+        self.allocated_output_tokens: int = 0
+        self.reported_completion_tokens: int = 0
+        self.reported_usage_present: bool = False
+        self.unreported_usage_calls: int = 0
+
+    def check_dispatch(self, next_max_tokens: int, *, asi_calls_used: int) -> tuple[str, str] | None:
+        if asi_calls_used >= MAX_TOTAL_PROVIDER_CALLS_PER_ASI:
+            return (
+                "asi_call_budget_exceeded",
+                f"Per-ASI provider call budget ({MAX_TOTAL_PROVIDER_CALLS_PER_ASI}) reached.",
+            )
+        if self.calls_used >= self.max_total_calls:
+            return (
+                "generation_call_budget_exceeded",
+                f"Generation-wide provider call budget ({self.max_total_calls}) reached.",
+            )
+        if self.allocated_output_tokens + next_max_tokens > self.output_token_budget:
+            return (
+                "generation_output_token_budget_exceeded",
+                f"Authorized generation output token budget ({self.output_token_budget}) would be exceeded.",
+            )
+        if self.reported_usage_present and self.reported_completion_tokens >= self.output_token_budget:
+            return (
+                "generation_reported_token_budget_exceeded",
+                f"Provider-reported completion tokens reached generation ceiling ({self.output_token_budget}).",
+            )
+        return None
+
+    def record_attempt(self, max_tokens: int, response: ProviderGenerationResponse) -> None:
+        if response.call_count <= 0:
+            return
+        self.calls_used += response.call_count
+        self.allocated_output_tokens += max_tokens
+        if response.token_usage is not None and response.token_usage.completion_tokens is not None:
+            self.reported_usage_present = True
+            self.reported_completion_tokens += response.token_usage.completion_tokens
+        else:
+            self.unreported_usage_calls += response.call_count
+
+
 class GeneratorService:
-    """Stateless Context-aware Generator Service (G11.3B).
+    """Stateless Context-aware Generator Service (G11.3B + Phase 2 bounded chunking).
 
     Holds no global state, never writes to AppData or DatasetRepository, never
     contacts a Target, and never invokes Judge/Evaluator components.
@@ -431,30 +552,68 @@ class GeneratorService:
         self._max_raw_output_bytes = max_raw_output_bytes
         self._max_json_depth = max_json_depth
 
+    def _invoke_provider_chunk(
+        self,
+        provider_request: ProviderGenerationRequest,
+        *,
+        asi_calls_used: int,
+        asi_retries_remaining: int,
+        budget: _GenerationBudgetTracker,
+        cancel_event: Event | None = None,
+    ) -> tuple[ProviderGenerationResponse | None, int, float, TokenUsage | None, int, tuple[str, str] | None]:
+        """Execute 1 call for one chunk plus at most 1 ASI-wide transient retry (zero nested retries)."""
+        chunk_calls = 0
+        chunk_duration_ms = 0.0
+        usages: list[TokenUsage | None] = []
+        retries_consumed = 0
+        last_response: ProviderGenerationResponse | None = None
+
+        max_attempts_this_chunk = 2 if asi_retries_remaining > 0 else 1
+        for attempt in range(max_attempts_this_chunk):
+            _raise_if_cancelled(cancel_event, "generator_cancelled_before_provider_call")
+            budget_err = budget.check_dispatch(
+                provider_request.max_tokens,
+                asi_calls_used=asi_calls_used + chunk_calls,
+            )
+            if budget_err is not None:
+                if last_response is not None:
+                    # First attempt failed transiently, but budget forbids retry: return last response honestly.
+                    break
+                return None, 0, 0.0, None, 0, budget_err
+
+            response = self._provider.generate(provider_request)
+            last_response = response
+            chunk_calls += response.call_count
+            chunk_duration_ms += response.duration_ms
+            usages.append(response.token_usage)
+            budget.record_attempt(provider_request.max_tokens, response)
+            if attempt > 0:
+                retries_consumed += 1
+
+            _raise_if_cancelled(cancel_event, "generator_cancelled_after_provider_call")
+
+            if attempt + 1 >= max_attempts_this_chunk or not _is_retryable_provider_response(response):
+                break
+
+        return last_response, chunk_calls, chunk_duration_ms, _sum_token_usages(usages), retries_consumed, None
+
     def _invoke_provider_bounded(
         self,
         provider_request: ProviderGenerationRequest,
         *,
         max_calls: int,
     ) -> tuple[ProviderGenerationResponse, int, float, TokenUsage | None]:
-        """Execute 1 call by default (max 2 if explicitly configured) with zero fallback."""
-        total_calls = 0
-        total_duration_ms = 0.0
-        usages: list[TokenUsage | None] = []
-        last_response: ProviderGenerationResponse | None = None
-
-        for attempt in range(max_calls):
-            response = self._provider.generate(provider_request)
-            last_response = response
-            total_calls += response.call_count
-            total_duration_ms += response.duration_ms
-            usages.append(response.token_usage)
-
-            if attempt + 1 >= max_calls or not _is_retryable_provider_response(response):
-                break
-
-        assert last_response is not None
-        return last_response, total_calls, total_duration_ms, _sum_token_usages(usages)
+        """Backward-compatible single-request helper (1 call default, max 2 with transient retry)."""
+        budget = _GenerationBudgetTracker()
+        resp, calls, duration_ms, usage, _, _ = self._invoke_provider_chunk(
+            provider_request,
+            asi_calls_used=0,
+            asi_retries_remaining=max(0, min(max_calls, 2) - 1),
+            budget=budget,
+            cancel_event=None,
+        )
+        assert resp is not None
+        return resp, calls, duration_ms, usage
 
     def _generate_single_asi(
         self,
@@ -467,7 +626,15 @@ class GeneratorService:
         request: GenerationServiceRequest,
         token_ceiling: int,
         cross_asi_seen: dict[str, CrossAsiDuplicateReference],
+        budget: _GenerationBudgetTracker | None = None,
+        cancel_event: Event | None = None,
     ) -> AsiGenerationResult:
+        _raise_if_cancelled(cancel_event, f"generator_cancelled_before_{asi_code.lower()}")
+        active_budget = budget if budget is not None else _GenerationBudgetTracker()
+        chunk_plan = plan_asi_chunks(requested_count)
+        planned_chunk_count = len(chunk_plan)
+        chunking_used = planned_chunk_count > 1
+
         category = ASI_CODE_TO_CATEGORY[asi_code]
         provider_id = self._provider.provider_id
         model_name = self._provider.model_name
@@ -495,9 +662,13 @@ class GeneratorService:
                 model=model_name,
                 reviewed_policy_id=assessment.reviewed_policy_id,
                 reviewed_policy_revision_sha256=assessment.reviewed_policy_revision_sha256,
+                chunking_used=chunking_used,
+                planned_chunk_count=planned_chunk_count,
+                executed_chunk_count=0,
+                completed_chunk_count=0,
             )
 
-        # 2. Load allowlisted Generation Skill bundle.
+        # 2. Load allowlisted Generation Skill bundle once per ASI.
         try:
             skill_bundle = self._skill_loader.load(asi_code)
         except GeneratorSkillError as exc:
@@ -516,271 +687,549 @@ class GeneratorService:
                 model=model_name,
                 reviewed_policy_id=assessment.reviewed_policy_id,
                 reviewed_policy_revision_sha256=assessment.reviewed_policy_revision_sha256,
+                chunking_used=chunking_used,
+                planned_chunk_count=planned_chunk_count,
+                executed_chunk_count=0,
+                completed_chunk_count=0,
             )
 
-        # 3. Build strictly allowlisted, sanitized provider request.
-        try:
-            envelope = build_sanitized_generation_request(
-                skill_bundle=skill_bundle,
-                snapshot=snapshot,
-                assessment=assessment,
-                requested_count=requested_count,
-                language=request.language,
-                focus_note=request.focus_note,
-                token_ceiling=token_ceiling,
-                limits=self._limits,
-                request_id=f"{generation_id}-{asi_code.lower()}",
-                extra_sensitive_values=request.extra_sensitive_values,
+        # 3. Execute bounded sequential chunks with shared cross-chunk dedup & ASI-wide retry cap.
+        asi_retries_remaining = max(0, request.max_calls_per_asi - 1)
+        asi_calls_used = 0
+        total_duration_ms = 0.0
+        total_generated = 0
+        total_pre_dedup = 0
+        total_post_dedup = 0
+        total_dup_rejected = 0
+        completed_chunk_count = 0
+        budget_blocked_chunk_count = 0
+        next_source_index = 0
+
+        asi_within_seen: dict[str, IndexedCandidateDraft] = {}
+        source_index_to_candidate_id: dict[int, str] = {}
+        accepted: list[AcceptedCandidate] = []
+        rejected: list[RejectedCandidateRecord] = []
+        prior_strategy_tags: set[str] = set()
+        all_context_gaps: list[str] = []
+        chunk_summaries: list[ChunkExecutionSummary] = []
+        dispatched_request_hashes: list[str] = []
+        chunk_token_usages: list[TokenUsage | None] = []
+
+        first_prov: GenerationProvenanceInputs | None = None
+        first_dispatched_prov: GenerationProvenanceInputs | None = None
+        last_finish_reason: str | None = None
+        last_provider_id = provider_id
+        last_model = model_name
+        failure_status: AsiGenerationStatus | None = None
+        failure_code: str | None = None
+        failure_message: str | None = None
+        failure_category: ProviderErrorCategory | None = None
+
+        for chunk_idx, chunk_requested in enumerate(chunk_plan, start=1):
+            _raise_if_cancelled(cancel_event, f"generator_cancelled_before_chunk_{chunk_idx}")
+
+            req_id = (
+                f"{generation_id}-{asi_code.lower()}-c{chunk_idx}"
+                if chunking_used
+                else f"{generation_id}-{asi_code.lower()}"
             )
-        except GenerationRequestError as exc:
-            return AsiGenerationResult(
-                asi_code=asi_code,
-                asi_category=category,
-                status="blocked",
-                effective_scope=assessment.effective_scope,
-                readiness_status=assessment.status,
-                readiness_blockers=assessment.blockers,
-                readiness_warnings=assessment.warnings,
-                requested_count=requested_count,
-                error_code=f"request_error:{exc.code}",
-                error_message=exc.message[:512],
-                provider_id=provider_id,
-                model=model_name,
-                skill_id=skill_bundle.identity.id,
-                skill_version=skill_bundle.identity.version,
-                skill_sha256=skill_bundle.identity.sha256,
-                reviewed_policy_id=assessment.reviewed_policy_id,
-                reviewed_policy_revision_sha256=assessment.reviewed_policy_revision_sha256,
+            try:
+                envelope = build_sanitized_generation_request(
+                    skill_bundle=skill_bundle,
+                    snapshot=snapshot,
+                    assessment=assessment,
+                    requested_count=chunk_requested,
+                    language=request.language,
+                    focus_note=request.focus_note,
+                    token_ceiling=token_ceiling,
+                    limits=self._limits,
+                    request_id=req_id,
+                    extra_sensitive_values=request.extra_sensitive_values,
+                    chunk_index=chunk_idx if chunking_used else None,
+                    total_chunks=planned_chunk_count if chunking_used else None,
+                    prior_strategy_tags=sorted(prior_strategy_tags) if chunking_used and prior_strategy_tags else None,
+                )
+            except GenerationRequestError as exc:
+                if not chunk_summaries:
+                    return AsiGenerationResult(
+                        asi_code=asi_code,
+                        asi_category=category,
+                        status="blocked",
+                        effective_scope=assessment.effective_scope,
+                        readiness_status=assessment.status,
+                        readiness_blockers=assessment.blockers,
+                        readiness_warnings=assessment.warnings,
+                        requested_count=requested_count,
+                        error_code=f"request_error:{exc.code}",
+                        error_message=exc.message[:512],
+                        provider_id=provider_id,
+                        model=model_name,
+                        skill_id=skill_bundle.identity.id,
+                        skill_version=skill_bundle.identity.version,
+                        skill_sha256=skill_bundle.identity.sha256,
+                        reviewed_policy_id=assessment.reviewed_policy_id,
+                        reviewed_policy_revision_sha256=assessment.reviewed_policy_revision_sha256,
+                        chunking_used=chunking_used,
+                        planned_chunk_count=planned_chunk_count,
+                        attempted_chunk_count=0,
+                        executed_chunk_count=0,
+                        completed_chunk_count=0,
+                        budget_blocked_chunk_count=0,
+                    )
+                failure_status = "blocked"
+                failure_code = f"request_error:{exc.code}"
+                failure_message = exc.message[:512]
+                chunk_summaries.append(
+                    ChunkExecutionSummary(
+                        chunk_index=chunk_idx,
+                        requested_count=chunk_requested,
+                        status="blocked",
+                        dispatched=False,
+                        blocked_before_dispatch=True,
+                        error_code=failure_code,
+                    )
+                )
+                break
+
+            provider_req = envelope.provider_request
+            if request.timeout_seconds is not None:
+                provider_req = provider_req.model_copy(update={"timeout_seconds": request.timeout_seconds})
+
+            prov = envelope.provenance_inputs
+            if first_prov is None:
+                first_prov = prov
+
+            response, chunk_calls, chunk_duration_ms, chunk_usage, retries_used, budget_err = (
+                self._invoke_provider_chunk(
+                    provider_req,
+                    asi_calls_used=asi_calls_used,
+                    asi_retries_remaining=asi_retries_remaining,
+                    budget=active_budget,
+                    cancel_event=cancel_event,
+                )
             )
+            asi_calls_used += chunk_calls
+            asi_retries_remaining = max(0, asi_retries_remaining - retries_used)
+            total_duration_ms += chunk_duration_ms
+            chunk_token_usages.append(chunk_usage)
 
-        provider_req = envelope.provider_request
-        if request.timeout_seconds is not None:
-            provider_req = provider_req.model_copy(update={"timeout_seconds": request.timeout_seconds})
+            chunk_dispatched = chunk_calls > 0
+            if chunk_dispatched:
+                if first_dispatched_prov is None:
+                    first_dispatched_prov = prov
+                dispatched_request_hashes.append(prov.request_sha256)
 
-        prov = envelope.provenance_inputs
+            if budget_err is not None or response is None:
+                err_code, err_msg = budget_err or (
+                    "generation_budget_exceeded",
+                    "Generation call or token budget exceeded.",
+                )
+                budget_blocked_chunk_count += 1
+                failure_status = "provider_error"
+                failure_code = err_code
+                failure_message = err_msg[:512]
+                failure_category = ProviderErrorCategory.CONFIGURATION_ERROR
+                chunk_summaries.append(
+                    ChunkExecutionSummary(
+                        chunk_index=chunk_idx,
+                        requested_count=chunk_requested,
+                        status="provider_error",
+                        dispatched=False,
+                        blocked_before_dispatch=True,
+                        call_count=chunk_calls,
+                        duration_ms=chunk_duration_ms,
+                        token_usage=chunk_usage,
+                        sanitized_request_sha256=prov.request_sha256,
+                        error_code=err_code,
+                        provider_error_category=failure_category,
+                    )
+                )
+                break
 
-        # 4. Invoke GeneratorLLMProvider under strict call budget.
-        response, call_count, duration_ms, token_usage = self._invoke_provider_bounded(
-            provider_req,
-            max_calls=request.max_calls_per_asi,
-        )
+            last_finish_reason = response.finish_reason
+            last_provider_id = response.provider_id
+            last_model = response.model
 
-        common_kwargs: dict[str, Any] = {
-            "asi_code": asi_code,
-            "asi_category": category,
-            "effective_scope": prov.effective_scope,
-            "readiness_status": assessment.status,
-            "readiness_blockers": assessment.blockers,
-            "readiness_warnings": assessment.warnings,
-            "requested_count": requested_count,
-            "finish_reason": response.finish_reason,
-            "provider_id": response.provider_id,
-            "model": response.model,
-            "skill_id": prov.skill_id,
-            "skill_version": prov.skill_version,
-            "skill_sha256": prov.skill_sha256,
-            "sanitized_request_sha256": prov.request_sha256,
-            "reviewed_policy_id": prov.reviewed_policy_id,
-            "reviewed_policy_revision_sha256": prov.reviewed_policy_revision_sha256,
-            "call_count": call_count,
-            "duration_ms": duration_ms,
-            "token_usage": token_usage,
-            "provenance_inputs": prov,
-        }
-
-        # 5. Classify truncated / provider error outcomes before JSON parsing.
-        if (
-            response.error_category == ProviderErrorCategory.TRUNCATED_RESPONSE
-            or (isinstance(response.finish_reason, str) and response.finish_reason.strip().lower() == "length")
-        ):
-            return AsiGenerationResult(
-                status="truncated",
-                error_code="truncated_output",
-                error_message=(
+            # Classify truncated / provider error outcomes before JSON parsing.
+            if (
+                response.error_category == ProviderErrorCategory.TRUNCATED_RESPONSE
+                or (isinstance(response.finish_reason, str) and response.finish_reason.strip().lower() == "length")
+            ):
+                err_cat = response.error_category or ProviderErrorCategory.TRUNCATED_RESPONSE
+                failure_status = "truncated"
+                failure_code = "truncated_output"
+                failure_message = (
                     response.error_message
                     or "LLM generation output was truncated before completion (finish_reason=length)."
-                )[:512],
-                provider_error_category=response.error_category or ProviderErrorCategory.TRUNCATED_RESPONSE,
-                **common_kwargs,
-            )
+                )[:512]
+                failure_category = err_cat
+                chunk_summaries.append(
+                    ChunkExecutionSummary(
+                        chunk_index=chunk_idx,
+                        requested_count=chunk_requested,
+                        status="truncated",
+                        dispatched=chunk_dispatched,
+                        blocked_before_dispatch=not chunk_dispatched,
+                        finish_reason=response.finish_reason,
+                        call_count=chunk_calls,
+                        duration_ms=chunk_duration_ms,
+                        token_usage=chunk_usage,
+                        sanitized_request_sha256=prov.request_sha256,
+                        error_code=failure_code,
+                        provider_error_category=err_cat,
+                    )
+                )
+                break
 
-        if not response.ok:
-            err_cat = response.error_category or ProviderErrorCategory.HTTP_ERROR
-            return AsiGenerationResult(
-                status="provider_error",
-                error_code=f"provider_error:{err_cat.value}",
-                error_message=(response.error_message or "Generator provider call failed.")[:512],
-                provider_error_category=err_cat,
-                **common_kwargs,
-            )
+            if not response.ok:
+                err_cat = response.error_category or ProviderErrorCategory.HTTP_ERROR
+                failure_status = "provider_error"
+                failure_code = f"provider_error:{err_cat.value}"
+                failure_message = (response.error_message or "Generator provider call failed.")[:512]
+                failure_category = err_cat
+                chunk_summaries.append(
+                    ChunkExecutionSummary(
+                        chunk_index=chunk_idx,
+                        requested_count=chunk_requested,
+                        status="provider_error",
+                        dispatched=chunk_dispatched,
+                        blocked_before_dispatch=not chunk_dispatched,
+                        finish_reason=response.finish_reason,
+                        call_count=chunk_calls,
+                        duration_ms=chunk_duration_ms,
+                        token_usage=chunk_usage,
+                        sanitized_request_sha256=prov.request_sha256,
+                        error_code=failure_code,
+                        provider_error_category=err_cat,
+                    )
+                )
+                break
 
-        # 6. Strictly parse untrusted raw_text into RawGenerationOutputContract.
-        try:
-            parsed = parse_llm_generation_output(
-                response.raw_text,
-                finish_reason=response.finish_reason,
-                max_raw_bytes=self._max_raw_output_bytes,
-                max_depth=self._max_json_depth,
-            )
-        except OutputParseError as exc:
-            status: AsiGenerationStatus = "truncated" if exc.code == "truncated_output" else "invalid_output"
-            return AsiGenerationResult(
-                status=status,
-                error_code=exc.code,
-                error_message=exc.message[:512],
-                **common_kwargs,
-            )
+            # Strictly parse untrusted raw_text into RawGenerationOutputContract.
+            try:
+                parsed = parse_llm_generation_output(
+                    response.raw_text,
+                    finish_reason=response.finish_reason,
+                    max_raw_bytes=self._max_raw_output_bytes,
+                    max_depth=self._max_json_depth,
+                )
+            except OutputParseError as exc:
+                parse_status: AsiGenerationStatus = (
+                    "truncated" if exc.code == "truncated_output" else "invalid_output"
+                )
+                failure_status = parse_status
+                failure_code = exc.code
+                failure_message = exc.message[:512]
+                chunk_summaries.append(
+                    ChunkExecutionSummary(
+                        chunk_index=chunk_idx,
+                        requested_count=chunk_requested,
+                        status=parse_status,
+                        dispatched=chunk_dispatched,
+                        blocked_before_dispatch=not chunk_dispatched,
+                        finish_reason=response.finish_reason,
+                        call_count=chunk_calls,
+                        duration_ms=chunk_duration_ms,
+                        token_usage=chunk_usage,
+                        sanitized_request_sha256=prov.request_sha256,
+                        error_code=exc.code,
+                    )
+                )
+                break
 
-        contract = parsed.contract
-        generated_count = len(contract.candidates)
+            contract = parsed.contract
+            chunk_generated = len(contract.candidates)
+            total_generated += chunk_generated
+            for gap in contract.context_gaps:
+                if gap not in all_context_gaps:
+                    all_context_gaps.append(gap)
 
-        # 7. Deterministic backend candidate validation (ASI consistency + confirmed context_basis).
-        val_outcome = validate_parsed_output(
-            contract,
-            expected_asi_code=asi_code,
-            snapshot=snapshot,
-            assessment=assessment,
-            provenance_inputs=prov,
-        )
-        if not val_outcome.asi_matched:
-            return AsiGenerationResult(
-                status="invalid_output",
-                generated_count=generated_count,
-                error_code="asi_mismatch",
-                error_message=(
+            # Deterministic backend candidate validation (ASI consistency + confirmed context_basis).
+            val_outcome = validate_parsed_output(
+                contract,
+                expected_asi_code=asi_code,
+                snapshot=snapshot,
+                assessment=assessment,
+                provenance_inputs=prov,
+                source_index_offset=next_source_index,
+            )
+            if not val_outcome.asi_matched:
+                failure_status = "invalid_output"
+                failure_code = "asi_mismatch"
+                failure_message = (
                     val_outcome.asi_mismatch_message
                     or f"LLM output ASI category does not match requested {asi_code}."
-                )[:512],
-                **common_kwargs,
-            )
-
-        # Explicit empty candidates with valid context_gaps (NEVER treated as completed!).
-        if generated_count == 0:
-            return AsiGenerationResult(
-                status="empty_with_context_gaps",
-                generated_count=0,
-                accepted_count=0,
-                rejected_count=0,
-                context_gaps=contract.context_gaps,
-                **common_kwargs,
-            )
-
-        # 8. Deterministic exact/normalized deduplication (v1).
-        dedup_outcome = deduplicate_asi_candidates(
-            val_outcome.valid_candidates,
-            asi_code=asi_code,
-            cross_asi_seen=cross_asi_seen,
-            deduplicate_across_asi=request.deduplicate_across_asi,
-        )
-
-        # 9. Cap accepted candidates at requested_count WITHOUT silent truncation.
-        kept_within_limit = dedup_outcome.kept[:requested_count]
-        excess_over_requested = dedup_outcome.kept[requested_count:]
-
-        accepted: list[AcceptedCandidate] = []
-        source_index_to_candidate_id: dict[int, str] = {}
-        for seq, item in enumerate(kept_within_limit, start=1):
-            candidate_id = f"{generation_id}:{asi_code.lower()}:{seq:03d}"
-            source_index_to_candidate_id[item.source_index] = candidate_id
-            accepted.append(
-                AcceptedCandidate(
-                    candidate_id=candidate_id,
-                    generation_id=generation_id,
-                    asi_code=asi_code,
-                    asi_category=category,
-                    effective_scope=prov.effective_scope,
-                    source_index=item.source_index,
-                    prompt=item.draft.prompt,
-                    description=item.draft.description,
-                    strategy_tag=item.draft.strategy_tag,
-                    context_basis=item.draft.context_basis,
-                    scope_note=item.draft.scope_note,
-                    prompt_sha256=item.prompt_sha256,
-                    normalized_prompt_sha256=item.normalized_prompt_sha256,
+                )[:512]
+                chunk_summaries.append(
+                    ChunkExecutionSummary(
+                        chunk_index=chunk_idx,
+                        requested_count=chunk_requested,
+                        generated_count=chunk_generated,
+                        status="invalid_output",
+                        dispatched=chunk_dispatched,
+                        blocked_before_dispatch=not chunk_dispatched,
+                        finish_reason=response.finish_reason,
+                        call_count=chunk_calls,
+                        duration_ms=chunk_duration_ms,
+                        token_usage=chunk_usage,
+                        sanitized_request_sha256=prov.request_sha256,
+                        error_code=failure_code,
+                    )
                 )
-            )
-            # Register accepted candidate in cross-ASI dedup index after minting its backend ID.
-            if item.normalized_prompt_sha256 not in cross_asi_seen:
-                cross_asi_seen[item.normalized_prompt_sha256] = CrossAsiDuplicateReference(
-                    asi_code=asi_code,
-                    source_index=item.source_index,
-                    candidate_id=candidate_id,
-                )
+                break
 
-        rejected: list[RejectedCandidateRecord] = []
-        for rej in val_outcome.rejected_candidates:
-            rejected.append(
-                RejectedCandidateRecord(
-                    source_index=rej.source_index,
-                    asi_code=asi_code,
-                    reason_code=rej.reason_code,
-                    reason_message=rej.reason_message,
-                    prompt_sha256=rej.prompt_sha256,
-                    normalized_prompt_sha256=rej.normalized_prompt_sha256,
-                    invalid_context_fields=rej.invalid_context_fields,
+            next_source_index += chunk_generated
+
+            # Explicit empty candidates with valid context_gaps (NEVER treated as completed!).
+            if chunk_generated == 0:
+                completed_chunk_count += 1
+                chunk_summaries.append(
+                    ChunkExecutionSummary(
+                        chunk_index=chunk_idx,
+                        requested_count=chunk_requested,
+                        generated_count=0,
+                        accepted_count=0,
+                        rejected_count=0,
+                        status="empty_with_context_gaps",
+                        dispatched=chunk_dispatched,
+                        blocked_before_dispatch=not chunk_dispatched,
+                        finish_reason=response.finish_reason,
+                        call_count=chunk_calls,
+                        duration_ms=chunk_duration_ms,
+                        token_usage=chunk_usage,
+                        sanitized_request_sha256=prov.request_sha256,
+                    )
                 )
+                # Model reported explicit context gaps; do not waste remaining chunks with identical context.
+                break
+
+            # Deterministic exact/normalized deduplication across all chunks of this ASI + cross-ASI.
+            chunk_within_seen = dict(asi_within_seen)
+            dedup_outcome = deduplicate_asi_candidates(
+                val_outcome.valid_candidates,
+                asi_code=asi_code,
+                within_seen=chunk_within_seen,
+                cross_asi_seen=cross_asi_seen,
+                deduplicate_across_asi=request.deduplicate_across_asi,
+            )
+            total_pre_dedup += dedup_outcome.pre_dedup_count
+            total_post_dedup += dedup_outcome.post_dedup_count
+            total_dup_rejected += (
+                dedup_outcome.within_asi_duplicates_removed
+                + dedup_outcome.across_asi_duplicates_removed
             )
 
-        for dup in dedup_outcome.rejected:
-            ref_candidate_id = dup.duplicate_of_candidate_id
-            if ref_candidate_id is None and dup.duplicate_of_asi_code == asi_code:
-                ref_candidate_id = source_index_to_candidate_id.get(dup.duplicate_of_source_index)
-            rejected.append(
-                RejectedCandidateRecord(
-                    source_index=dup.source_index,
-                    asi_code=asi_code,
-                    reason_code=dup.reason_code,
-                    reason_message=dup.reason_message,
-                    prompt_sha256=dup.prompt_sha256,
-                    normalized_prompt_sha256=dup.normalized_prompt_sha256,
-                    duplicate_of_asi_code=dup.duplicate_of_asi_code,
-                    duplicate_of_source_index=dup.duplicate_of_source_index,
-                    duplicate_of_candidate_id=ref_candidate_id,
-                )
-            )
+            # Cap chunk accepted candidates at chunk_requested (and <= remaining ASI need) without silent truncation.
+            remaining_asi_capacity = max(0, requested_count - len(accepted))
+            chunk_limit = min(chunk_requested, remaining_asi_capacity)
+            kept_within_limit = dedup_outcome.kept[:chunk_limit]
+            excess_over_requested = dedup_outcome.kept[chunk_limit:]
 
-        for extra_item in excess_over_requested:
-            rejected.append(
-                RejectedCandidateRecord(
-                    source_index=extra_item.source_index,
-                    asi_code=asi_code,
-                    reason_code="exceeds_requested_count",
-                    reason_message=(
+            chunk_accepted_count = 0
+            for item in kept_within_limit:
+                seq = len(accepted) + 1
+                candidate_id = f"{generation_id}:{asi_code.lower()}:{seq:03d}"
+                source_index_to_candidate_id[item.source_index] = candidate_id
+                asi_within_seen[item.normalized_prompt_sha256] = item
+                prior_strategy_tags.add(item.draft.strategy_tag)
+                accepted.append(
+                    AcceptedCandidate(
+                        candidate_id=candidate_id,
+                        generation_id=generation_id,
+                        asi_code=asi_code,
+                        asi_category=category,
+                        effective_scope=prov.effective_scope,
+                        source_index=item.source_index,
+                        prompt=item.draft.prompt,
+                        description=item.draft.description,
+                        strategy_tag=item.draft.strategy_tag,
+                        context_basis=item.draft.context_basis,
+                        scope_note=item.draft.scope_note,
+                        prompt_sha256=item.prompt_sha256,
+                        normalized_prompt_sha256=item.normalized_prompt_sha256,
+                    )
+                )
+                chunk_accepted_count += 1
+                if item.normalized_prompt_sha256 not in cross_asi_seen:
+                    cross_asi_seen[item.normalized_prompt_sha256] = CrossAsiDuplicateReference(
+                        asi_code=asi_code,
+                        source_index=item.source_index,
+                        candidate_id=candidate_id,
+                    )
+
+            chunk_rejected_count = 0
+            for rej in val_outcome.rejected_candidates:
+                rejected.append(
+                    RejectedCandidateRecord(
+                        source_index=rej.source_index,
+                        asi_code=asi_code,
+                        reason_code=rej.reason_code,
+                        reason_message=rej.reason_message,
+                        prompt_sha256=rej.prompt_sha256,
+                        normalized_prompt_sha256=rej.normalized_prompt_sha256,
+                        invalid_context_fields=rej.invalid_context_fields,
+                    )
+                )
+                chunk_rejected_count += 1
+
+            for dup in dedup_outcome.rejected:
+                ref_candidate_id = dup.duplicate_of_candidate_id
+                reason_msg = dup.reason_message
+                if ref_candidate_id is None and dup.duplicate_of_asi_code == asi_code:
+                    ref_candidate_id = source_index_to_candidate_id.get(dup.duplicate_of_source_index)
+                    if ref_candidate_id is None:
+                        reason_msg = (
+                            f"{dup.reason_message} Referenced raw candidate at source index "
+                            f"{dup.duplicate_of_source_index} was not accepted (exceeds_requested_count); "
+                            "duplicate_of_candidate_id is null."
+                        )[:512]
+                rejected.append(
+                    RejectedCandidateRecord(
+                        source_index=dup.source_index,
+                        asi_code=asi_code,
+                        reason_code=dup.reason_code,
+                        reason_message=reason_msg,
+                        prompt_sha256=dup.prompt_sha256,
+                        normalized_prompt_sha256=dup.normalized_prompt_sha256,
+                        duplicate_of_asi_code=dup.duplicate_of_asi_code,
+                        duplicate_of_source_index=dup.duplicate_of_source_index,
+                        duplicate_of_candidate_id=ref_candidate_id,
+                    )
+                )
+                chunk_rejected_count += 1
+
+            for extra_item in excess_over_requested:
+                if chunking_used:
+                    excess_msg = (
+                        f"Candidate exceeds chunk requested_count ({chunk_requested}) in chunk "
+                        f"{chunk_idx}/{planned_chunk_count} for {asi_code} "
+                        f"(total requested {requested_count}); explicitly rejected instead of silently truncating."
+                    )
+                else:
+                    excess_msg = (
                         f"Candidate exceeds requested_count ({requested_count}) for {asi_code}; "
                         "explicitly rejected instead of silently truncating."
-                    ),
-                    prompt_sha256=extra_item.prompt_sha256,
-                    normalized_prompt_sha256=extra_item.normalized_prompt_sha256,
+                    )
+                rejected.append(
+                    RejectedCandidateRecord(
+                        source_index=extra_item.source_index,
+                        asi_code=asi_code,
+                        reason_code="exceeds_requested_count",
+                        reason_message=excess_msg,
+                        prompt_sha256=extra_item.prompt_sha256,
+                        normalized_prompt_sha256=extra_item.normalized_prompt_sha256,
+                    )
+                )
+                chunk_rejected_count += 1
+
+            if chunk_accepted_count == chunk_requested:
+                chunk_status: AsiGenerationStatus = "completed"
+            elif chunk_accepted_count > 0:
+                chunk_status = "partial"
+            else:
+                chunk_status = "empty_all_rejected"
+
+            completed_chunk_count += 1
+            chunk_summaries.append(
+                ChunkExecutionSummary(
+                    chunk_index=chunk_idx,
+                    requested_count=chunk_requested,
+                    generated_count=chunk_generated,
+                    accepted_count=chunk_accepted_count,
+                    rejected_count=chunk_rejected_count,
+                    status=chunk_status,
+                    dispatched=chunk_dispatched,
+                    blocked_before_dispatch=not chunk_dispatched,
+                    finish_reason=response.finish_reason,
+                    call_count=chunk_calls,
+                    duration_ms=chunk_duration_ms,
+                    token_usage=chunk_usage,
+                    sanitized_request_sha256=prov.request_sha256,
                 )
             )
 
         rejected.sort(key=lambda r: r.source_index)
         accepted_count = len(accepted)
         rejected_count = len(rejected)
+        dispatched_chunk_count = sum(1 for cs in chunk_summaries if cs.dispatched)
+
+        # Composite sanitized_request_sha256 strictly reflects requests actually dispatched to the provider.
+        if not dispatched_request_hashes:
+            asi_request_sha256: str | None = None
+        elif not chunking_used:
+            asi_request_sha256 = dispatched_request_hashes[0]
+        else:
+            asi_request_sha256 = sha256("|".join(dispatched_request_hashes).encode("utf-8")).hexdigest()
+
+        asi_provenance: GenerationProvenanceInputs | None = None
+        if first_dispatched_prov is not None and asi_request_sha256 is not None:
+            if chunking_used:
+                asi_provenance = first_dispatched_prov.model_copy(
+                    update={"requested_count": requested_count, "request_sha256": asi_request_sha256}
+                )
+            else:
+                asi_provenance = first_dispatched_prov
 
         if accepted_count == requested_count:
             asi_status: AsiGenerationStatus = "completed"
         elif accepted_count > 0:
             asi_status = "partial"
+        elif failure_status is not None:
+            asi_status = failure_status
+        elif total_generated == 0 and all_context_gaps:
+            asi_status = "empty_with_context_gaps"
         else:
             asi_status = "empty_all_rejected"
 
         return AsiGenerationResult(
+            asi_code=asi_code,
+            asi_category=category,
             status=asi_status,
-            generated_count=generated_count,
-            pre_dedup_valid_count=dedup_outcome.pre_dedup_count,
-            post_dedup_valid_count=dedup_outcome.post_dedup_count,
+            effective_scope=first_prov.effective_scope if first_prov is not None else assessment.effective_scope,
+            readiness_status=assessment.status,
+            readiness_blockers=assessment.blockers,
+            readiness_warnings=assessment.warnings,
+            requested_count=requested_count,
+            generated_count=total_generated,
+            pre_dedup_valid_count=total_pre_dedup,
+            post_dedup_valid_count=total_post_dedup,
             accepted_count=accepted_count,
             rejected_count=rejected_count,
-            duplicate_rejected_count=(
-                dedup_outcome.within_asi_duplicates_removed
-                + dedup_outcome.across_asi_duplicates_removed
-            ),
+            duplicate_rejected_count=total_dup_rejected,
             accepted_candidates=tuple(accepted),
             rejected_candidates=tuple(rejected),
             rejection_reason_counts=_count_reasons(rejected),
-            context_gaps=contract.context_gaps,
-            **common_kwargs,
+            context_gaps=tuple(all_context_gaps),
+            error_code=failure_code,
+            error_message=failure_message,
+            provider_error_category=failure_category,
+            finish_reason=last_finish_reason,
+            provider_id=last_provider_id,
+            model=last_model,
+            skill_id=first_prov.skill_id if first_prov is not None else skill_bundle.identity.id,
+            skill_version=first_prov.skill_version if first_prov is not None else skill_bundle.identity.version,
+            skill_sha256=first_prov.skill_sha256 if first_prov is not None else skill_bundle.identity.sha256,
+            sanitized_request_sha256=asi_request_sha256,
+            reviewed_policy_id=(
+                first_prov.reviewed_policy_id if first_prov is not None else assessment.reviewed_policy_id
+            ),
+            reviewed_policy_revision_sha256=(
+                first_prov.reviewed_policy_revision_sha256
+                if first_prov is not None
+                else assessment.reviewed_policy_revision_sha256
+            ),
+            call_count=asi_calls_used,
+            duration_ms=total_duration_ms,
+            token_usage=_sum_token_usages(chunk_token_usages),
+            provenance_inputs=asi_provenance,
+            chunking_used=chunking_used,
+            planned_chunk_count=planned_chunk_count,
+            attempted_chunk_count=len(chunk_summaries),
+            executed_chunk_count=dispatched_chunk_count,
+            completed_chunk_count=completed_chunk_count,
+            budget_blocked_chunk_count=budget_blocked_chunk_count,
+            dispatched_request_sha256s=tuple(dispatched_request_hashes),
+            chunk_summaries=tuple(chunk_summaries),
         )
 
     def generate(
@@ -788,6 +1237,7 @@ class GeneratorService:
         request: GenerationServiceRequest,
         *,
         generation_id: str | None = None,
+        cancel_event: Event | None = None,
     ) -> GenerationResult:
         """Execute bounded Context-aware Generation across requested ASI categories."""
         if not isinstance(request, GenerationServiceRequest):
@@ -813,6 +1263,8 @@ class GeneratorService:
         else:
             resolved_gen_id = f"gen-{uuid4().hex[:16]}"
 
+        _raise_if_cancelled(cancel_event, "generator_cancelled_before_start")
+
         # Canonical deterministic ASI processing order independent of caller dict insertion order.
         asi_order: tuple[AsiCode, ...] = tuple(
             code for code in SUPPORTED_ASI_CODES if code in validated_counts
@@ -835,8 +1287,10 @@ class GeneratorService:
 
         asi_results: dict[AsiCode, AsiGenerationResult] = {}
         cross_asi_seen: dict[str, CrossAsiDuplicateReference] = {}
+        budget = _GenerationBudgetTracker()
 
         for asi_code in asi_order:
+            _raise_if_cancelled(cancel_event, f"generator_cancelled_before_{asi_code.lower()}")
             asi_results[asi_code] = self._generate_single_asi(
                 generation_id=resolved_gen_id,
                 asi_code=asi_code,
@@ -846,7 +1300,10 @@ class GeneratorService:
                 request=request,
                 token_ceiling=provider_status.max_output_tokens_ceiling,
                 cross_asi_seen=cross_asi_seen,
+                budget=budget,
+                cancel_event=cancel_event,
             )
+            _raise_if_cancelled(cancel_event, f"generator_cancelled_after_{asi_code.lower()}")
 
         all_accepted: list[AcceptedCandidate] = []
         all_rejected: list[RejectedCandidateRecord] = []
@@ -889,6 +1346,9 @@ class GeneratorService:
             total_call_count=total_call_count,
             total_duration_ms=total_duration_ms,
             total_token_usage=total_token_usage,
+            authorized_output_token_budget=budget.output_token_budget,
+            allocated_output_tokens=budget.allocated_output_tokens,
+            token_usage_unreported_calls=budget.unreported_usage_calls,
             asi_order=asi_order,
             asi_results=asi_results,
             explicit_policy_ids_by_asi=dict(request.policy_ids_by_asi),
